@@ -110,9 +110,10 @@ Reasoning:
    - Free feature for all users
 
 2. **Select Countries** (Premium Feature)
-   - Multi-select dropdown showing only Shopify Markets-enabled countries
-   - Auto-fetch from Shopify Markets API
-   - Validation: Only allow countries configured in Shopify Markets
+   - Multi-select dropdown with **all countries** available
+   - **Optional filter:** "Show only Shopify Markets countries" checkbox
+   - **Auto-detection:** Highlight/mark countries that are in Shopify Markets
+   - **Validation:** Allow any country, but warn if not in Markets
    - **Free tier:** Max 3 countries
    - **Premium tier:** Unlimited countries
 
@@ -208,12 +209,18 @@ Reasoning:
 ### **API Changes**
 
 **New Endpoint:** `GET /api/v1/markets/countries`
-- Fetch available countries from Shopify Markets API
-- Return only countries enabled in merchant's Markets settings
+- Fetch all countries with Markets status
+- Return comprehensive country list with Markets indicators
 - Response format:
   ```javascript
   {
     "countries": [
+      {"code": "US", "name": "United States", "currency": "USD", "inMarkets": true},
+      {"code": "GB", "name": "United Kingdom", "currency": "GBP", "inMarkets": true},
+      {"code": "CA", "name": "Canada", "currency": "CAD", "inMarkets": false},
+      {"code": "AU", "name": "Australia", "currency": "AUD", "inMarkets": false}
+    ],
+    "marketsOnly": [
       {"code": "US", "name": "United States", "currency": "USD"},
       {"code": "GB", "name": "United Kingdom", "currency": "GBP"}
     ]
@@ -224,7 +231,9 @@ Reasoning:
 
 **New Component:** `CountrySwitchingTab.jsx` (if Option A)
 - Similar structure to `SelectCurrencies.jsx`
-- Multi-select for countries (filtered by Markets)
+- Multi-select for all countries with optional Markets filter
+- Visual indicators for Markets vs non-Markets countries
+- Warning messages for non-Markets selections
 - Display mode radio buttons
 - Enable/disable toggle
 - Premium upgrade prompt if > 3 countries selected
@@ -278,8 +287,8 @@ const events = config => {
 **Q: Why separate tab instead of adding to Currency Selector tab?**  
 A: Keeps UI clean, allows for future country-specific features, easier to make premium. However, both options are viable - see "Admin Side (Configuration)" section above.
 
-**Q: How do we prevent showing countries not in Shopify Markets?**  
-A: Fetch available countries from Shopify Markets API, filter dropdown to only show those.
+**Q: How do we handle countries not in Shopify Markets?**  
+A: Merchants can select any country, but we provide an optional filter to show only Markets countries. Non-Markets countries will fallback to currency switching.
 
 **Q: What if merchant disables a country in Markets after selecting it?**  
 A: Widget validates against `availableCountries` array, skips disabled countries.
@@ -406,4 +415,3 @@ A: Use unique CSS classes (`buckcc` vs `buckcc-country`) and shared theme variab
 2. Decide on admin layout approach (Option A vs B)
 3. Get approval for premium tier pricing model
 4. Begin Phase 0 implementation
-
