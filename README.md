@@ -39,6 +39,29 @@ Currently, the app only supports **currency switching**, but merchants operating
 
 ---
 
+## **Premium Model Options**
+
+We have **two approaches** for monetizing this feature:
+
+### **Option A: Limited Free Tier (Recommended)**
+- **Free users:** Basic country switching (max 3 countries, Markets-only filter)
+- **Premium users:** Unlimited countries, custom labels, advanced fallback, analytics
+- **Benefits:** Lower barrier to entry, showcases value, easier upgrade path
+
+### **Option B: Entire Feature Premium**
+- **Free users:** No country switching functionality
+- **Premium users:** Full country switching (unlimited countries, all features)
+- **Benefits:** Strong premium incentive, higher immediate revenue potential
+
+### **Option C: Full Feature Free**
+- **Free users:** Complete country switching functionality (unlimited countries, all features)
+- **Premium users:** No additional features (country switching is free)
+- **Benefits:** Maximum user adoption, competitive advantage, upsell opportunities for other premium features
+
+**Recommendation:** Option A for balanced approach, Option C for maximum market penetration
+
+---
+
 ## **Proposed Solution**
 
 Add **country-based switching** alongside existing currency switching, with full admin configuration and widget support.
@@ -106,36 +129,47 @@ Reasoning:
 ### **Configuration Options** (Regardless of Layout)
 
 1. **Enable/Disable Country Switching**
-   - Toggle: ON/OFF
-   - Free feature for all users
+   - **Option A:** Toggle: ON/OFF (Free)
+   - **Option B:** Toggle: ON/OFF (Premium only)
+   - **Option C:** Toggle: ON/OFF (Free)
 
-2. **Select Countries** (Premium Feature)
+2. **Select Countries**
    - Multi-select dropdown with **all countries** available
    - **Optional filter:** "Show only Shopify Markets countries" checkbox
    - **Auto-detection:** Highlight/mark countries that are in Shopify Markets
    - **Validation:** Allow any country, but warn if not in Markets
-   - **Free tier:** Max 3 countries
-   - **Premium tier:** Unlimited countries
+   - **Option A:** Free tier: Max 3 countries | Premium tier: Unlimited countries
+   - **Option B:** Premium tier: Unlimited countries
+   - **Option C:** Free tier: Unlimited countries
 
-3. **Display Options** (Free)
-   - Radio buttons:
+3. **Display Options**
+   - **Option A:** Radio buttons (Free)
      - Show both switchers (currency + country)
      - Show only country switcher
      - Show only currency switcher
-   - Default: "Show both switchers"
+   - **Option B:** Radio buttons (Premium)
+     - Same options as above
+   - **Option C:** Radio buttons (Free)
+     - Same options as above
 
 4. **Theme & Styling** (Reuse existing)
-   - Use same theme configurations as currency switcher
+   - **Option A:** Same theme configurations as currency switcher (Free)
+   - **Option B:** Same theme configurations as currency switcher (Premium)
+   - **Option C:** Same theme configurations as currency switcher (Free)
    - Same color pickers (background, text, hover)
    - Same flag styles and display options
    - Same positioning options (floating, header, custom)
    - **Note:** Both switchers share styling to maintain consistency
 
 5. **Premium Features**
-   - Select more than 3 countries (Free: max 3, Premium: unlimited)
-   - Advanced fallback logic (auto-detect country → currency fallback)
-   - Custom country labels/names (e.g., "Deutschland" instead of "Germany")
-   - Analytics dashboard for country selection tracking
+   - **Option A:** 
+     - Select more than 3 countries
+     - Advanced fallback logic (auto-detect country → currency fallback)
+     - Custom country labels/names (e.g., "Deutschland" instead of "Germany")
+     - Analytics dashboard for country selection tracking
+   - **Option B:** All features included in premium package
+   - **Option C:** All features included in free package
+   - Analytics dashboard for country selection tracking (Free)
 
 ---
 
@@ -299,6 +333,9 @@ A: Widget maintains country→currency mapping, falls back to currency switching
 **Q: Can merchants customize country names?**  
 A: Premium feature - allow custom labels (e.g., "Deutschland" instead of "Germany").
 
+**Q: Should we make the entire feature premium, offer limited free tier, or make it completely free?**  
+A: **Option A (Limited Free)** is recommended for balanced approach - free users get basic functionality (3 countries, Markets filter) to experience value, then upgrade for unlimited countries and advanced features. **Option B (Premium Only)** offers stronger immediate revenue but may reduce user adoption. **Option C (Full Feature Free)** maximizes user adoption and competitive advantage, with revenue coming from other premium features.
+
 **Q: Will this work without Shopify Markets?**  
 A: Yes, but with limited functionality. Country switching will fallback to currency switching only.
 
@@ -406,6 +443,16 @@ A: Use unique CSS classes (`buckcc` vs `buckcc-country`) and shared theme variab
 | **Future Features** | ⭐⭐⭐⭐⭐ Easy to add | ⭐⭐⭐ Harder to add |
 | **Maintenance** | ⭐⭐⭐⭐⭐ Isolated | ⭐⭐⭐ Coupled |
 
+### **Premium Model Comparison**
+
+| **Criteria** | **Option A (Limited Free)** | **Option B (Premium Only)** | **Option C (Full Feature Free)** |
+|--------------|----------------------------|---------------------------|--------------------------------|
+| **User Adoption** | ⭐⭐⭐⭐⭐ High (free trial) | ⭐⭐⭐ Moderate (paywall) | ⭐⭐⭐⭐⭐ Maximum (no limits) |
+| **Revenue Potential** | ⭐⭐⭐⭐ Good (gradual upgrades) | ⭐⭐⭐⭐⭐ High (immediate) | ⭐⭐ Low (no direct revenue) |
+| **Conversion Funnel** | ⭐⭐⭐⭐⭐ Strong (value demonstration) | ⭐⭐⭐ Weak (no trial) | ⭐⭐⭐⭐ Strong (upsell other features) |
+| **Competitive Edge** | ⭐⭐⭐⭐⭐ Better (free tier) | ⭐⭐⭐ Good (premium only) | ⭐⭐⭐⭐⭐ Excellent (full free) |
+| **Support Load** | ⭐⭐⭐ Moderate (more users) | ⭐⭐⭐⭐ Low (premium only) | ⭐⭐ High (most users) |
+
 **Recommendation:** Option A (Separate Tab) for better long-term maintainability and UX.
 
 ---
@@ -413,5 +460,6 @@ A: Use unique CSS classes (`buckcc` vs `buckcc-country`) and shared theme variab
 **Next Steps:**
 1. Review RFC with tech lead
 2. Decide on admin layout approach (Option A vs B)
-3. Get approval for premium tier pricing model
-4. Begin Phase 0 implementation
+3. Decide on premium model (Option A: Limited Free vs Option B: Premium Only vs Option C: Full Feature Free)
+4. Get approval for premium tier pricing model
+5. Begin Phase 0 implementation
