@@ -1,287 +1,575 @@
-# Analytics Dashboard - Testing Guide
+**# Shopify Web Pixel Bulk Enablement Feature**
 
-## Overview
-The Analytics Dashboard tracks customer behavior and sales data to provide insights and recommendations for optimizing your currency conversion strategy.
+> ****Repository****: helixo-co/bucks-analytics
 
----
+> ****Branch****: `refactor/cleanup-pixel-only-service`
 
-## 1. Dashboard Metrics (Top Cards)
+**## Overview**
 
-### What Data is Displayed:
+This feature enables Shopify Web Pixels across multiple stores automatically using background job processing. It processes stores in batches with built-in rate limiting and retry logic.
 
-#### **Total Visits**
-- **What it shows:** Number of customer visits to your store
-- **How it's tracked:** Stored in browser local storage when customers visit the store
-- **Testing:** Visit the store multiple times and verify the count increases
+**## Key Capabilities**
 
-#### **Currency Clicks** 
-- **What it shows:** Number of times customers switched currencies
-- **How it's tracked:** Counted each time a customer clicks to change currency using the Bucks switcher
-- **Testing:** Switch currencies multiple times and verify the count increases
+- ***Batch Processing****: Process up to 500 stores per batch
+- ***Rate Limiting****: 2-second delay between stores to avoid API limits
+- ***Auto-Chaining****: Automatically queues next batch when current completes
+- ***Retry Logic****: Handles failures with exponential backoff (3 attempts)
+- ***Progress Tracking****: All results stored in MongoDB
+- ***API Triggered****: Start processing via HTTP endpoint or CLI
 
-#### **Total Sales**
-- **What it shows:** Total revenue generated across all currencies
-- **How it's tracked:** Captured when checkout is completed, using the order amount
-- **Testing:** Complete test orders and verify sales total updates
+**## How It Works**
 
-#### **Total Orders**
-- **What it shows:** Number of completed orders
-- **How it's tracked:** Counted when checkout_completed event fires
-- **Testing:** Complete test orders and verify order count increases
+```
 
-#### **Top Currency**
-- **What it shows:** The currency that was switched to most frequently
-- **How it's tracked:** Identifies which currency has the highest number of switches
-- **Testing:** Switch to a specific currency multiple times and verify it shows as top currency
+API Request → Redis Queue → Worker Process → Shopify API → MongoDB Results
 
-#### **Average Order Value**
-- **What it shows:** Average sales per order (Total Sales ÷ Total Orders)
-- **How it's calculated:** Automatically computed from total sales and orders
-- **Testing:** Complete orders with different amounts and verify the average is correct
+```
 
----
+1. API receives request and adds job to Redis queue
 
-## 2. Charts Section
+2. Worker picks up job and queries MongoDB for eligible stores
 
-### **Currency Conversion Trends** (Bar Chart)
-- **What it shows:** Number of currency switches over time
-- **How it's tracked:** Records each currency switch with timestamp
-- **Data displayed:** Currency code and number of switches
-- **Testing:** 
-  - Switch currencies on different days
-  - Verify the chart shows switches by date
-  - Check that currency codes are displayed correctly
+3. Worker processes each store with 2-second delay
 
-### **Revenue by Currency** (Bar Chart)
-- **What it shows:** Sales amount for each currency
-- **How it's tracked:** 
-  - Captures the **last selected currency** when checkout is completed
-  - Uses `selectedCurrency` field from the analytics pixel
-  - This is the currency the customer was browsing in, NOT the checkout currency
-- **Data displayed:** Currency code and total sales amount
-- **Testing:**
-  - Switch to EUR, then complete checkout
-  - Verify sales are attributed to EUR (browsing currency)
-  - Complete multiple orders in different browsing currencies
-  - Verify each currency shows correct sales total
+4. Worker calls Shopify API to create web pixel
 
----
+5. Worker saves results to MongoDB
 
-## 3. Currency Performance Tables
+6. Worker automatically chains next batch if stores remain
 
-### **Currency Switches Table**
-- **What it shows:** List of currencies with switch counts
-- **Columns:** Currency code, Number of switches
-- **How it's tracked:** Counts every time customer switches to that currency
-- **Testing:**
-  - Switch to different currencies (USD, EUR, GBP, etc.)
-  - Verify each currency appears in the table
-  - Verify switch counts are accurate
+**## Prerequisites**
 
-### **Sales by Browsing Currency Table**
-- **What it shows:** Sales breakdown by the currency customers were browsing in
-- **Columns:** Currency code, Sales amount, Number of orders
-- **How it's tracked:** 
-  - Records the **last selected currency** before checkout
-  - Stored in session storage as `buckscc_customer_currency`
-  - Sent to analytics when checkout completes
-- **Testing:**
-  - Browse in EUR, complete checkout → Sales should show under EUR
-  - Browse in GBP, complete checkout → Sales should show under GBP
-  - Verify sales amounts match order totals
+- Node.js 18+
+- MongoDB (store data and results)
+- Redis (job queue)
+- Shopify API access tokens for each store
 
-### **Sales by Country Table**
-- **What it shows:** Sales breakdown by customer's country
-- **Columns:** Country name, Sales amount, Number of orders
-- **How it's tracked:**
-  - Uses `billingCountry` from checkout billing address
-  - Also tracks `visitorCountry` from session storage (geo-location)
-- **Testing:**
-  - Complete orders with different billing countries
-  - Verify each country appears in the table
-  - Verify sales amounts are correct per country
+**## Environment Configuration**
 
----
+```env
 
-## 4. Smart Recommendations
+MONGO_URI=mongodb://localhost:27017
 
-### **Add Currency to Selected Currencies**
-- **What it suggests:** Currencies that should be added to your selected currency list
-- **When it appears:** 
-  - A currency has switches but is NOT in your selected currencies list
-  - This happens when customers are auto-switched based on their location
-  - Minimum threshold: 1 currency switch
-- **Example:** 
-  - EUR has 10 switches but is not in selected currencies
-  - Suggestion: "Add EUR to Selected Currencies"
-- **Testing:**
-  1. Remove EUR from selected currencies in settings
-  2. Enable auto-location currency switching
-  3. Visit from a European location (or use VPN)
-  4. Customer will be auto-switched to EUR
-  5. Verify suggestion appears to add EUR
+REDIS_URL=redis://127.0.0.1:6389
 
-### **Price Increase Suggestion**
-- **What it suggests:** Increase prices in your top-performing country
-- **When it appears:**
-  - A country has the highest sales amount
-  - Sales amount is greater than threshold (minimum: $1)
-  - Country exists in a Shopify market
-  - Overall average order value is >= $1
-- **Conditions:**
-  - If country is in a **single-country market**: Suggests price increase
-  - If country is in a **multi-country market**: Suggests creating separate market first
-  - If only 1 country total across all markets: Suggestion is hidden
-- **Example:**
-  - United States has $5,000 in sales (highest)
-  - US is in its own market
-  - Suggestion: "Increase Prices in United States Market"
-- **Testing:**
-  1. Complete multiple orders from one country (e.g., US)
-  2. Ensure that country has a dedicated Shopify market
-  3. Verify sales exceed $1
-  4. Check suggestion appears for price increase
+SHOPIFY_API_VERSION=2024-01
 
-### **Market Optimization Suggestion**
-- **What it suggests:** Add high-performing countries to Shopify Markets
-- **When it appears:**
-  - A country has sales but is NOT in any Shopify market
-  - Country sales amount is greater than threshold (minimum: $1)
-  - Country-specific average order value is >= $1
-  - Overall average order value is >= $1
-- **Shows:** Country name, top currency used, sales amount, order count
-- **Example:**
-  - Germany has $1,200 in sales using EUR
-  - Germany is not in any market
-  - Suggestion: "Add Germany (EUR) to Markets"
-- **Testing:**
-  1. Complete orders from a country (e.g., Germany)
-  2. Ensure Germany is NOT in any Shopify market
-  3. Verify sales exceed $1
-  4. Check suggestion appears to add Germany to markets
+PORT=3001
 
----
+NODE_ENV=development
 
-## 5. Data Tracking Flow
+```
 
-### **How Data is Captured:**
+**## API Endpoints**
 
-1. **Customer Visits Store**
-   - Visit count stored in local storage
-   - Visitor country detected and stored in session storage
+**### Trigger Pixel Enablement**
 
-2. **Customer Switches Currency**
-   - Currency switch event recorded
-   - Selected currency stored in session storage (`buckscc_customer_currency`)
-   - Switch count incremented
+- ***POST**** `/api/pixel/trigger-pixel-enablement`
+- ***Request Body:****
 
-3. **Customer Completes Checkout**
-   - Analytics pixel fires on `checkout_completed` event
-   - Data sent to analytics API:
-     - Order amount
-     - Checkout currency (what Shopify charged)
-     - **Selected currency** (what customer was browsing in - from session storage)
-     - Billing country (from checkout address)
-     - Visitor country (from session storage)
-     - Shop domain
-     - Timestamp
+```json
 
-4. **Data Stored in Database**
-   - Sales by country and currency
-   - Currency conversion trends
-   - Order counts and totals
+{
 
-5. **Dashboard Displays Data**
-   - Aggregates data from database
-   - Calculates metrics and ratios
-   - Generates suggestions based on thresholds
+"limit": 500,
 
----
+"retryType": "required_access"
 
-## 6. Testing Checklist
+}
 
-### **Basic Functionality:**
-- [ ] Visit store → Verify Total Visits increases
-- [ ] Switch currency → Verify Currency Clicks increases
-- [ ] Complete order → Verify Total Sales and Orders update
-- [ ] Check Top Currency shows most-switched currency
+```
 
-### **Charts:**
-- [ ] Switch currencies on different days → Verify trend chart updates
-- [ ] Complete orders in different browsing currencies → Verify revenue chart shows correct currencies
+- ***Parameters:****
+- `limit` (optional): Batch size, default 500
+- `retryType` (optional): Set to "required_access" to retry failed shops
+- ***Single Shop Mode:****
 
-### **Tables:**
-- [ ] Switch to multiple currencies → Verify all appear in Currency Switches table
-- [ ] Complete orders while browsing in different currencies → Verify Sales by Browsing Currency table
-- [ ] Complete orders from different countries → Verify Sales by Country table
+```
 
-### **Recommendations:**
-- [ ] Auto-switch to currency not in selected list → Verify "Add Currency" suggestion
-- [ ] Generate high sales in one country with market → Verify "Price Increase" suggestion
-- [ ] Generate sales in country without market → Verify "Market Optimization" suggestion
+POST /api/pixel/trigger-pixel-enablement?shop=mystore.myshopify.com
 
-### **Edge Cases:**
-- [ ] Zero sales → Verify no suggestions appear
-- [ ] Only one country → Verify price increase suggestion is hidden
-- [ ] All countries in markets → Verify no market optimization suggestions
+```
 
----
+- ***Response:****
 
-## 7. Important Notes
+```json
 
-### **Browsing Currency vs Checkout Currency:**
-- **Browsing Currency:** The currency the customer selected/was viewing prices in (tracked by Bucks)
-- **Checkout Currency:** The currency Shopify actually charged (may be different)
-- **Analytics uses BROWSING CURRENCY** for revenue attribution to understand customer preferences
+{
 
-### **Thresholds:**
-All thresholds are currently set to minimum values (1) for testing:
-- Minimum visits: 1
-- Minimum conversions: 1  
-- Minimum currency switches: 1
-- Minimum sales ratio (avg order value): $1
+"message": "Queued background batch processing with limit 500. BullMQ will handle the shops in chunks.",
 
-### **Data Refresh:**
-- Dashboard data updates based on date range selected (Today, Last 7 Days, Last 30 Days)
-- Suggestions are generated each time the page loads
-- Real-time updates require page refresh
+"checkStatusIn": "BullMQ / MongoDB"
 
----
+}
 
-## 8. Common Testing Scenarios
+```
 
-### **Scenario 1: New Store Setup**
-1. No data initially → All metrics show 0
-2. Visit store → Total Visits = 1
-3. Switch currency → Currency Clicks = 1
-4. Complete order → Sales and Orders update
-5. Verify all tables populate with data
+**### Health Check**
 
-### **Scenario 2: Multi-Currency Sales**
-1. Browse in EUR, complete order for $100
-2. Browse in GBP, complete order for $150  
-3. Browse in USD, complete order for $200
-4. Verify Revenue by Currency chart shows:
-   - EUR: $100
-   - GBP: $150
-   - USD: $200
+- ***GET**** `/health`
 
-### **Scenario 3: Market Recommendations**
-1. Complete $500 in sales from Germany (not in market)
-2. Verify suggestion: "Add Germany (EUR) to Markets"
-3. Add Germany to a market in Shopify
-4. Refresh dashboard
-5. Verify suggestion changes to price increase or disappears
+Returns service status.
 
-### **Scenario 4: Auto-Location Currency**
-1. Remove JPY from selected currencies
-2. Enable auto-location switching
-3. Visit from Japan (or use VPN)
-4. Customer auto-switched to JPY
-5. Verify suggestion: "Add JPY to Selected Currencies"
+**## CLI Commands**
 
----
+```bash
 
-## Support
+# Trigger batch processing
 
-For technical issues or questions about the analytics implementation, contact the development team.
+npm run trigger:pixel-enablement [limit]
+
+# Retry failed shops
+
+npm run trigger:pixel-retry
+
+# Clear pending jobs
+
+npm run clear:pixel-queue
+
+# Check MongoDB stats
+
+npm run debug:mongodb
+
+```
+
+**## MongoDB Schema**
+
+**### Collection: users**
+
+- ***Required Fields:****
+- `myshopify_domain`: Store URL (e.g., "store1.myshopify.com")
+- `accessToken`: Shopify API access token
+- `is_active`: Must be `true` to be processed
+- `first_installed`: Date when app was installed
+- ***Auto-Populated Fields:****
+- `webPixel_id`: Pixel ID after successful creation
+- `acces_checking.status`: SUCCESS, FAILED, or ERROR
+- `acces_checking.message`: Error message if failed
+- `acces_checking.code`: Error code if applicable
+- `acces_checking.date`: Processing timestamp
+- `webPixel_last_attempt`: Last processing attempt date
+- ***Example Document:****
+
+```json
+
+{
+
+"_id": ObjectId("..."),
+
+"myshopify_domain": "store1.myshopify.com",
+
+"accessToken": "shpat_xxxxx",
+
+"is_active": true,
+
+"first_installed": ISODate("2026-03-17T00:00:00.000Z"),
+
+"webPixel_id": "gid://shopify/WebPixel/123456",
+
+"acces_checking": {
+
+"status": "SUCCESS",
+
+"message": null,
+
+"code": null,
+
+"date": ISODate("2026-05-04T00:00:00.000Z")
+
+},
+
+"webPixel_last_attempt": ISODate("2026-05-04T00:00:00.000Z")
+
+}
+
+```
+
+**## Processing Logic**
+
+**### Shop Selection Criteria**
+
+- ***Standard Processing:****
+- `is_active: true`
+- `first_installed >= 2026-03-17`
+- `webPixel_id` does not exist
+- `acces_checking` does not exist
+- ***Retry Mode (required_access):****
+- Same as above, but includes shops where:
+
+- `acces_checking.message` contains "Required access"
+
+- ***Single Shop Mode:****
+- Targets specific shop by `myshopify_domain`
+
+**### Error Handling**
+
+- ***ALREADY_EXISTS Error:****
+- Worker queries existing pixels via Shopify API
+- Matches pixel by domain in settings
+- Updates MongoDB with existing pixel ID
+- Marks as SUCCESS
+- ***Other Errors:****
+- Stored in `acces_checking.message`
+- Job retries up to 3 times with exponential backoff
+- Failed jobs kept for 30 days (last 1000)
+
+**## Monitoring Progress**
+
+**### MongoDB Queries**
+
+```javascript
+
+// Total processed
+
+db.users.countDocuments({ webPixel_id: { $exists: true } })
+
+// Remaining shops
+
+db.users.countDocuments({
+
+is_active: true,
+
+webPixel_id: { $exists: false }
+
+})
+
+// Failed shops
+
+db.users.countDocuments({
+
+"acces_checking.status": "FAILED"
+
+})
+
+// Shops needing retry
+
+db.users.countDocuments({
+
+"acces_checking.message": { $regex: /Required access/i }
+
+})
+
+```
+
+**### Redis Queue Status**
+
+```bash
+
+redis-cli
+
+> LLEN bull:pixel-enablement:waiting
+
+> LLEN bull:pixel-enablement:active
+
+```
+
+**### Application Logs**
+
+Look for these key messages:
+
+- `✅ Pixel Worker initialized.` - Worker started
+- `📊 Total shops matching criteria: X` - Batch size
+- `[SUCCESS] store.myshopify.com` - Pixel created
+- `[FAILED] store.myshopify.com - Error` - Processing failed
+- `🔗 Chaining next batch. Remaining: X` - Auto-chaining
+- `✅ All batches completed!` - Processing finished
+
+**## Common Error Messages**
+
+| Error | Meaning | Action |
+
+|-------|---------|--------|
+
+| `ALREADY_EXISTS` | Pixel already created | Auto-recovered by worker |
+
+| `Required access` | Missing API scopes | Retry after granting access |
+
+| `401 Unauthorized` | Invalid access token | Update token in MongoDB |
+
+| `403 Forbidden` | Shop frozen/paused | Check shop status |
+
+**## Architecture**
+
+```
+
+┌─────────────────────────────────────────┐
+
+│         Single Node.js Process          │
+
+│                                         │
+
+│  ┌──────────────┐  ┌──────────────┐   │
+
+│  │ Express API  │  │ Pixel Worker │   │
+
+│  │  (Port 3001) │  │ (Background) │   │
+
+│  └──────────────┘  └──────────────┘   │
+
+└─────────────────────────────────────────┘
+
+│                │
+
+└────────┬───────┘
+
+│
+
+┌─────┴─────┐
+
+│   Redis   │
+
+│ (BullMQ)  │
+
+└───────────┘
+
+│
+
+┌─────┴─────┐
+
+│  MongoDB  │
+
+│  (Stores) │
+
+└───────────┘
+
+```
+
+**## Configuration Options**
+
+**### Queue Settings**
+
+File: `src/utils/queue/pixel-queue.ts`
+
+```typescript
+
+const pixelDefaultJobOptions = {
+
+attempts: 3,                    // Retry count
+
+backoff: {
+
+type: "exponential",
+
+delay: 10000                  // 10s initial delay
+
+},
+
+removeOnComplete: true,         // Clean successful jobs
+
+removeOnFail: {
+
+count: 1000,                  // Keep last 1000 failed
+
+age: 2592000                  // Keep for 30 days
+
+}
+
+};
+
+```
+
+**### Batch Size**
+
+File: `src/controllers/pixelController.ts`
+
+```typescript
+
+export const BATCH_SIZE = 500;  // Shops per batch
+
+```
+
+**### Rate Limiting**
+
+File: `src/utils/worker/pixelWorker.ts`
+
+```typescript
+
+await delay(2000);  // 2 seconds between shops
+
+```
+
+**## Troubleshooting**
+
+**### Worker Not Processing**
+
+1. Check if worker initialized:
+
+```
+
+✅ Pixel Worker initialized.
+
+```
+
+2. Verify Redis connection:
+
+```bash
+
+redis-cli ping
+
+# Should return: PONG
+
+```
+
+3. Check MongoDB connection in logs
+
+**### Jobs Stuck in Queue**
+
+Clear all pending jobs:
+
+```bash
+
+npm run clear:pixel-queue
+
+```
+
+**### High Failure Rate**
+
+1. Check MongoDB for error patterns:
+
+```javascript
+
+db.users.aggregate([
+
+{ $match: { "acces_checking.status": "FAILED" } },
+
+{ $group: { _id: "$acces_checking.message", count: { $sum: 1 } } }
+
+])
+
+```
+
+2. Retry shops with "Required access":
+
+```bash
+
+npm run trigger:pixel-retry
+
+```
+
+**## Integration Methods**
+
+**### Method 1: Standalone Service**
+
+Run as separate microservice:
+
+```javascript
+
+const response = await fetch('http://pixel-service:3001/api/pixel/trigger-pixel-enablement', {
+
+method: 'POST',
+
+headers: { 'Content-Type': 'application/json' },
+
+body: JSON.stringify({ limit: 500 })
+
+});
+
+```
+
+**### Method 2: Code Integration**
+
+Copy these files into your app:
+
+- `src/controllers/pixelController.ts`
+- `src/utils/redis.ts`
+- `src/utils/queue/pixel-queue.ts`
+- `src/utils/worker/pixelWorker.ts`
+- `src/scripts/*`
+
+Initialize in your app:
+
+```typescript
+
+import { initPixelWorker } from './utils/worker/pixelWorker';
+
+app.listen(3000);
+
+const pixelWorker = initPixelWorker();
+
+```
+
+**## Performance Considerations**
+
+- ***Processing Speed****: ~1800 stores/hour (2s delay per store)
+- ***Concurrency****: 1 batch at a time to avoid rate limits
+- ***Memory****: Minimal, processes one shop at a time
+- ***Redis****: Lightweight queue storage
+- ***MongoDB****: Indexed queries on `is_active`, `webPixel_id`, `myshopify_domain`
+
+**## Security Notes**
+
+- Access tokens stored in MongoDB
+- API endpoint has no authentication (add if needed)
+- Redis connection should be secured in production
+- Shopify API calls use HTTPS
+- No sensitive data in logs (tokens not logged)
+
+**## Future Improvements**
+
+**### Real-Time Progress Tracking**
+
+Add a progress bar or dashboard to visualize processing status:
+
+- ***Suggested Implementation:****
+- WebSocket endpoint for real-time updates
+- Progress API endpoint returning:
+
+- Total shops to process
+
+- Shops completed
+
+- Shops failed
+
+- Current batch progress
+
+- Estimated time remaining
+
+- Simple UI dashboard showing:
+
+- Progress bar with percentage
+
+- Success/failure counts
+
+- Recent processing logs
+
+- Current processing speed (shops/minute)
+
+- ***Example Progress Endpoint:****
+
+```typescript
+
+GET /api/pixel/progress
+
+Response:
+
+{
+
+"total": 5000,
+
+"completed": 2500,
+
+"failed": 50,
+
+"inProgress": 500,
+
+"percentage": 50,
+
+"estimatedTimeRemaining": "2 hours",
+
+"processingSpeed": 25
+
+}
+
+```
+
+This would provide better visibility into long-running batch operations and help identify issues early.
+
+**## Version History**
+
+- ***v1.0.0****
+- Initial release
+- Batch processing with auto-chaining
+- API endpoint for triggering
+- Retry logic for failed shops
+- MongoDB result tracking
+- Recovery logic for ALREADY_EXISTS errors
