@@ -1,575 +1,212 @@
-**# Shopify Web Pixel Bulk Enablement Feature**
+# Next.js 16.2 — What's New & How It Benefits Our Codebase
 
-> ****Repository****: helixo-co/bucks-analytics
+> **Presenter:** Software Developer  
+> **Current version:** `next@^14.2.3` (Pages Router)  
+> **Target version:** `next@16.2` (latest)  
+> **React:** Currently `18.2.0` → needs `19.2`
 
-> ****Branch****: `refactor/cleanup-pixel-only-service`
+---
 
-**## Overview**
+## 1. Why Upgrade?
 
-This feature enables Shopify Web Pixels across multiple stores automatically using background job processing. It processes stores in batches with built-in rate limiting and retry logic.
+| Area | v14 (Current) | v16.2 |
+|------|--------------|-------|
+| Bundler | Webpack (only) | **Turbopack by default** (dev + build) |
+| Dev startup | Baseline | **~400% faster** `next dev` startup |
+| Server rendering | Baseline | **25–60% faster** HTML rendering (RSC payload deserialization) |
+| React | 18.2 | **19.2** (View Transitions, React Compiler, Activity API) |
+| Middleware | `middleware.js` | Renamed to **`proxy.js`** (Node.js runtime, no edge) |
+| Caching | Route-level | Per-segment prefetch + `cacheComponents` |
+| Dev/Build output | Shared `.next/` | **Separate** `.next/dev` + `.next/` (concurrent dev & build) |
 
-**## Key Capabilities**
+---
 
-- ***Batch Processing****: Process up to 500 stores per batch
-- ***Rate Limiting****: 2-second delay between stores to avoid API limits
-- ***Auto-Chaining****: Automatically queues next batch when current completes
-- ***Retry Logic****: Handles failures with exponential backoff (3 attempts)
-- ***Progress Tracking****: All results stored in MongoDB
-- ***API Triggered****: Start processing via HTTP endpoint or CLI
+## 2. Top Features Relevant to Our Codebase
 
-**## How It Works**
+### 2.1 Turbopack by Default
+- No more `--turbopack` flag needed — it's the default for both `next dev` and `next build`.
+- **⚠️ Impact on us:** We have a custom `webpack` config in `next.config.js` (lines 53-70) for `resolve.fallback` (fs, net, tls, readline) and externalizing `posthog-node`.
+- **Migration path:**
+  - Either use `--webpack` flag temporarily: `"build": "next build --webpack"`
+  - Or migrate to Turbopack's `resolveAlias`:
+    ```js
+    // next.config.js — Turbopack equivalent
+    const nextConfig = {
+      turbopack: {
+        resolveAlias: {
+          fs: { browser: './empty.js' },
+          net: { browser: './empty.js' },
+          tls: { browser: './empty.js' },
+          readline: { browser: './empty.js' },
+        },
+      },
+    };
+    ```
+- **Turbopack FS Caching (beta):** Stores compiler artifacts on disk between restarts → even faster recompiles.
+  ```js
+  experimental: { turbopackFileSystemCacheForDev: true }
+  ```
 
-```
+### 2.2 ~400% Faster Dev Startup
+- `next dev` now loads config only once (was twice before).
+- **Note:** `process.argv` no longer includes `'dev'` during config load — use `process.env.NODE_ENV === 'development'` instead.  
+  ✅ Our `next.config.js` already uses `process.env.NODE_ENV` — no change needed.
 
-API Request → Redis Queue → Worker Process → Shopify API → MongoDB Results
+### 2.3 25–60% Faster Server Rendering
+- React's `JSON.parse` reviver callback was causing C++/JS boundary overhead in V8.
+- New two-step approach: plain `JSON.parse()` + recursive JS walk.
+- **Real-world results:**
+  - Table with 1000 items → **26% faster**
+  - Nested Suspense → **33% faster**
+  - Rich text pages → **60% faster**
+- **Impact:** All our API routes and SSR pages benefit automatically — zero code changes.
 
-```
+### 2.4 Middleware → Proxy Rename
+- `middleware.js` is **deprecated**, renamed to `proxy.js`.
+- Exported function `middleware()` → `proxy()`.
+- Config: `skipMiddlewareUrlNormalize` → `skipProxyUrlNormalize`.
+- **Our middleware.js** (33 lines, CSP + CORS headers) → simple rename.
+  ```
+  mv middleware.js proxy.js
+  # Rename function: middleware() → proxy()
+  ```
+- **Runtime change:** `proxy.js` runs on Node.js only (not Edge). Our middleware doesn't use Edge-specific APIs, so this is fine.
 
-1. API receives request and adds job to Redis queue
+### 2.5 React 19.2 + React Compiler
+- **React Compiler (stable):** Automatic memoization — no more manual `useMemo`/`useCallback` needed.
+  ```js
+  // next.config.js
+  const nextConfig = { reactCompiler: true };
+  ```
+  - Potential impact: We use `react-query` with various callbacks — compiler auto-memoizes them.
+  
+- **View Transitions API:** Native page transition animations.
+  ```jsx
+  <Link href="/settings" transitionTypes={['slide']}>Settings</Link>
+  ```
+  - Could enhance our Navigation component for smooth page transitions.
 
-2. Worker picks up job and queries MongoDB for eligible stores
+- **`useEffectEvent`:** Extract non-reactive logic from Effects — useful for our PostHog tracking in `_app.js`.
 
-3. Worker processes each store with 2-second delay
+- **Activity API:** Hide UI with `display: none` while maintaining state — useful for tab-based interfaces.
 
-4. Worker calls Shopify API to create web pixel
+### 2.6 Enhanced Routing & Navigation
+- **Layout deduplication:** Shared layouts downloaded once across sibling routes.
+- **Incremental prefetching:** Only prefetches parts not already in cache.
+- **Impact:** Our dashboard pages share a common layout — fewer network requests, faster navigations.
 
-5. Worker saves results to MongoDB
+### 2.7 Better DX (Developer Experience)
+| Feature | Benefit |
+|---------|---------|
+| **Server Function Logging** | See function name, args, execution time in terminal |
+| **Hydration Diff Indicator** | `+ Client / - Server` legend in error overlay |
+| **Error Causes in Dev Overlay** | `Error.cause` chains shown up to 5 levels deep |
+| **`--inspect` for `next start`** | Debug/profile production server with Node.js debugger |
+| **New Default Error Page** | Cleaner 500 page out of the box |
 
-6. Worker automatically chains next batch if stores remain
+### 2.8 Experimental Features Worth Watching
+- **`unstable_catchError()`** — Granular component-level error boundaries (better than just `error.js`).
+- **`unstable_retry()`** — Built-in retry logic for error recovery (re-fetches data, not just re-renders).
+- **`experimental.prefetchInlining`** — Bundle all segment data into single response per link.
+- **`experimental.appNewScrollHandler`** — Better scroll/focus management after navigation.
 
-**## Prerequisites**
+---
 
-- Node.js 18+
-- MongoDB (store data and results)
-- Redis (job queue)
-- Shopify API access tokens for each store
+## 3. Breaking Changes We Need to Handle
 
-**## Environment Configuration**
+### 3.1 Async Request APIs (Fully Enforced)
+In v15 it was a warning, in v16 synchronous access is **removed**:
+- `cookies()`, `headers()`, `draftMode()` — must be `await`ed
+- `params` and `searchParams` in pages/layouts — must be `await`ed
 
-```env
-
-MONGO_URI=mongodb://localhost:27017
-
-REDIS_URL=redis://127.0.0.1:6389
-
-SHOPIFY_API_VERSION=2024-01
-
-PORT=3001
-
-NODE_ENV=development
-
-```
-
-**## API Endpoints**
-
-**### Trigger Pixel Enablement**
-
-- ***POST**** `/api/pixel/trigger-pixel-enablement`
-- ***Request Body:****
-
-```json
-
-{
-
-"limit": 500,
-
-"retryType": "required_access"
-
+```js
+// Before (v14)
+export default function Page({ searchParams }) {
+  const shop = searchParams.shop;
 }
 
-```
-
-- ***Parameters:****
-- `limit` (optional): Batch size, default 500
-- `retryType` (optional): Set to "required_access" to retry failed shops
-- ***Single Shop Mode:****
-
-```
-
-POST /api/pixel/trigger-pixel-enablement?shop=mystore.myshopify.com
-
-```
-
-- ***Response:****
-
-```json
-
-{
-
-"message": "Queued background batch processing with limit 500. BullMQ will handle the shops in chunks.",
-
-"checkStatusIn": "BullMQ / MongoDB"
-
+// After (v16)
+export default async function Page({ searchParams }) {
+  const { shop } = await searchParams;
 }
-
 ```
-
-**### Health Check**
-
-- ***GET**** `/health`
-
-Returns service status.
-
-**## CLI Commands**
-
+**Impact:** All our `pages/` directory API routes and pages that access these need updating. The codemod handles this automatically:
 ```bash
-
-# Trigger batch processing
-
-npm run trigger:pixel-enablement [limit]
-
-# Retry failed shops
-
-npm run trigger:pixel-retry
-
-# Clear pending jobs
-
-npm run clear:pixel-queue
-
-# Check MongoDB stats
-
-npm run debug:mongodb
-
+npx @next/codemod@canary upgrade latest
 ```
 
-**## MongoDB Schema**
+### 3.2 React 18 → 19 Upgrade
+- `react` and `react-dom` must be upgraded from `18.2.0` to `19.2`.
+- `react-query v3` (we use `^3.39.3`) — **needs migration to `@tanstack/react-query` v5** for React 19 compatibility.
+
+### 3.3 Node.js Minimum Version
+- Requires **Node.js 20.9.0+**
+
+### 3.4 Removed Features
+| Removed | Impact on Us |
+|---------|-------------|
+| AMP support | None — we don't use AMP |
+| `next lint` command | Use ESLint/Biome directly; `next build` no longer runs lint |
+| `next/legacy/image` | None — we use `next/image` |
+| Runtime config (`publicRuntimeConfig`) | Check if we use it |
+
+### 3.5 Custom Webpack Config
+Our `next.config.js` has a `webpack` callback. In v16, `next build` uses Turbopack by default and will **fail** if it finds a webpack config.
+- **Option A:** Add `--webpack` flag to build script
+- **Option B:** Migrate to Turbopack config (recommended long-term)
+
+---
+
+## 4. Migration Effort Estimate
+
+| Task | Effort | Priority |
+|------|--------|----------|
+| Upgrade `next`, `react`, `react-dom` | Low | High |
+| Run async API codemod | Low | High |
+| Rename `middleware.js` → `proxy.js` | Low | High |
+| Migrate `react-query` v3 → `@tanstack/react-query` v5 | **Medium** | High |
+| Migrate webpack config → Turbopack | Low-Medium | Medium |
+| Test all pages/API routes | Medium | High |
+| Enable React Compiler | Low | Low (optional) |
+| Add View Transitions | Low | Low (nice-to-have) |
+
+### Recommended Migration Steps
+1. **Backup & branch** — create `feature/next16-upgrade`
+2. **Run the codemod:**
+   ```bash
+   npx @next/codemod@canary upgrade latest
+   ```
+3. **Update dependencies manually:**
+   ```bash
+   npm install next@latest react@latest react-dom@latest
+   npm install @tanstack/react-query@latest  # replace react-query
+   ```
+4. **Rename middleware → proxy**
+5. **Handle webpack → Turbopack** (or use `--webpack` flag)
+6. **Test thoroughly** — all API routes, pages, widget loading
+7. **Enable optional features** — React Compiler, View Transitions
+
+---
+
+## 5. Quick Wins After Upgrade (Zero/Low Effort, High Impact)
+
+1. **Free performance** — 25-60% faster rendering, 400% faster dev startup
+2. **Turbopack FS caching** — one config line for faster rebuilds
+3. **React Compiler** — auto-memoization, one config line
+4. **Better debugging** — Server Function logging, Hydration diffs, Error causes
+5. **`--inspect` on production** — debug production issues easily
+
+---
+
+## 6. References
+
+- [Next.js 16.2 Blog Post](https://nextjs.org/blog/next-16-2)
+- [Upgrading to v16 Guide](https://nextjs.org/docs/app/guides/upgrading/version-16)
+- [Next.js Blog (all releases)](https://nextjs.org/blog)
+- [React 19.2 Announcement](https://react.dev/blog/2025/10/01/react-19-2)
+- [Turbopack Deep Dive](https://nextjs.org/blog/next-16-2-turbopack)
+
+---
+
+> **TL;DR:** Upgrading from Next.js 14 → 16.2 gives us **massive free performance gains** (400% faster dev, 25-60% faster rendering), **Turbopack** as the default bundler, **React 19.2** with auto-memoization via React Compiler, better DX with debugging tools, and a cleaner architecture (`proxy.js` replacing middleware). The biggest migration effort is upgrading `react-query` v3 → `@tanstack/react-query` v5 and handling the async Request APIs codemod.
 
-**### Collection: users**
-
-- ***Required Fields:****
-- `myshopify_domain`: Store URL (e.g., "store1.myshopify.com")
-- `accessToken`: Shopify API access token
-- `is_active`: Must be `true` to be processed
-- `first_installed`: Date when app was installed
-- ***Auto-Populated Fields:****
-- `webPixel_id`: Pixel ID after successful creation
-- `acces_checking.status`: SUCCESS, FAILED, or ERROR
-- `acces_checking.message`: Error message if failed
-- `acces_checking.code`: Error code if applicable
-- `acces_checking.date`: Processing timestamp
-- `webPixel_last_attempt`: Last processing attempt date
-- ***Example Document:****
-
-```json
-
-{
-
-"_id": ObjectId("..."),
-
-"myshopify_domain": "store1.myshopify.com",
-
-"accessToken": "shpat_xxxxx",
-
-"is_active": true,
-
-"first_installed": ISODate("2026-03-17T00:00:00.000Z"),
-
-"webPixel_id": "gid://shopify/WebPixel/123456",
-
-"acces_checking": {
-
-"status": "SUCCESS",
-
-"message": null,
-
-"code": null,
-
-"date": ISODate("2026-05-04T00:00:00.000Z")
-
-},
-
-"webPixel_last_attempt": ISODate("2026-05-04T00:00:00.000Z")
-
-}
-
-```
-
-**## Processing Logic**
-
-**### Shop Selection Criteria**
-
-- ***Standard Processing:****
-- `is_active: true`
-- `first_installed >= 2026-03-17`
-- `webPixel_id` does not exist
-- `acces_checking` does not exist
-- ***Retry Mode (required_access):****
-- Same as above, but includes shops where:
-
-- `acces_checking.message` contains "Required access"
-
-- ***Single Shop Mode:****
-- Targets specific shop by `myshopify_domain`
-
-**### Error Handling**
-
-- ***ALREADY_EXISTS Error:****
-- Worker queries existing pixels via Shopify API
-- Matches pixel by domain in settings
-- Updates MongoDB with existing pixel ID
-- Marks as SUCCESS
-- ***Other Errors:****
-- Stored in `acces_checking.message`
-- Job retries up to 3 times with exponential backoff
-- Failed jobs kept for 30 days (last 1000)
-
-**## Monitoring Progress**
-
-**### MongoDB Queries**
-
-```javascript
-
-// Total processed
-
-db.users.countDocuments({ webPixel_id: { $exists: true } })
-
-// Remaining shops
-
-db.users.countDocuments({
-
-is_active: true,
-
-webPixel_id: { $exists: false }
-
-})
-
-// Failed shops
-
-db.users.countDocuments({
-
-"acces_checking.status": "FAILED"
-
-})
-
-// Shops needing retry
-
-db.users.countDocuments({
-
-"acces_checking.message": { $regex: /Required access/i }
-
-})
-
-```
-
-**### Redis Queue Status**
-
-```bash
-
-redis-cli
-
-> LLEN bull:pixel-enablement:waiting
-
-> LLEN bull:pixel-enablement:active
-
-```
-
-**### Application Logs**
-
-Look for these key messages:
-
-- `✅ Pixel Worker initialized.` - Worker started
-- `📊 Total shops matching criteria: X` - Batch size
-- `[SUCCESS] store.myshopify.com` - Pixel created
-- `[FAILED] store.myshopify.com - Error` - Processing failed
-- `🔗 Chaining next batch. Remaining: X` - Auto-chaining
-- `✅ All batches completed!` - Processing finished
-
-**## Common Error Messages**
-
-| Error | Meaning | Action |
-
-|-------|---------|--------|
-
-| `ALREADY_EXISTS` | Pixel already created | Auto-recovered by worker |
-
-| `Required access` | Missing API scopes | Retry after granting access |
-
-| `401 Unauthorized` | Invalid access token | Update token in MongoDB |
-
-| `403 Forbidden` | Shop frozen/paused | Check shop status |
-
-**## Architecture**
-
-```
-
-┌─────────────────────────────────────────┐
-
-│         Single Node.js Process          │
-
-│                                         │
-
-│  ┌──────────────┐  ┌──────────────┐   │
-
-│  │ Express API  │  │ Pixel Worker │   │
-
-│  │  (Port 3001) │  │ (Background) │   │
-
-│  └──────────────┘  └──────────────┘   │
-
-└─────────────────────────────────────────┘
-
-│                │
-
-└────────┬───────┘
-
-│
-
-┌─────┴─────┐
-
-│   Redis   │
-
-│ (BullMQ)  │
-
-└───────────┘
-
-│
-
-┌─────┴─────┐
-
-│  MongoDB  │
-
-│  (Stores) │
-
-└───────────┘
-
-```
-
-**## Configuration Options**
-
-**### Queue Settings**
-
-File: `src/utils/queue/pixel-queue.ts`
-
-```typescript
-
-const pixelDefaultJobOptions = {
-
-attempts: 3,                    // Retry count
-
-backoff: {
-
-type: "exponential",
-
-delay: 10000                  // 10s initial delay
-
-},
-
-removeOnComplete: true,         // Clean successful jobs
-
-removeOnFail: {
-
-count: 1000,                  // Keep last 1000 failed
-
-age: 2592000                  // Keep for 30 days
-
-}
-
-};
-
-```
-
-**### Batch Size**
-
-File: `src/controllers/pixelController.ts`
-
-```typescript
-
-export const BATCH_SIZE = 500;  // Shops per batch
-
-```
-
-**### Rate Limiting**
-
-File: `src/utils/worker/pixelWorker.ts`
-
-```typescript
-
-await delay(2000);  // 2 seconds between shops
-
-```
-
-**## Troubleshooting**
-
-**### Worker Not Processing**
-
-1. Check if worker initialized:
-
-```
-
-✅ Pixel Worker initialized.
-
-```
-
-2. Verify Redis connection:
-
-```bash
-
-redis-cli ping
-
-# Should return: PONG
-
-```
-
-3. Check MongoDB connection in logs
-
-**### Jobs Stuck in Queue**
-
-Clear all pending jobs:
-
-```bash
-
-npm run clear:pixel-queue
-
-```
-
-**### High Failure Rate**
-
-1. Check MongoDB for error patterns:
-
-```javascript
-
-db.users.aggregate([
-
-{ $match: { "acces_checking.status": "FAILED" } },
-
-{ $group: { _id: "$acces_checking.message", count: { $sum: 1 } } }
-
-])
-
-```
-
-2. Retry shops with "Required access":
-
-```bash
-
-npm run trigger:pixel-retry
-
-```
-
-**## Integration Methods**
-
-**### Method 1: Standalone Service**
-
-Run as separate microservice:
-
-```javascript
-
-const response = await fetch('http://pixel-service:3001/api/pixel/trigger-pixel-enablement', {
-
-method: 'POST',
-
-headers: { 'Content-Type': 'application/json' },
-
-body: JSON.stringify({ limit: 500 })
-
-});
-
-```
-
-**### Method 2: Code Integration**
-
-Copy these files into your app:
-
-- `src/controllers/pixelController.ts`
-- `src/utils/redis.ts`
-- `src/utils/queue/pixel-queue.ts`
-- `src/utils/worker/pixelWorker.ts`
-- `src/scripts/*`
-
-Initialize in your app:
-
-```typescript
-
-import { initPixelWorker } from './utils/worker/pixelWorker';
-
-app.listen(3000);
-
-const pixelWorker = initPixelWorker();
-
-```
-
-**## Performance Considerations**
-
-- ***Processing Speed****: ~1800 stores/hour (2s delay per store)
-- ***Concurrency****: 1 batch at a time to avoid rate limits
-- ***Memory****: Minimal, processes one shop at a time
-- ***Redis****: Lightweight queue storage
-- ***MongoDB****: Indexed queries on `is_active`, `webPixel_id`, `myshopify_domain`
-
-**## Security Notes**
-
-- Access tokens stored in MongoDB
-- API endpoint has no authentication (add if needed)
-- Redis connection should be secured in production
-- Shopify API calls use HTTPS
-- No sensitive data in logs (tokens not logged)
-
-**## Future Improvements**
-
-**### Real-Time Progress Tracking**
-
-Add a progress bar or dashboard to visualize processing status:
-
-- ***Suggested Implementation:****
-- WebSocket endpoint for real-time updates
-- Progress API endpoint returning:
-
-- Total shops to process
-
-- Shops completed
-
-- Shops failed
-
-- Current batch progress
-
-- Estimated time remaining
-
-- Simple UI dashboard showing:
-
-- Progress bar with percentage
-
-- Success/failure counts
-
-- Recent processing logs
-
-- Current processing speed (shops/minute)
-
-- ***Example Progress Endpoint:****
-
-```typescript
-
-GET /api/pixel/progress
-
-Response:
-
-{
-
-"total": 5000,
-
-"completed": 2500,
-
-"failed": 50,
-
-"inProgress": 500,
-
-"percentage": 50,
-
-"estimatedTimeRemaining": "2 hours",
-
-"processingSpeed": 25
-
-}
-
-```
-
-This would provide better visibility into long-running batch operations and help identify issues early.
-
-**## Version History**
-
-- ***v1.0.0****
-- Initial release
-- Batch processing with auto-chaining
-- API endpoint for triggering
-- Retry logic for failed shops
-- MongoDB result tracking
-- Recovery logic for ALREADY_EXISTS errors
