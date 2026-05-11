@@ -1,212 +1,231 @@
-# Next.js 16.2 — What's New & How It Benefits Our Codebase
+# Smart Recommendations — Technical Implementation
 
-> **Presenter:** Software Developer  
-> **Current version:** `next@^14.2.3` (Pages Router)  
-> **Target version:** `next@16.2` (latest)  
-> **React:** Currently `18.2.0` → needs `19.2`
+## Overview
 
----
-
-## 1. Why Upgrade?
-
-| Area | v14 (Current) | v16.2 |
-|------|--------------|-------|
-| Bundler | Webpack (only) | **Turbopack by default** (dev + build) |
-| Dev startup | Baseline | **~400% faster** `next dev` startup |
-| Server rendering | Baseline | **25–60% faster** HTML rendering (RSC payload deserialization) |
-| React | 18.2 | **19.2** (View Transitions, React Compiler, Activity API) |
-| Middleware | `middleware.js` | Renamed to **`proxy.js`** (Node.js runtime, no edge) |
-| Caching | Route-level | Per-segment prefetch + `cacheComponents` |
-| Dev/Build output | Shared `.next/` | **Separate** `.next/dev` + `.next/` (concurrent dev & build) |
+The Suggestions system generates up to **3 actionable recommendations** per store based on analytics data. It has **two generation paths**: rule-based (manual) and AI-powered (Gemini). AI suggestions are preferred when available; manual suggestions serve as the fallback.
 
 ---
 
-## 2. Top Features Relevant to Our Codebase
+## Architecture
 
-### 2.1 Turbopack by Default
-- No more `--turbopack` flag needed — it's the default for both `next dev` and `next build`.
-- **⚠️ Impact on us:** We have a custom `webpack` config in `next.config.js` (lines 53-70) for `resolve.fallback` (fs, net, tls, readline) and externalizing `posthog-node`.
-- **Migration path:**
-  - Either use `--webpack` flag temporarily: `"build": "next build --webpack"`
-  - Or migrate to Turbopack's `resolveAlias`:
-    ```js
-    // next.config.js — Turbopack equivalent
-    const nextConfig = {
-      turbopack: {
-        resolveAlias: {
-          fs: { browser: './empty.js' },
-          net: { browser: './empty.js' },
-          tls: { browser: './empty.js' },
-          readline: { browser: './empty.js' },
-        },
-      },
-    };
-    ```
-- **Turbopack FS Caching (beta):** Stores compiler artifacts on disk between restarts → even faster recompiles.
-  ```js
-  experimental: { turbopackFileSystemCacheForDev: true }
-  ```
-
-### 2.2 ~400% Faster Dev Startup
-- `next dev` now loads config only once (was twice before).
-- **Note:** `process.argv` no longer includes `'dev'` during config load — use `process.env.NODE_ENV === 'development'` instead.  
-  ✅ Our `next.config.js` already uses `process.env.NODE_ENV` — no change needed.
-
-### 2.3 25–60% Faster Server Rendering
-- React's `JSON.parse` reviver callback was causing C++/JS boundary overhead in V8.
-- New two-step approach: plain `JSON.parse()` + recursive JS walk.
-- **Real-world results:**
-  - Table with 1000 items → **26% faster**
-  - Nested Suspense → **33% faster**
-  - Rich text pages → **60% faster**
-- **Impact:** All our API routes and SSR pages benefit automatically — zero code changes.
-
-### 2.4 Middleware → Proxy Rename
-- `middleware.js` is **deprecated**, renamed to `proxy.js`.
-- Exported function `middleware()` → `proxy()`.
-- Config: `skipMiddlewareUrlNormalize` → `skipProxyUrlNormalize`.
-- **Our middleware.js** (33 lines, CSP + CORS headers) → simple rename.
-  ```
-  mv middleware.js proxy.js
-  # Rename function: middleware() → proxy()
-  ```
-- **Runtime change:** `proxy.js` runs on Node.js only (not Edge). Our middleware doesn't use Edge-specific APIs, so this is fine.
-
-### 2.5 React 19.2 + React Compiler
-- **React Compiler (stable):** Automatic memoization — no more manual `useMemo`/`useCallback` needed.
-  ```js
-  // next.config.js
-  const nextConfig = { reactCompiler: true };
-  ```
-  - Potential impact: We use `react-query` with various callbacks — compiler auto-memoizes them.
-  
-- **View Transitions API:** Native page transition animations.
-  ```jsx
-  <Link href="/settings" transitionTypes={['slide']}>Settings</Link>
-  ```
-  - Could enhance our Navigation component for smooth page transitions.
-
-- **`useEffectEvent`:** Extract non-reactive logic from Effects — useful for our PostHog tracking in `_app.js`.
-
-- **Activity API:** Hide UI with `display: none` while maintaining state — useful for tab-based interfaces.
-
-### 2.6 Enhanced Routing & Navigation
-- **Layout deduplication:** Shared layouts downloaded once across sibling routes.
-- **Incremental prefetching:** Only prefetches parts not already in cache.
-- **Impact:** Our dashboard pages share a common layout — fewer network requests, faster navigations.
-
-### 2.7 Better DX (Developer Experience)
-| Feature | Benefit |
-|---------|---------|
-| **Server Function Logging** | See function name, args, execution time in terminal |
-| **Hydration Diff Indicator** | `+ Client / - Server` legend in error overlay |
-| **Error Causes in Dev Overlay** | `Error.cause` chains shown up to 5 levels deep |
-| **`--inspect` for `next start`** | Debug/profile production server with Node.js debugger |
-| **New Default Error Page** | Cleaner 500 page out of the box |
-
-### 2.8 Experimental Features Worth Watching
-- **`unstable_catchError()`** — Granular component-level error boundaries (better than just `error.js`).
-- **`unstable_retry()`** — Built-in retry logic for error recovery (re-fetches data, not just re-renders).
-- **`experimental.prefetchInlining`** — Bundle all segment data into single response per link.
-- **`experimental.appNewScrollHandler`** — Better scroll/focus management after navigation.
-
----
-
-## 3. Breaking Changes We Need to Handle
-
-### 3.1 Async Request APIs (Fully Enforced)
-In v15 it was a warning, in v16 synchronous access is **removed**:
-- `cookies()`, `headers()`, `draftMode()` — must be `await`ed
-- `params` and `searchParams` in pages/layouts — must be `await`ed
-
-```js
-// Before (v14)
-export default function Page({ searchParams }) {
-  const shop = searchParams.shop;
-}
-
-// After (v16)
-export default async function Page({ searchParams }) {
-  const { shop } = await searchParams;
-}
 ```
-**Impact:** All our `pages/` directory API routes and pages that access these need updating. The codemod handles this automatically:
-```bash
-npx @next/codemod@canary upgrade latest
+Frontend (bucks-converter-main)          Backend (bucks-analytics-backend)
+─────────────────────────────────        ─────────────────────────────────
+analytics/index.jsx                      
+  │                                      
+  │  GET /api/v1/analytics/proxy         
+  │      ?path=suggestions               
+  │      &startDate=...&endDate=...      
+  │                                      
+  └──► proxy.js ──► GET /api/analytics/suggestions?shop=...&startDate=...&endDate=...
+                                           │
+                                           ▼
+                                     suggestionsController.ts → getSuggestions()
+                                           │
+                                     ┌─────┴──────────────────┐
+                                     │  fetchSnapshotData()    │  (internal — gathers all data)
+                                     │   ├─ Prisma: users,    │
+                                     │   │  settings           │
+                                     │   ├─ Shopify GraphQL:   │
+                                     │   │  fetchAllMarkets()  │
+                                     │   └─ ClickHouse:        │
+                                     │      7 parallel queries │
+                                     └────────────────────────-┘
+                                           │
+                                     ┌─────┴────────────────────┐
+                                     │  generateSuggestions()    │  (manual / rule-based)
+                                     │  generateAISuggestions()  │  (Gemini 2.0 Flash)
+                                     └──────────────────────────┘
+                                           │
+                                     Response: { suggestions, aiSuggestions,
+                                                 manualSuggestions, usingAI }
 ```
 
-### 3.2 React 18 → 19 Upgrade
-- `react` and `react-dom` must be upgraded from `18.2.0` to `19.2`.
-- `react-query v3` (we use `^3.39.3`) — **needs migration to `@tanstack/react-query` v5** for React 19 compatibility.
+### Key Files
 
-### 3.3 Node.js Minimum Version
-- Requires **Node.js 20.9.0+**
-
-### 3.4 Removed Features
-| Removed | Impact on Us |
-|---------|-------------|
-| AMP support | None — we don't use AMP |
-| `next lint` command | Use ESLint/Biome directly; `next build` no longer runs lint |
-| `next/legacy/image` | None — we use `next/image` |
-| Runtime config (`publicRuntimeConfig`) | Check if we use it |
-
-### 3.5 Custom Webpack Config
-Our `next.config.js` has a `webpack` callback. In v16, `next build` uses Turbopack by default and will **fail** if it finds a webpack config.
-- **Option A:** Add `--webpack` flag to build script
-- **Option B:** Migrate to Turbopack config (recommended long-term)
+| Layer | File | Purpose |
+|-------|------|---------|
+| **Route** | `src/routes/analyticsRoutes.ts` | `GET /suggestions` → `getSuggestions` |
+| **Controller** | `src/controllers/suggestionsController.ts` | Orchestrates data fetch → manual + AI generation |
+| **Manual logic** | `src/utils/analytics/suggestionUtils.ts` | `generateSuggestions()`, `findCountriesNotInMarkets()`, `filterAISuggestions()` |
+| **AI service** | `src/utils/analytics/aiSuggestionsService.ts` | `generateAISuggestions()` — calls Gemini, manages cache |
+| **AI prompts** | `src/utils/analytics/aiPromptUtils.ts` | `buildSystemPrompt()`, `buildUserMessage()` — structures the prompt sent to Gemini |
+| **Market utils** | `src/utils/analytics/marketUtils.ts` | `fetchAllMarkets()`, `findMarketContainingCountry()`, `getCountriesInMarket()` |
+| **Constants** | `src/utils/analytics/constants.ts` | `ANALYTICS_THRESHOLDS` — all minimum thresholds |
+| **Frontend proxy** | `pages/api/v1/analytics/proxy.js` | Authenticates session, forwards request to analytics backend |
+| **Frontend page** | `pages/analytics/index.jsx` | Calls proxy in parallel with other analytics APIs |
 
 ---
 
-## 4. Migration Effort Estimate
+## API
 
-| Task | Effort | Priority |
-|------|--------|----------|
-| Upgrade `next`, `react`, `react-dom` | Low | High |
-| Run async API codemod | Low | High |
-| Rename `middleware.js` → `proxy.js` | Low | High |
-| Migrate `react-query` v3 → `@tanstack/react-query` v5 | **Medium** | High |
-| Migrate webpack config → Turbopack | Low-Medium | Medium |
-| Test all pages/API routes | Medium | High |
-| Enable React Compiler | Low | Low (optional) |
-| Add View Transitions | Low | Low (nice-to-have) |
+### `GET /api/analytics/suggestions`
 
-### Recommended Migration Steps
-1. **Backup & branch** — create `feature/next16-upgrade`
-2. **Run the codemod:**
-   ```bash
-   npx @next/codemod@canary upgrade latest
-   ```
-3. **Update dependencies manually:**
-   ```bash
-   npm install next@latest react@latest react-dom@latest
-   npm install @tanstack/react-query@latest  # replace react-query
-   ```
-4. **Rename middleware → proxy**
-5. **Handle webpack → Turbopack** (or use `--webpack` flag)
-6. **Test thoroughly** — all API routes, pages, widget loading
-7. **Enable optional features** — React Compiler, View Transitions
+**Query params:** `shop` (required), `startDate`, `endDate`
+
+**Response:**
+```json
+{
+  "success": true,
+  "suggestions": [],       // Final list shown to user (AI if available, else manual)
+  "aiSuggestions": [],      // AI-generated only
+  "manualSuggestions": [],  // Rule-based only
+  "aiFromCache": false,     // Whether AI result was served from DB cache
+  "usingAI": true           // true if aiSuggestions were used
+}
+```
 
 ---
 
-## 5. Quick Wins After Upgrade (Zero/Low Effort, High Impact)
+## Thresholds
 
-1. **Free performance** — 25-60% faster rendering, 400% faster dev startup
-2. **Turbopack FS caching** — one config line for faster rebuilds
-3. **React Compiler** — auto-memoization, one config line
-4. **Better debugging** — Server Function logging, Hydration diffs, Error causes
-5. **`--inspect` on production** — debug production issues easily
+Defined in `constants.ts`:
 
----
-
-## 6. References
-
-- [Next.js 16.2 Blog Post](https://nextjs.org/blog/next-16-2)
-- [Upgrading to v16 Guide](https://nextjs.org/docs/app/guides/upgrading/version-16)
-- [Next.js Blog (all releases)](https://nextjs.org/blog)
-- [React 19.2 Announcement](https://react.dev/blog/2025/10/01/react-19-2)
-- [Turbopack Deep Dive](https://nextjs.org/blog/next-16-2-turbopack)
+| Threshold | Value | Used For |
+|-----------|-------|----------|
+| `MIN_CONVERSIONS_THRESHOLD` | 1 | Minimum total currency switches before any currency suggestion triggers |
+| `MIN_CURRENCY_SWITCHES` | 1 | Minimum switches for a specific currency to be suggested |
+| `MIN_SALES_RATIO` | 1 | Minimum average order value (`totalSales / totalOrders`) for pricing/country suggestions |
 
 ---
 
-> **TL;DR:** Upgrading from Next.js 14 → 16.2 gives us **massive free performance gains** (400% faster dev, 25-60% faster rendering), **Turbopack** as the default bundler, **React 19.2** with auto-memoization via React Compiler, better DX with debugging tools, and a cleaner architecture (`proxy.js` replacing middleware). The biggest migration effort is upgrading `react-query` v3 → `@tanstack/react-query` v5 and handling the async Request APIs codemod.
+## Suggestion Types
 
+### 1. `CURRENCY_NOT_SELECTED` — Add Currency to Selected Currencies
+
+**Trigger conditions (all must be true):**
+- `totalConversions >= MIN_CONVERSIONS_THRESHOLD`
+- A currency exists in `currencyConversions` that is **not** in the shop's `selectedCurrencies`
+- That currency is **not** the shop's `defaultCurrency`
+- That currency has `conversions >= MIN_CURRENCY_SWITCHES`
+- Only the **top** (highest conversions) qualifying currency is suggested
+
+**Data source:** `currency_switches` ClickHouse table → aggregated by currency
+
+**Implementation:** `findCurrencyNotInSelectedList()` in `suggestionUtils.ts`
+
+**Example output:**
+```json
+{
+  "type": "CURRENCY_NOT_SELECTED",
+  "priority": "HIGH",
+  "title": "Add EUR to Selected Currencies",
+  "description": "EUR has 10 conversions but is not in your selected currencies. Customers may be auto-switched due to location.",
+  "actionText": "Go to Settings",
+  "icon": "currency"
+}
+```
+
+---
+
+### 2. `ADD_COUNTRY_TO_MARKET` — Add Country to Shopify Markets
+
+**Trigger conditions (all must be true):**
+- `salesRatio >= MIN_SALES_RATIO` (overall average order value)
+- Country has sales > 0 but is **not in any enabled Shopify market**
+- Country's own `salesRatio` (country sales / country orders) `>= MIN_SALES_RATIO`
+- Only the **top** (highest sales) qualifying country is suggested
+
+**Data source:**
+- `orders` ClickHouse table → grouped by `country`
+- Shopify GraphQL `markets` query → to check which countries are already in markets
+- `currencyByCountry` → to find the top currency used in that country
+
+**Implementation:** `findCountriesNotInMarkets()` + threshold checks in `generateSuggestions()`
+
+**Example output:**
+```json
+{
+  "type": "ADD_COUNTRY_TO_MARKET",
+  "priority": "HIGH",
+  "title": "Add Germany (EUR) to Markets",
+  "description": "Germany generated 1200.00 in sales with 15 orders using EUR, but is not in any market. Add it to optimize pricing.",
+  "actionText": "Go to Markets",
+  "icon": "globe"
+}
+```
+
+---
+
+### 3. `PRICING_OPTIMIZATION` — Price Increase / Market Split
+
+**Trigger conditions (all must be true):**
+- `salesRatio >= MIN_SALES_RATIO`
+- Top country (by sales) has `sales > MIN_SALES_RATIO`
+- More than 1 unique country exists across all markets (otherwise suggestion is hidden)
+
+**Three sub-cases:**
+
+| Scenario | Market Status | Suggestion |
+|----------|--------------|------------|
+| Country is **not** in any market | `NOT_IN_MARKET` | "Create Separate Market for {Country}" |
+| Country is in a **single-country** market | `SINGLE_COUNTRY_MARKET` | "Increase Prices in {Country} Market" |
+| Country is in a **multi-country** market | `MULTI_COUNTRY_MARKET` | "Create Separate Market for {Country}" (split from shared market) |
+
+**Implementation:** `findTopCountryOpportunity()` in `suggestionUtils.ts`
+
+**Post-filter:** `filterAISuggestions()` drops `PRICING_OPTIMIZATION` if total countries across all markets = 1
+
+---
+
+## AI Layer (Gemini)
+
+### Flow
+
+1. **Controller** assembles `aiInputData` — selectedCurrencies, conversions, markets, countriesNotInMarkets, thresholds, etc.
+2. **`generateAISuggestions(shop, rangeKey, aiInputData)`** checks **cache** first:
+   - Cache table: `ai_suggestions` (MongoDB via Prisma)
+   - Cache key: `shop` + `analytics_range` (e.g. `"2025-04-11--2025-05-11"`)
+   - Cache TTL: **24 hours** (`expires_at`)
+   - If cache is valid → return cached suggestions, `fromCache: true`
+3. **Cache miss** → calls `callGeminiAI(analyticsData)`:
+   - Model: `gemini-2.0-flash`
+   - Temperature: `0.3` (low for deterministic output)
+   - Prompt built from `buildSystemPrompt()` + `buildUserMessage(analyticsData)`
+   - Response is parsed as JSON array
+4. **AI response is post-filtered** through `filterAISuggestions()`:
+   - Only **1** `ADD_COUNTRY_TO_MARKET` suggestion allowed
+   - `PRICING_OPTIMIZATION` dropped if only 1 country across all markets
+5. Country codes in AI text are expanded to full names (e.g. `DE` → `Germany`)
+6. **Result stored** in `ai_suggestions` table for caching
+
+### Fallback
+
+If the AI call fails (network error, parse error, missing API key), the controller catches the error and falls back to `manualSuggestions` silently:
+
+```ts
+const allSuggestions = aiSuggestions.length > 0 ? aiSuggestions : manualSuggestions;
+```
+
+---
+
+## Frontend Integration
+
+The frontend (`pages/analytics/index.jsx`) calls the suggestions API through the same proxy pattern used by other analytics endpoints:
+
+```
+GET /api/v1/analytics/proxy?path=suggestions&startDate=...&endDate=...
+```
+
+This runs **in parallel** with the existing `summary`, `trends`, `revenue-by-currency`, and `sales-by-country` calls via `Promise.all`.
+
+**Proxy requirement:** `"suggestions"` must be added to the `ALLOWED_PATHS` array in `pages/api/v1/analytics/proxy.js`.
+
+---
+
+## Data Flow Summary
+
+```
+1. Frontend loads analytics page
+2. Promise.all fires 5 parallel calls (summary, trends, revenue, country, suggestions)
+3. Proxy authenticates session → forwards to analytics backend
+4. suggestions endpoint:
+   a. Fetches shop settings + access token from Prisma
+   b. Fetches Shopify markets via GraphQL
+   c. Fetches 7 ClickHouse aggregations in parallel
+   d. Runs manual rule-based suggestion generation
+   e. Checks AI cache → calls Gemini if cache miss
+   f. Post-filters AI output
+   g. Returns { suggestions (AI preferred), manualSuggestions (fallback) }
+5. Frontend renders suggestion cards
+```
