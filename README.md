@@ -170,6 +170,34 @@ Defined in `constants.ts`:
 
 ## AI Layer (Gemini)
 
+### Prompts
+
+> **Source file:** [`src/utils/analytics/aiPromptUtils.ts`](https://github.com/user/bucks-analytics-backend/blob/main/src/utils/analytics/aiPromptUtils.ts)
+
+#### System Prompt (`buildSystemPrompt()`)
+
+Instructs Gemini as an "e-commerce analytics consultant" with strict rules:
+
+- Generate **up to 3** suggestions (1 per type)
+- Validate each against thresholds before generating
+- Return **only** a raw JSON array — no markdown, no explanation
+- Suggestion types and their validation order:
+  1. **`ADD_CURRENCY`** — `totalConversions >= minConversions` → find top currency not in `selectedCurrencies` with `conversions >= minCurrencySwitches`
+  2. **`ADD_COUNTRY_TO_MARKET`** — `salesRatio >= minSalesRatio` → pick best country from `countriesNotInMarkets` whose own `sales/orders >= minSalesRatio`
+  3. **`PRICING_OPTIMIZATION`** — `salesRatio >= minSalesRatio` + skip if only 1 country across all markets → check market type (single vs multi-country)
+
+#### User Prompt (`buildUserMessage(analyticsData)`)
+
+Feeds the actual store data into the prompt:
+
+- **Thresholds** — `minConversions`, `minCurrencySwitches`, `minSalesRatio`
+- **Overall metrics** — `totalSales`, `totalOrders`, `totalConversions`, `salesRatio`
+- **Step 1 data** — `selectedCurrencies`, `currencyConversions` (all currencies + counts)
+- **Step 2 data** — `countriesNotInMarkets` (pre-filtered list with `topCurrency`, `sales`, `orders`)
+- **Step 3 data** — `locationSales` (sorted by sales), `existingMarkets` (with region country codes)
+
+Each step includes the exact expected JSON format so Gemini returns structured, parseable output.
+
 ### Flow
 
 1. **Controller** assembles `aiInputData` — selectedCurrencies, conversions, markets, countriesNotInMarkets, thresholds, etc.
