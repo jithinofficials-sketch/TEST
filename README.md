@@ -123,7 +123,6 @@ Defined in `constants.ts`:
 **Trigger conditions (all must be true):**
 - `salesRatio >= MIN_SALES_RATIO` (overall average order value)
 - Country has sales > 0 but is **not in any enabled Shopify market**
-- Country's own `salesRatio` (country sales / country orders) `>= MIN_SALES_RATIO`
 - Only the **top** (highest sales) qualifying country is suggested
 
 **Data source:**
@@ -151,7 +150,6 @@ Defined in `constants.ts`:
 
 **Trigger conditions (all must be true):**
 - `salesRatio >= MIN_SALES_RATIO`
-- Top country (by sales) has `sales > MIN_SALES_RATIO`
 - More than 1 unique country exists across all markets (otherwise suggestion is hidden)
 
 **Three sub-cases:**
