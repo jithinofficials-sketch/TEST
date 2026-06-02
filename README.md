@@ -1,349 +1,430 @@
-# RFC: Merchant Panel
+# New Pricing Plans — Bucks Currency Converter
 
-**Metadata:**
-- **Author:** [Your Name]
-- **Status:** Draft
-- **Reviewers:** CPO, Product Owner
-- **Type:** `#feature-rfc`
+**Document created:** June 2026  
+**Status:** Planning / Pre-implementation
 
 ---
 
-## 1. Problem
+## 1. Overview
 
-**We have no way to see what a merchant sees.**
+We are introducing a new **Pro tier** priced at **$14.99/month** (and **$179.88/year**) alongside the existing $7.99/month and discounted annual plans.
 
-When a merchant reports a bug or asks for help, we have to:
-1. Ask them to send screenshots
-2. Guess their settings from the database
-3. Manually query MongoDB to check their config
+The new plans are the **going-forward standard paid tier** for new users. Existing users retain access to their current plans but are shown the new plans as upgrade options.
 
-This is slow, error-prone, and wastes both our time and the merchant's time.
-
-**Current workarounds:**
-- SSH into server, run Prisma queries to inspect merchant data
-- Ask merchant to screen-share or send screenshots
-- Reproduce issues locally with test data (often doesn't match real merchant state)
-
-**What we need:**
-A way for super admins to click one button and instantly see the app exactly as a specific merchant sees it — their settings, their analytics, their currency rules — without asking them anything.
+The key differentiator of new plans: **Full Analytics access** (existing plans get partial/teaser view).
 
 ---
 
-## 2. Why This Matters?
+## 2. Plan Catalogue
 
-**Why now:**
-- Support tickets are growing. Every "can you send a screenshot?" adds 24+ hours to resolution.
-- We already have the `isSuperAdmin` system and the `admin/partners` page pattern — the foundation exists.
-- Multiple pages have inconsistent SSR logic (some check session validity, some don't) — fixing this alongside the panel avoids doing the same work twice.
+| Plan ID (DB) | Display Name | Price | Interval | Who sees it |
+|---|---|---|---|---|
+| `bucks_free` | Free | $0 | — | Everyone |
+| `bucks_premium` | Plus Monthly *(legacy)* | $7.99/mo | Monthly | Existing $7.99 subscribers only |
+| `bucks_premium_60/65/70` | Plus Yearly *(legacy)* | varies | Annual | Existing annual subscribers only |
+| **`bucks_premium_pro`** | **Pro Monthly** | **$14.99/mo** | Monthly | Everyone |
+| **`bucks_premium_pro_annual`** | **Pro Yearly** | **$179.88/yr** | Annual | Everyone |
 
-**What we gain:**
-- **Faster support resolution** — see merchant's exact state in seconds, not hours
-- **Easier debugging** — reproduce issues with real merchant data
-- **Consistent codebase** — standardized SSR logic across all pages (optimization bonus)
-- **Foundation for future admin tools** — audit logs, bulk actions, etc.
+### Coupon Discount (Pro Plans Only)
 
-**If we DON'T do this:**
-- Support stays slow — keep asking merchants for screenshots
-- Bugs stay harder to reproduce — guessing merchant state from raw DB queries
-- SSR inconsistency grows — new pages copy-paste different patterns
-
----
-
-## 3. Proposed Solution
-
-### Core Idea
-
-Super admin clicks "Access" on a merchant in the panel. The app sets a cookie + DB record, then redirects to `/?shop=merchant.myshopify.com`. Every page and API route detects the impersonation and loads that merchant's data instead.
-
-### Why This Approach?
-
-- **URL-based shop switching** — the app already uses `?shop=` to identify merchants. We just need to let admins use it for any shop.
-- **Cookie + DB validation** — cookie for speed (no DB call on every client-side request), DB for security (validates the session is real).
-- **Reuses existing systems** — `isSuperAdmin`, `getAppDetails`, `getUserDetails`, `fetchSession` all stay the same.
-
-### New Systems Introduced
-
-| System | Purpose |
-|---|---|
-| `withShopContext` wrapper | Standardizes all page SSR logic + admin bypass |
-| `withImpersonation` middleware | Standardizes all API route auth + admin bypass |
-| `getAdminViewContext` | Reads impersonation cookie, validates against DB |
-| `impersonation_sessions` model | Tracks active impersonation sessions |
-| `StaffAccessBar` component | Shows "Viewing as [shop]" banner + Exit button |
-
-### What This Does NOT Do
-
-- Does NOT give admin write access to Shopify APIs (e.g., can't create orders for merchants)
-- Does NOT bypass Shopify's own authentication — only bypasses our internal session/availability checks
-- Does NOT store merchant credentials — uses existing stored sessions
+- **Code:** Fixed hardcoded code (e.g. `BUCKS33`) — displayed directly on the pricing card
+- **Monthly discount:** $14.99 → **$9.99/month** (~33.36% off)
+- **Yearly discount:** $179.88 → **$119.88/year** ($9.99/month × 12) — same percentage applied
+- **Validation:** Backend validates the code and reduces `price.amount` before calling the Shopify subscription mutation; no native Shopify coupon involved
+- **Scope:** Only applicable to new Pro plans; not applicable to legacy $7.99 plans
 
 ---
 
-## 4. End-to-End Flow
+## 3. Plan Display by User Segment
 
-### Admin Flow
+The pricing grid adapts based on the current user's plan. Layout changes from 3-column to 4-column (or 2×2 on mobile) when 4 cards are shown.
 
-```
-Super Admin opens app
-    |
-    v
-Sees normal dashboard (their own data)
-    |
-    v
-Clicks "Merchants" in navigation
-    |
-    v
-/admin/merchants page loads
-Shows table: Shop | Name | Email | Plan | Status | [Access]
-    |
-    v
-Clicks "Access" on a merchant
-    |
-    v
-POST /api/admin/merchants/access
-  - Validates admin is super admin
-  - Creates impersonation_session in DB
-  - Sets bucks_admin_imp cookie
-    |
-    v
-Redirects to /?shop=merchant.myshopify.com (same tab)
-    |
-    v
-Page loads with StaffAccessBar: "Viewing as merchant.myshopify.com [Exit]"
-Admin sees merchant's dashboard, settings, analytics — everything
-    |
-    v
-Clicks "Exit"
-    |
-    v
-POST /api/admin/merchants/exit
-  - Ends impersonation_session in DB
-  - Clears cookie
-    |
-    v
-Redirects back to /admin/merchants?shop=admin.myshopify.com
-```
+### 3a. New Users & Existing Free Users
 
-### Technical Flow — Page Load (SSR)
+**Cards shown (3 cards):**
 
 ```
-Browser requests /?shop=merchant.myshopify.com
-    |
-    v
-getServerSideProps calls withShopContext(context)
-    |
-    v
-withShopContext calls getAdminViewContext(context)
-    |
-    +--> Reads bucks_admin_imp cookie
-    +--> Parses { adminShop, sessionId }
-    +--> Validates adminShop is super admin
-    +--> Checks impersonation_sessions DB: session active + not expired?
-    +--> Confirms impersonatedShop matches URL's ?shop=
-    |
-    v
-If valid admin view:
-    - SKIP isShopAvailable (merchant might be uninstalled)
-    - SKIP isSessionValid (merchant's token might be expired)
-    - SKIP pricing redirect (admin doesn't need a plan)
-    - Load merchant's data from DB directly
-    - Return { adminCtx: { isAdminView: true, adminShop, ... } }
-    |
-    v
-Page renders with merchant's data + StaffAccessBar
+[ Free ] [ Pro Monthly $14.99 ] [ Pro Yearly $179.88 ]
 ```
 
-### Technical Flow — Client-Side API Call
-
-```
-Admin clicks "Save" on merchant's settings page
-    |
-    v
-httpProvider reads bucks_admin_imp cookie from browser
-Compares cookie's adminShop vs URL's ?shop=
-If different → injects headers:
-    X-Admin-Shop: admin.myshopify.com
-    X-Impersonated-Shop: merchant.myshopify.com
-    |
-    v
-POST /api/v1/settings (with impersonation headers)
-    |
-    v
-withImpersonation middleware:
-    1. Loads admin's session via fetchSession
-    2. Reads X-Admin-Shop + X-Impersonated-Shop headers
-    3. Validates admin is super admin
-    4. Validates session.shop matches X-Admin-Shop
-    5. Overrides req.effectiveShop = merchant.myshopify.com
-    6. Loads merchant's accessToken for Shopify API calls
-    |
-    v
-Handler uses req.effectiveShop → saves to merchant's settings
-```
+- Free card: "Downgrade" / "Current plan"
+- Pro Monthly: coupon code shown → $9.99 after code
+- Pro Yearly: coupon code shown → $119.88 after code
+- Trial: 7-day free trial applies for Pro Monthly (existing trial logic)
 
 ---
 
-## 5. Implementation Details
+### 3b. Existing Monthly Plan Users ($7.99/month — `bucks_premium`)
 
-### 5.1 Data Model
+**Cards shown (4 cards):**
 
-**New Prisma model: `impersonation_sessions`**
+```
+[ Free ] [ Legacy Monthly $7.99 ] [ Pro Monthly $14.99 ] [ Pro Yearly $179.88 ]
+```
 
-```prisma
-model impersonation_sessions {
-  id               String   @id @default(auto()) @map("_id") @db.ObjectId
-  adminShop        String
-  impersonatedShop String
-  sessionId        String   @unique @default(uuid())
-  isActive         Boolean  @default(true)
-  createdAt        DateTime @default(now())
-  expiresAt        DateTime
+- Legacy Monthly: shows "Current plan" badge; user cannot re-subscribe
+- Pro Monthly ($14.99): uses `replacementBehavior: "STANDARD"` → remaining balance on $7.99 plan is credited; old plan is removed
+- Pro Yearly ($179.88): uses `replacementBehavior: "STANDARD"` → remaining monthly balance credited toward yearly plan
+- Coupon code visible on both new plan cards
+
+#### Shopify Mutation — Upgrade from Monthly → Pro Monthly
+
+```graphql
+mutation AppSubscriptionCreate(
+  $name: String!
+  $lineItems: [AppSubscriptionLineItemInput!]!
+  $returnUrl: URL!
+  $trialDays: Int!
+  $replacementBehavior: AppSubscriptionReplacementBehavior
+) {
+  appSubscriptionCreate(
+    name: $name
+    returnUrl: $returnUrl
+    lineItems: $lineItems
+    test: false
+    trialDays: $trialDays
+    replacementBehavior: $replacementBehavior  # STANDARD
+  ) {
+    userErrors { field message }
+    appSubscription { id }
+    confirmationUrl
+  }
 }
 ```
 
-- Sessions expire after 24 hours
-- Only one active session per admin at a time
-- Old sessions are deactivated, not deleted (audit trail)
-
-### 5.2 Backend — SSR Wrapper
-
-**`utils/middleware/withShopContext.js`**
-
-Replaces inline `getServerSideProps` logic in all 8 merchant pages.
-
-| Option | Default | Purpose |
-|---|---|---|
-| `requireShop` | `true` | Run `isShopAvailable` check |
-| `requireSession` | `true` | Run `isSessionValid` check |
-| `pricingRedirect` | `true` | Redirect to /pricing if no plan |
-| `fetchSettings` | `true` | Call `getAppDetails(shop)` |
-
-Returns: `{ shop, userData, settings, superAdmin, adminCtx, redirect }`
-
-**Optimization**: Pages that previously had NO session/shop checks (`settings`, `advanced`, `currency-rules`, `partners`, `pricing`) now get consistent checks via the wrapper. Admin bypass ensures this doesn't break impersonation.
-
-### 5.3 Backend — API Middleware
-
-**`utils/middleware/withImpersonation.js`**
-
-Wraps all 12 merchant-facing API routes.
-
-What it does:
-1. Calls `fetchSession` to get admin's real session
-2. Checks for `X-Admin-Shop` + `X-Impersonated-Shop` headers
-3. If present: validates admin is super admin, overrides `req.effectiveShop`
-4. If absent: normal flow, `req.effectiveShop = session.shop`
-
-Each API changes two lines:
-```js
-// Before:
-const session = await fetchSession({ req, res });
-const { shop, accessToken } = session;
-
-// After:
-const { effectiveShop: shop, effectiveAccessToken: accessToken } = req;
+Variables:
+```json
+{
+  "replacementBehavior": "STANDARD"
+}
 ```
 
-**APIs to wrap:**
-- `v1/settings/index.js`
-- `v1/settings/status/updateStatus.js`
-- `v1/user/onboarding.js`
-- `v1/user/updateBannerStatus.js`
-- `v1/user/skipOnboarding.js`
-- `v1/user/latest.js`
-- `v1/user/dashboardSection.js`
-- `v1/user/updateChatToken.js`
-- `v1/billing/initSubscription.js`
-- `v1/billing/cancelSubscription.js`
-- `v1/analytics/proxy.js`
-- `v1/banner/dismiss.js`
+---
 
-### 5.4 Backend — Merchant Panel APIs
+### 3c. Existing Annual Plan Users (`bucks_premium_60/65/70`)
 
-| Route | Method | Purpose |
-|---|---|---|
-| `/api/admin/merchants` | GET | List all merchants (name, email, plan, status) |
-| `/api/admin/merchants/access` | POST | Start impersonation (create DB session + set cookie) |
-| `/api/admin/merchants/exit` | POST | End impersonation (deactivate DB session + clear cookie) |
+**Cards shown (4 cards):**
 
-All three validate `isSuperAdmin` before proceeding.
+```
+[ Free ] [ Pro Monthly $14.99 ] [ Legacy Yearly (their price) ] [ Pro Yearly $179.88 ]
+```
 
-### 5.5 Frontend — Client-Side Header Injection
+- Legacy Yearly: shows "Current plan" badge
+- Pro Monthly ($14.99): uses `replacementBehavior: "STANDARD"` → remaining annual balance credited
+- Pro Yearly ($179.88): uses `replacementBehavior: "STANDARD"` → remaining annual balance credited; old annual plan removed
+- Coupon code visible on both new plan cards
 
-**`utils/common/http/httpProvider.js`**
+---
 
-Add `getImpersonationHeaders()` function:
-- Reads `bucks_admin_imp` cookie from `document.cookie`
-- Gets target shop from URL `?shop=`
-- If `adminShop !== targetShop` → returns `{ X-Admin-Shop, X-Impersonated-Shop }`
-- Injected into every GET/POST/PUT/DELETE call
+## 4. New Plan Database Identifiers
 
-### 5.6 Frontend — Merchant List Page
+### New `bucks_plan` values
 
-**`pages/admin/merchants/index.jsx`**
-
-- Gated by `getAuthorizedAdminShop` (same pattern as `admin/partners`)
-- Table columns: Shop Domain | Store Name | Email | Plan | Status | Action
-- Search/filter by shop domain or email
-- "Access" button per row → calls `/api/admin/merchants/access` → redirects to `/?shop=target`
-
-### 5.7 Frontend — StaffAccessBar
-
-**`components/common/StaffAccessBar.jsx`**
-
-- Fixed banner at top of every page during impersonation
-- Shows: "Viewing as merchant.myshopify.com"
-- "Exit" button → calls `/api/admin/merchants/exit` → redirects to `/admin/merchants?shop=adminShop`
-- Only renders when `adminCtx.isAdminView === true`
-
-### 5.8 Frontend — Navigation Update
-
-**`components/common/Navigation.jsx`**
-
-- Add "Merchants" tab after "Partners Dashboard" (super admin only)
-- Links to `/admin/merchants?shop=${shop}`
-
-### 5.9 Edge Cases
-
-| Case | Handling |
+| DB Value | Description |
 |---|---|
-| **Merchant uninstalled** | Admin bypass skips `isShopAvailable` — DB data still visible. Shopify API calls return errors → show "API unavailable" instead of crashing |
-| **Merchant session expired** | Admin bypass skips `isSessionValid` — DB data visible. Shopify API calls fail gracefully |
-| **Impersonation session expired (24h)** | `getAdminViewContext` returns `isAdminView: false` → normal checks kick in → admin redirected |
-| **Non-admin sends fake headers** | `withImpersonation` validates `isSuperAdmin(adminShop)` AND `session.shop === adminShop` — rejects with 403 |
-| **Admin opens multiple tabs** | Cookie is shared across tabs. Each tab reads same impersonation state. Switching merchants updates the cookie, all tabs reflect new merchant on next navigation |
-| **Admin impersonates then admin panel is accessed** | `/admin/merchants` uses `getAuthorizedAdminShop` (checks real session), not the impersonation context |
-| **Missing `?shop=` in URL** | `withShopContext` returns redirect early |
-| **Cookie tampered** | DB validation in `getAdminViewContext` catches invalid `sessionId` |
+| `bucks_premium_pro` | New Pro Monthly ($14.99/month) |
+| `bucks_premium_pro_annual` | New Pro Yearly ($179.88/year) |
+
+### `PREMIUM_PLANS` constant update
+
+```js
+// utils/constants.js
+export const PREMIUM_PLANS = {
+  MONTHLY: "bucks_premium",             // legacy $7.99
+  ANNUAL_60: "bucks_premium_60",        // legacy annual 60% discount
+  ANNUAL_65: "bucks_premium_65",        // legacy annual 65% (partner)
+  ANNUAL_70: "bucks_premium_70",        // legacy annual 70% (BFCM)
+  PRO_MONTHLY: "bucks_premium_pro",     // NEW $14.99/month
+  PRO_ANNUAL: "bucks_premium_pro_annual", // NEW $179.88/year
+};
+```
+
+### `PREMIUM_PLAN_IDS` update
+
+```js
+// utils/common/common-methods/trialHelpers.js
+export const PREMIUM_PLAN_IDS = [
+  "bucks_premium",
+  "bucks_premium_60",
+  "bucks_premium_65",
+  "bucks_premium_70",
+  "bucks_premium_pro",          // NEW
+  "bucks_premium_pro_annual",   // NEW
+];
+```
 
 ---
 
-## 6. Open Questions
+## 5. Pricing Constants
 
-1. **Should we log impersonation actions?** (e.g., "Admin viewed merchant's settings", "Admin saved settings for merchant") — useful for audit, but adds complexity.
-2. **Should admin be able to make billing changes** (initSubscription, cancelSubscription) while impersonating? Could be dangerous. Consider making these read-only during impersonation.
-3. **Should we add a search/filter on the merchants page?** With 100+ merchants, scrolling through a table isn't ideal. Probably yes, but scope it.
-4. **Session expiry: 24 hours enough?** Could make this configurable via env var.
+```js
+// utils/common/constants/constants.js
+
+export const NEW_PRO_MONTHLY_PRICE = 14.99;
+export const NEW_PRO_ANNUAL_PRICE = 179.88; // 14.99 * 12
+
+export const PRO_COUPON_CODE = "BUCKS33"; // displayed on card
+export const PRO_COUPON_DISCOUNT_PERCENT = 33.36; // ~33.36%
+// Monthly with coupon: $9.99  | Annual with coupon: $119.88
+
+export const NEW_PRO_MONTHLY_PRICE_WITH_COUPON = 9.99;
+export const NEW_PRO_ANNUAL_PRICE_WITH_COUPON = 119.88; // 9.99 * 12
+```
 
 ---
 
-## References
+## 6. Coupon Code Flow (Frontend → Backend)
 
-- Existing admin pattern: `pages/admin/partners/index.jsx`
-- Super admin check: `utils/admin/isSuperAdmin.js`
-- Session handler: `utils/sessionHandler.js`
+### Frontend
+1. Pricing card for Pro plans shows a coupon input field **or** shows the code inline with a "Copy" button
+2. If user enters/applies the code before clicking upgrade, the discounted amount is sent in the API payload
+3. The pricing card shows both the original price and the discounted price with the code
+
+### Backend (`pages/api/v1/billing/initSubscription.js`)
+1. Receives payload with `{ couponCode, price: { amount }, ... }`
+2. Validates `couponCode === PRO_COUPON_CODE`
+3. If valid: overrides `price.amount` with discounted amount before calling `createAppSubscription`
+4. Also passes `replacementBehavior: "STANDARD"` when user is on an active premium plan
+
+### Example API Payload (Pro Monthly with coupon)
+```json
+{
+  "name": "Pro Monthly",
+  "plan_name": "bucks_premium_pro",
+  "plan_type": "monthly",
+  "price": { "amount": 14.99, "currencyCode": "USD" },
+  "interval": "EVERY_30_DAYS",
+  "trialDays": 7,
+  "couponCode": "BUCKS33",
+  "bucks_plan": "bucks_premium_pro"
+}
+```
+
+Backend resolves final `price.amount = 9.99` before mutation.
 
 ---
 
-## Implementation Plan
+## 7. `replacementBehavior` Logic
 
-| Phase | Goal | Steps | Risk |
-|---|---|---|---|
-| **Phase 1: Wrapper** | Standardize SSR logic, no behavior change | Create `withShopContext.js`, update 8 pages | Medium — test each page |
-| **Phase 2: API Middleware** | Standardize API auth, no behavior change | Create `withImpersonation.js`, update 12 APIs | Medium — test each API |
-| **Phase 3: Impersonation Core** | DB + cookie + validation logic | Prisma model, CRUD helpers, `getAdminViewContext` | Low |
-| **Phase 4: Merchant Panel UI** | Admin can list + access merchants | Merchant APIs, list page, StaffAccessBar, Navigation | Low |
-| **Phase 5: Wire Everything** | Connect admin bypass to wrapper + middleware | Update `withShopContext` + `withImpersonation` to use `getAdminViewContext` | Low |
-| **Phase 6: Testing** | Full flow verification | Normal merchant flow + admin impersonation flow | — |
+Used only when user **currently has an active paid subscription** and is switching to a new plan.
 
-Each phase ships independently. Phase 1-2 are pure refactors (zero behavior change). Phase 3-5 add the merchant panel feature.
+```js
+// In createAppSubscription.js / initSubscription.js
+const isUpgradingFromPaidPlan = Boolean(userRecord?.subscription_id) && isPremiumPlan(userRecord?.bucks_plan);
+
+const replacementBehavior = isUpgradingFromPaidPlan ? "STANDARD" : undefined;
+// "STANDARD" = remaining balance credited, old subscription removed immediately
+```
+
+| From → To | replacementBehavior |
+|---|---|
+| Free → Pro Monthly | `undefined` (no active paid sub) |
+| Free → Pro Yearly | `undefined` |
+| Legacy Monthly ($7.99) → Pro Monthly ($14.99) | `"STANDARD"` |
+| Legacy Monthly ($7.99) → Pro Yearly ($179.88) | `"STANDARD"` |
+| Legacy Annual → Pro Monthly | `"STANDARD"` |
+| Legacy Annual → Pro Yearly | `"STANDARD"` |
+
+---
+
+## 8. Trial Days Logic
+
+Same existing logic — no changes:
+- New users (never subscribed): 7-day free trial
+- Users who used trial before: no trial (0 days)
+- Users with remaining trial from a previous premium subscription: carry over
+
+Applies to both Pro Monthly and Pro Yearly.
+
+---
+
+## 9. Analytics Feature Gate
+
+| Plan | Analytics Access |
+|---|---|
+| `bucks_free` | Partial / teaser view (locked rows, blur overlay, or limited date range) |
+| `bucks_premium` (legacy $7.99) | Partial / teaser view |
+| `bucks_premium_60/65/70` (legacy annual) | Partial / teaser view |
+| **`bucks_premium_pro`** | **Full analytics** |
+| **`bucks_premium_pro_annual`** | **Full analytics** |
+
+The analytics page (`pages/analytics/index.jsx`) should check:
+```js
+const hasFullAnalytics = ["bucks_premium_pro", "bucks_premium_pro_annual"].includes(userData?.bucks_plan);
+```
+
+If `!hasFullAnalytics`: show a partial/teaser view with a prompt to upgrade to Pro plans.
+
+---
+
+## 10. `planDetails` Array — New Entries
+
+Two new entries added to `planDetails` in `utils/common/constants/constants.js`:
+
+```js
+{
+  id: "pro-v2",
+  plan_name: "bucks_premium_pro",
+  plan_type: "monthly",
+  action: "Upgrade",
+  name: "Pro Monthly",
+  description: "Full analytics + all premium features at our new standard price",
+  features: [
+    "All free features",
+    "Full Analytics dashboard",
+    "Unlimited conversions",
+    "Unlimited page views",
+    "Set manual conversion rates",
+    "Customize currency display",
+    "Priority support",
+    "Third party apps support",
+    "Custom positioning",
+  ],
+  unlimitedFeatures: ["Unlimited conversions", "Unlimited page views"],
+  price: {
+    amount: 14.99,
+    currencyCode: "USD",
+    comparePrice: 14.99,
+  },
+  interval: MONTHLY_INTERVAL,
+  frequency: "month",
+  trialDays: DEFAULT_TRIAL_DAYS,
+  buttonText: "Start your 7-day free trial",
+  billingNote: "Billed monthly • No commitment",
+  footerText: "Then $14.99/month · Use code BUCKS33 for $9.99/month",
+  couponCode: "BUCKS33",
+  couponPrice: 9.99,
+},
+{
+  id: "pro-v2-annual",
+  plan_name: "bucks_premium_pro_annual",
+  plan_type: "annual",
+  action: "Upgrade",
+  name: "Pro Yearly",
+  badge: "BEST VALUE",
+  description: "Full analytics + all premium features, billed yearly",
+  features: [
+    "All free features",
+    "Full Analytics dashboard",
+    "Unlimited conversions",
+    "Unlimited currencies",
+    "Unlimited page views",
+    "Set manual conversion rates",
+    "Customize currency display",
+    "Priority support (24/7)",
+    "Third-party apps support",
+    "Custom positioning",
+    "Price increase protection (locked in for 12 months)",
+  ],
+  unlimitedFeatures: ["Unlimited conversions", "Unlimited currencies", "Unlimited page views"],
+  price: {
+    amount: 179.88,
+    currencyCode: "USD",
+    comparePrice: 179.88,
+  },
+  interval: ANNUAL_INTERVAL,
+  frequency: "year",
+  trialDays: DEFAULT_TRIAL_DAYS,
+  buttonText: "Start your 7-day free trial",
+  billingNote: "Billed annually",
+  footerText: "Use code BUCKS33 for $119.88/year ($9.99/month)",
+  couponCode: "BUCKS33",
+  couponPrice: 119.88,
+  hasBlueBorder: true,
+},
+```
+
+---
+
+## 11. Pricing Page Grid Layout
+
+Currently `InlineGrid columns={mdDown ? 1 : 3}`.
+
+With 4 cards (for monthly/annual legacy users), this needs to change:
+
+```jsx
+// Determine column count dynamically
+const cardCount = visiblePlans.length; // 3 or 4
+const columns = mdDown ? 1 : (cardCount === 4 ? 4 : 3);
+
+<InlineGrid gap="400" columns={columns} alignItems="stretch">
+```
+
+On tablet/medium screens, 4 columns may be cramped — consider `lgDown ? 2 : 4` for 4-card layouts.
+
+---
+
+## 12. `checkSubscriptionStatus.js` — Plan Type Update
+
+The query param `bucks_plan` already flows through the return URL. New values `bucks_premium_pro` and `bucks_premium_pro_annual` will be passed automatically via the existing mechanism in `createAppSubscription.js`:
+
+```
+returnUrl: `...&bucks_plan=bucks_premium_pro&plan_type=monthly`
+```
+
+No change needed to `checkSubscriptionStatus.js` — it already reads these from query params and saves to DB.
+
+---
+
+## 13. `getPlanType` Helper Update
+
+```js
+// utils/common/common-methods/pricingConfig.js
+export function getPlanType(user) {
+  if (user?.bucks_plan === "bucks_premium") return user?.plan_type || "monthly";
+  if (user?.bucks_plan === "bucks_premium_pro") return "monthly";
+  if (user?.bucks_plan === "bucks_premium_pro_annual") return "annual";
+  if (PREMIUM_PLAN_IDS.slice(1).includes(user?.bucks_plan)) return "annual";
+  return user?.plan_type || "";
+}
+```
+
+---
+
+## 14. Implementation Checklist
+
+### Constants & Config
+- [ ] Add `NEW_PRO_MONTHLY_PRICE`, `NEW_PRO_ANNUAL_PRICE`, `PRO_COUPON_CODE`, `PRO_COUPON_DISCOUNT_PERCENT` to `utils/common/constants/constants.js`
+- [ ] Add `PRO_MONTHLY` and `PRO_ANNUAL` to `PREMIUM_PLANS` in `utils/constants.js`
+- [ ] Add `bucks_premium_pro` and `bucks_premium_pro_annual` to `PREMIUM_PLAN_IDS` in `trialHelpers.js`
+- [ ] Add two new entries to `planDetails` array
+
+### Backend
+- [ ] Update `createAppSubscription.js` to accept and pass `replacementBehavior` param
+- [ ] Update `initSubscription.js` to:
+  - Detect when user is upgrading from paid plan → set `replacementBehavior: "STANDARD"`
+  - Validate coupon code → apply discounted price
+  - Set correct `bucks_plan` for new Pro plans
+- [ ] Update `getPlanType` in `pricingConfig.js`
+- [ ] Ensure `checkSubscriptionStatus.js` handles new plan IDs (no code change needed)
+
+### Frontend
+- [ ] Update `planDetails` in constants with new plan objects
+- [ ] Update pricing page to filter/show correct cards per user segment
+- [ ] Update `InlineGrid` columns to handle 3 or 4 cards dynamically
+- [ ] Add coupon code UI to Pro plan cards (input field or inline display with copy)
+- [ ] Update `PricingCard.jsx` to show coupon info and discounted price
+
+### Analytics Gate
+- [ ] Update `pages/analytics/index.jsx` to check for `bucks_premium_pro` / `bucks_premium_pro_annual`
+- [ ] Add partial/teaser view for non-Pro plans with upgrade prompt
+
+### PostHog Events
+- [ ] `"bucks pro plan initiated"` — track when Pro Monthly or Pro Yearly selected
+- [ ] `"bucks pro coupon applied"` — track coupon usage with code and final amount
+- [ ] `"bucks pro plan selected"` — track after Shopify confirms subscription
+
+---
+
+## 15. Open Questions / Decisions Pending
+
+- [ ] **Exact coupon code string** — placeholder used `BUCKS33`; confirm final code
+- [ ] **Analytics teaser UX** — blur overlay vs locked rows vs date-limited view? Design needed
+- [ ] **4-card grid responsiveness** — confirm breakpoints for tablet view (2×2 vs 4 columns)
+- [ ] **Legacy plan users' upgrade CTA copy** — e.g. "Upgrade to Pro" vs "Switch to Pro"
+- [ ] **Prisma schema** — no new DB columns needed (`bucks_plan` and `plan_type` already exist); confirm with team
+- [ ] **Whether legacy annual users can downgrade to legacy monthly** — currently not shown to them; should it be?
+
+---
+
+*This document should be updated as decisions are finalized. Implementation should follow the checklist in Section 14 in order.*
