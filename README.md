@@ -11,44 +11,21 @@
 
 ## 1. Problem
 
-Bucks Currency Converter currently has a single paid tier at **$7.99/month** (legacy `bucks_premium`). This one-size-fits-all model creates several friction points:
+Bucks Currency Converter has a single paid tier at **$7.99/month** that hasn't changed since launch. Two problems need solving:
 
-**Merchant pain points:**
-- No incentive for annual commitment — legacy annual plans required manual coupon-based discounting, which was ad-hoc and inconsistent.
-- Power merchants who need analytics have no upgrade path; analytics is gated but there's no plan to unlock it.
-- Price-sensitive merchants who want "just the widget" are paying the same as power users who expect deeper features.
-
-**Business gaps:**
-- No monetization of the analytics feature despite significant investment in building it.
-- No recurring annual revenue stream for new users (only legacy subscribers have annual plans).
-- Single pricing tier makes it impossible to test conversion at different price points.
-
-**Current workarounds:**
-- Annual discounts issued manually via Shopify partner coupon codes (`bucks_premium_60`, `_65`, `_70`).
-- Analytics page is accessible for all paid plans by default — there's no gate to drive upgrades.
-
-**Competitor context:**
-- Most Shopify currency/FX apps (e.g., BEST Currency Converter, Auto Currency Switcher) offer 2–3 pricing tiers with clear feature differentiation, making upsell paths obvious to merchants.
+1. **The base price is outdated.** $7.99/month is below market. New subscribers should be on a $9.99/month plan going forward.
+2. **Analytics is built but unmonetized.** Full analytics access exists in the app but is not gated to any paid tier — there is no plan that merchants can subscribe to in order to unlock it.
 
 ---
 
 ## 2. Why This Matters?
 
-**Why now?**
-- The analytics module is built and live but not yet monetized.
-- Legacy annual plan management (manual coupon codes) does not scale and creates customer confusion.
-- The existing $7.99 monthly plan is below market for the feature set we now offer.
+- **Price increase**: All new subscribers move from $7.99 → **$9.99/month** (+$2/merchant/month).
+- **Analytics upgrade incentive**: We introduce a **$14.99/month Pro plan** that includes full analytics. Merchants see the value and apply coupon code `BUCKS33` to get it at $9.99/month — same price as Standard but with analytics unlocked. This creates a clear reason to upgrade.
+- **Annual plan**: A **$95.88/year** Pro Annual plan (20% off) replaces the old manual coupon-based annual discounts with a self-serve option.
+- **$14.99 plan is temporary**: Once merchants are familiar with the new pricing structure and upgrade behaviour is established, the $14.99/month plan will be removed. The $9.99 Standard plan will remain as the primary ongoing paid tier.
 
-**What we gain:**
-- **Revenue uplift**: New Standard tier ($9.99/mo) replaces $7.99 for all new subscribers — a $2/month/merchant increase. Pro tier ($14.99/mo) creates a clear upgrade path for analytics-hungry merchants.
-- **Annual predictability**: Pro Annual at $95.88/year (20% off $9.99 × 12) locks merchants in, reducing churn and improving LTV.
-- **Analytics monetization**: Full analytics becomes a tangible Pro feature, giving free and Standard users a clear reason to upgrade.
-- **Pricing clarity**: Replaces ad-hoc coupon-based annual discounts with a transparent, self-serve annual plan.
-
-**Cost of NOT doing this:**
-- Analytics investment continues to go unmonetized.
-- Legacy annual plan coupon management grows harder as subscriber base scales.
-- Revenue stays capped at $7.99/merchant/month for all new signups.
+**If we don't do this:** Revenue stays at $7.99/month for all new signups, analytics goes unmonetized, and the legacy annual coupon system becomes increasingly hard to manage.
 
 ---
 
