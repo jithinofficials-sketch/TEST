@@ -75,12 +75,7 @@ Effective monthly:        $95.88 / 12  = $7.99/month
 
 **Pricing page shows 4 cards:**
 ```
-┌──────────┐  ┌────────────────┐  ┌────────────────┐  ┌────────────────────┐
-│   Free   │  │  Standard      │  │  Pro Monthly   │  │   Pro Annual       │
-│   $0/mo  │  │  $9.99/mo      │  │  $14.99/mo     │  │   $95.88/yr        │
-│ [Current]│  │ [Start Trial]  │  │  [BUCKS33 →    │  │ [Start Trial]      │
-│          │  │                │  │   $9.99/mo]    │  │ ($7.99/mo equiv)   │
-└──────────┘  └────────────────┘  └────────────────┘  └────────────────────┘
+[ Free $0/mo (Current) ]  [ Standard $9.99/mo ]  [ Pro $14.99/mo ]  [ Pro Annual $95.88/yr ]
 ```
 
 **Merchant flow:**
@@ -103,12 +98,7 @@ Effective monthly:        $95.88 / 12  = $7.99/month
 
 **Pricing page shows 5 cards:**
 ```
-┌──────────┐  ┌────────────────┐  ┌────────────────┐  ┌────────────────┐  ┌────────────────────┐
-│   Free   │  │  Legacy $7.99  │  │  Standard      │  │  Pro Monthly   │  │  Pro Annual        │
-│   $0/mo  │  │  [Current Plan]│  │  $9.99/mo      │  │  $14.99/mo     │  │  $95.88/yr         │
-│[Downgrade│  │                │  │  [Upgrade]     │  │  [BUCKS33 →    │  │  [Upgrade]         │
-│  ]       │  │                │  │  ↑ STANDARD    │  │   $9.99/mo]    │  │  (Shopify default) │
-└──────────┘  └────────────────┘  └────────────────┘  └──── STANDARD ─┘  └────────────────────┘
+[ Free $0/mo ]  [ Legacy $7.99 (Current) ]  [ Standard $9.99/mo ]  [ Pro $14.99/mo ]  [ Pro Annual $95.88/yr ]
 ```
 
 **Same-interval upgrade (Monthly → Standard $9.99 or Pro $14.99):**
@@ -128,12 +118,7 @@ Effective monthly:        $95.88 / 12  = $7.99/month
 
 **Pricing page shows 5 cards:**
 ```
-┌──────────┐  ┌────────────────┐  ┌────────────────┐  ┌─────────────────────┐  ┌────────────────────┐
-│   Free   │  │  Standard      │  │  Pro Monthly   │  │  Legacy Annual      │  │  Pro Annual        │
-│   $0/mo  │  │  $9.99/mo      │  │  $14.99/mo     │  │  [Current Plan]     │  │  $95.88/yr         │
-│[Downgrade│  │  [Upgrade]     │  │  [Upgrade]     │  │                     │  │  [Upgrade]         │
-│  ]       │  │ (Shopify deflt)│  │ (Shopify deflt)│  │                     │  │  ↑ STANDARD        │
-└──────────┘  └────────────────┘  └────────────────┘  └─────────────────────┘  └────────────────────┘
+[ Free $0/mo ]  [ Standard $9.99/mo ]  [ Pro $14.99/mo ]  [ Legacy Annual (Current) ]  [ Pro Annual $95.88/yr ]
 ```
 
 - **Annual → Pro Annual** (same interval): `replacementBehavior: "STANDARD"` → remaining annual balance credited
