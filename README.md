@@ -25,7 +25,7 @@
 
 ## 2. Why This Matters?
 
-- **Price increase for new users**: New subscribers see a **$9.99/month** Standard plan (shown as "Plus Plan" on the pricing card) instead of the old $7.99.
+- **Price increase**: New subscribers see a **$9.99/month** Standard plan (shown as "Plus Plan") instead of the old $7.99.
 - **Analytics upgrade incentive**: A **$19.99/month Pro plan** includes full analytics. Merchants apply coupon `BUCKS33` (50.03% off) to bring it to **$9.99/month** — same price as Standard but with analytics unlocked. This creates a clear, visible reason to upgrade.
 - **Self-serve annual plan**: A **$95.90/year** Pro Annual plan (39.98% of $239.88 full price) replaces ad-hoc manual coupon-based annual discounts. Partners get an additional 5% off: **$83.93/year** (34.98% of $239.88).
 - **$19.99 plan is temporary**: Once the upgrade behaviour is established, the $19.99/month plan will be removed. $9.99 Standard remains as the primary ongoing paid tier.
@@ -40,8 +40,8 @@ Introduce **3 new plans** while keeping legacy plans accessible only to their cu
 
 | Plan | DB ID | Price | Analytics | Notes |
 |---|---|---|---|---|
-| Standard Monthly | `bucks_premium_standard` | $9.99/mo | ❌ None | No coupon; for new/free users only (shown as "Plus Plan") |
-| Pro Monthly | `bucks_premium_pro` | $19.99/mo | ✅ Full | Coupon `BUCKS33` (50.03% off) → $9.99/mo; for existing paid users |
+| Standard Monthly | `bucks_premium_standard` | $9.99/mo | ❌ None | No coupon; shown as "Plus Plan" to free/new users, "Standard" to existing paid |
+| Pro Monthly | `bucks_premium_pro` | $19.99/mo | ✅ Full | Coupon `BUCKS33` (50.03% off) → $9.99/mo |
 | Pro Annual | `bucks_premium_pro_annual` | $95.90/yr | ✅ Full | 39.98% of $239.88 full price; no coupon; partners pay $83.93/yr |
 
 **Annual price derivation:**
@@ -63,7 +63,7 @@ Effective monthly:        $95.90 / 12 = $7.99/month
 **Key design decisions:**
 
 - **Standard ($9.99) and Pro ($19.99) are separate plans** — each has its own `bucks_plan` DB value and distinct Shopify subscription. $9.99 is not a coupon-applied $19.99.
-- **Standard is for new/free users only** — existing paid users never see the $9.99 Standard card. Their upgrade path is directly to Pro $19.99 or Annual $95.90.
+- **Display name per segment** — the $9.99 Standard plan is shown as **"Plus Plan"** to free/new users and **"Standard"** to existing paid users (frontend label only; DB ID remains `bucks_premium_standard`).
 - **Legacy cards hide after upgrade** — once an existing monthly subscriber activates Pro Monthly, the Legacy $7.99 card is removed from their pricing view. Same for existing annual users who activate Pro Annual.
 - **`replacementBehavior: "APPLY_IMMEDIATELY"`** is set for same-interval upgrades from an active paid plan. Shopify credits the remaining balance and switches the plan immediately.
 - **Cross-interval upgrades** rely on Shopify's default behavior (no `replacementBehavior`).
@@ -81,19 +81,24 @@ Effective monthly:        $95.90 / 12 = $7.99/month
 
 ### 4a. Merchant Segment: New User / Existing Free
 
-**Pricing page shows 3 cards:**
+**Pricing page shows 4 cards:**
 ```
-[ Free $0/mo (Current) ]  [ Plus Plan $9.99/mo ]  [ Pro Annual $95.90/yr ]
+[ Free $0/mo (Current) ]  [ Plus Plan $9.99/mo ]  [ Pro $19.99/mo ]  [ Pro Annual $95.90/yr ]
 ```
 
-> The $9.99 plan is displayed as **"Plus Plan"** (frontend label only; internal DB ID remains `bucks_premium_standard`).
-> The Pro $19.99 monthly plan is **not shown** to free/new users.
+> The $9.99 plan is displayed as **"Plus Plan"** to free/new users (frontend label only; internal DB ID remains `bucks_premium_standard`).
 
-**Merchant flow:**
-1. Opens Pricing page → sees 3 cards
+**Standard $9.99 flow:**
+1. Opens Pricing page → sees 4 cards
 2. Clicks "Start Trial" on Plus Plan → redirected to Shopify billing confirmation
 3. Approves → `checkSubscriptionStatus` writes `bucks_plan: "bucks_premium_standard"` to DB
 4. Redirected back to pricing page with success message
+
+**Pro Monthly with coupon (free/new):**
+1. Merchant opens Pro Monthly card → enters `BUCKS33` in the coupon input on the card → price updates instantly to $9.99 in the UI
+2. Clicks upgrade → `initSubscription` detects: `currentPlan = "bucks_free"` → no `replacementBehavior`
+3. Backend validates coupon → sets `price.amount = 9.99` before Shopify mutation
+4. Shopify confirmation → approved → DB updated with `bucks_plan: "bucks_premium_pro"`
 
 ---
 
@@ -263,7 +268,7 @@ Three new `planDetails` entries with IDs: `"standard"`, `"pro"`, `"pro-annual"`.
 
 **`pages/pricing/index.jsx`**
 - Build `visiblePlanIds` array per user segment:
-  - Free/New: `["free", "standard", "pro-annual"]` — **3 cards**
+  - Free/New: `["free", "standard", "pro", "pro-annual"]` — **4 cards**
   - Legacy Monthly (active): `["free", "legacy-monthly", "pro", "pro-annual"]` — **4 cards**
   - Legacy Monthly (upgraded to Pro Monthly): `["free", "pro", "pro-annual"]` — **3 cards** (legacy hidden)
   - Legacy Annual (active): `["free", "pro", "legacy-annual", "pro-annual"]` — **4 cards**
