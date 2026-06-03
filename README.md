@@ -1,333 +1,446 @@
-# RFC: New Pricing Tiers — Standard, Pro Monthly, and Pro Annual
+# New Pricing Plans — Design Spec
 
-**Metadata:**
-- **Author:** Bucks Team
-- **Status:** Draft
-- **Reviewers:** CPO, Product Owner, Engineering Lead
-- **Type:** #feature-rfc
-- **Created:** June 2026
+**Created:** June 3, 2026  
+**Status:** Confirmed — Ready for Implementation  
+**RFC:** `docs/rfc-new-pricing-plans.md`  
+**Implementation Plan:** `docs/superpowers/plans/2026-06-03-new-pricing-plans.md`
 
----
-
-## 1. Problem
-
-**Current state:**
-- Bucks has a single paid tier at $7.99/month that hasn't changed since launch
-- Legacy annual plans exist (`bucks_premium_60`, `_65`, `_70`) but are only for existing subscribers via manual coupon codes — new users have no self-serve annual option
-- Analytics is fully built and available to all paid users, but there's no way to monetize it — no plan gates it
-
-**Problems:**
-1. **Revenue is capped at $7.99/month** — below market for the current feature set. New subscribers should be on a higher price point.
-2. **Analytics investment is unmonetized** — we built it but have no paid tier that includes it as a differentiator.
-3. **No self-serve annual plan for new users** — legacy annual plans are manual coupon-based and not available to new signups.
+> ⚠️ **Note:** `docs/new-pricing-plans.md` contains stale values ($14.99, $95.88, BUCKS33, "STANDARD" replacementBehavior, flat grid layout). This spec supersedes it with confirmed final values.
 
 ---
 
-## 2. Why This Matters?
+## 1. Plan Catalogue (Confirmed Final)
 
-- **Price increase**: New subscribers see a **$9.99/month** Standard plan (shown as "Plus Plan") instead of the old $7.99.
-- **Analytics upgrade incentive**: A **$19.99/month Pro plan** includes full analytics. Merchants apply coupon `BUCKS33` (50.03% off) to bring it to **$9.99/month** — same price as Standard but with analytics unlocked. This creates a clear, visible reason to upgrade.
-- **Self-serve annual plan**: A **$95.90/year** Pro Annual plan (39.98% of $239.88 full price) replaces ad-hoc manual coupon-based annual discounts. Partners get an additional 5% off: **$83.93/year** (34.98% of $239.88).
-- **$19.99 plan is temporary**: Once the upgrade behaviour is established, the $19.99/month plan will be removed. $9.99 Standard remains as the primary ongoing paid tier.
+| DB ID | Display Name | Price | Interval | Analytics | Audience |
+|---|---|---|---|---|---|
+| `bucks_free` | Free | $0 | — | ❌ | All |
+| `bucks_premium` | Legacy Plus | $7.99/mo | Monthly | ❌ | Legacy subscribers only |
+| `bucks_premium_60/65/70` | Legacy Annual | varies/yr | Annual | ❌ | Legacy subscribers only |
+| `bucks_premium_standard` | **Plus Plan** *(or "Standard")* | **$9.99/mo** | Monthly | ❌ | New/free users |
+| `bucks_premium_pro` | **Pro** | **$19.99/mo** | Monthly | ✅ Full | All |
+| `bucks_premium_pro_annual` | **Pro Annual** | **$95.90/yr** | Annual | ✅ Full | All |
 
-**If we don't do this:** Revenue stays at $7.99/month for all new signups, analytics goes unmonetized, and legacy annual coupon management continues to scale poorly.
+### Pricing Math (all confirmed)
+
+| Value | Amount |
+|---|---|
+| Pro Monthly full price | $19.99/mo |
+| Pro Monthly with coupon (BUCKS50) | $9.99/mo (50.03% off) |
+| Pro Annual default | $95.90/yr (39.98% off $239.88) |
+| Pro Annual partner price | $83.93/yr (34.98% off $239.88) |
+| Pro Annual compare/strikethrough price | $239.88/yr ($19.99 × 12) |
+| Pro Annual monthly equivalent | ~$7.99/mo |
+| Standard Monthly | $9.99/mo (no coupon, no discount) |
 
 ---
 
-## 3. Proposed Solution
+## 2. Coupon Design
 
-Introduce **3 new plans** while keeping legacy plans accessible only to their current subscribers:
+- **Code:** `BUCKS50` — stored in `process.env.PRO_COUPON_CODE` (fallback: `"BUCKS50"`)
+- **Applies to:** Pro Monthly (`bucks_premium_pro`) **only**
+- **Does NOT apply to:** Standard Monthly, Pro Annual
+- **Discount:** $19.99 → $9.99/mo (50.03% off)
+- **Validation:** Backend only. Frontend shows instant price preview on apply; wrong codes are silently ignored server-side (no price change)
+- **UI location:** Input field with Apply button, rendered **on the Pro Monthly card only** (`couponEnabled: true` flag in planDetails)
 
-| Plan | DB ID | Price | Analytics | Notes |
+### Coupon Input States
+
+```
+── State 1: Default (no coupon entered) ──────────────────────────
+  [         Enter coupon code          ] [ Apply ]
+  Then $19.99/month · Cancel anytime
+
+── State 2: Applied ──────────────────────────────────────────────
+  ~~$19.99/mo~~   $9.99/mo ✓   [ Remove ]
+  Then $9.99/month with BUCKS50 · Cancel anytime
+
+── State 3: Empty submit ─────────────────────────────────────────
+  [         Enter coupon code          ] [ Apply ]
+  Please enter a coupon code.   ← red error text
+
+── State 4: Wrong code (frontend-only note) ──────────────────────
+  Client accepts any non-empty code (shows $9.99 preview).
+  Backend validates — if invalid, Shopify charges $19.99.
+  Design decision: No client-side code rejection.
+```
+
+---
+
+## 3. Pricing Page Layout
+
+### 3a. Layout Rule
+
+| User Segment | Layout Mode | Top Row (3 cols) | Bottom |
+|---|---|---|---|
+| **New / Free / Standard** | 2-row | Plus Plan $9.99 · Pro $19.99 · Pro Annual $95.90 | Free card (full width) |
+| **Legacy $7.99 monthly (active)** | 2-row | Legacy $7.99 · Pro $19.99 · Pro Annual $95.90 | Free card (full width) |
+| **Legacy annual (active)** | 2-row | Pro $19.99 · Legacy Annual · Pro Annual $95.90 | Free card (full width) |
+| **Pro Monthly user (post-upgrade)** | Flat 3-col | Free · Pro $19.99 (Active) · Pro Annual $95.90 | *(none)* |
+| **Pro Annual user (post-upgrade)** | Flat 3-col | Free · Pro $19.99 · Pro Annual $95.90 (Active) | *(none)* |
+
+### 3b. Segment Detection Logic
+
+```js
+const isLegacyMonthly = currentPlan === "bucks_premium";
+const isLegacyAnnual  = ["bucks_premium_60", "bucks_premium_65", "bucks_premium_70"].includes(currentPlan);
+const isOnProPlan     = ["bucks_premium_pro", "bucks_premium_pro_annual"].includes(currentPlan);
+
+const useTwoRowLayout = !isOnProPlan;  // all users except Pro Monthly/Annual post-upgrade
+```
+
+### 3c. Card ID → planDetails Mapping
+
+| Card ID | plan_name (DB) | Shown When |
+|---|---|---|
+| `"free"` | `bucks_free` | Always (bottom row or flat position 1) |
+| `"standard"` | `bucks_premium_standard` | Free/new/standard segment |
+| `"pro-monthly"` | `bucks_premium_pro` | Always |
+| `"new-pro-annual"` | `bucks_premium_pro_annual` | Always |
+| `"pro"` | `bucks_premium` | Legacy monthly segment only |
+| `"pro-annual"` | `bucks_premium` (legacy) | Legacy annual segment only |
+
+### 3d. ASCII Wireframes
+
+**New / Free / Standard users:**
+```
+┌──────────────────────────────────────────────────────────────┐
+│  [ Plus Plan $9.99 ]  [ Pro $19.99     ]  [ Pro Annual      ]│
+│  Billed monthly       Coupon: BUCKS50     $95.90/yr          │
+│  No analytics         Full analytics      Full analytics     │
+│  [Start 7-day trial]  [Start 7-day trial] [Upgrade & save]  │
+└──────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│                    [ Free — $0 ]                             │
+│                    [ Current plan ] (if on free)             │
+└──────────────────────────────────────────────────────────────┘
+```
+
+**Legacy $7.99 monthly user (active):**
+```
+┌──────────────────────────────────────────────────────────────┐
+│  [ Legacy $7.99   ]   [ Pro $19.99    ]   [ Pro Annual      ]│
+│  [Current plan  ✓]   Coupon: BUCKS50     $95.90/yr          │
+│                       Full analytics      Full analytics     │
+│  [Current plan  ]    [Start trial    ]   [Upgrade & save]   │
+└──────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│                    [ Free — $0 ]                             │
+│                    [ Free plan ]                             │
+└──────────────────────────────────────────────────────────────┘
+```
+
+**Legacy annual user (active):**
+```
+┌──────────────────────────────────────────────────────────────┐
+│  [ Pro $19.99     ]  [ Legacy Annual  ]  [ Pro Annual       ]│
+│  Coupon: BUCKS50     [Current plan  ✓]   $95.90/yr          │
+│  Full analytics                           Full analytics     │
+│  [Start trial    ]   [Current plan  ]    [Upgrade & save]   │
+└──────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│                    [ Free — $0 ]                             │
+│                    [ Free plan ]                             │
+└──────────────────────────────────────────────────────────────┘
+```
+
+**Pro Monthly user (post-upgrade, flat layout):**
+```
+┌──────────────────────────────────────────────────────────────┐
+│  [ Free — $0   ]     [ Pro $19.99    ]   [ Pro Annual       ]│
+│  [ Free plan  ]      [ Current plan ✓]   $95.90/yr          │
+│                       Full analytics      Full analytics     │
+│                       [Current plan  ]   [Upgrade & save]   │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### 3e. Standard Plan Display Name Rule
+
+| User Segment | `id: "standard"` renders as |
+|---|---|
+| Free / New (no legacy plan) | **"Plus Plan"** |
+| Legacy $7.99 monthly (active) | **"Standard"** |
+| Legacy annual (active) | **"Standard"** |
+
+Logic: `plan.id === "standard" ? (hasActiveLegacy ? "Standard" : "Plus Plan") : plan.name`
+
+---
+
+## 4. Pro Annual Card Pricing Display
+
+The Pro Annual card uses the existing annual card rendering in `PricingCard.jsx`. Values passed from `pricing/index.jsx`:
+
+| Value | Non-Partner | Partner |
+|---|---|---|
+| `annualTotal` | $95.90 | $83.93 |
+| `displayAmount` (monthly equiv) | $7.99/mo | ~$6.99/mo |
+| `displayComparePrice` (monthly equiv) | $19.99/mo | $19.99/mo |
+| `discountPercent` | 60% | 65% |
+| `savingsText` | "You save $143.98 per year" | "You save $155.95 per year" |
+| `dynamicButtonText` | "Upgrade and save $143.98 now" | "Upgrade and save $155.95 now" |
+
+**Card visual (top section):**
+```
+Pro Annual                          [BEST VALUE]
+Lock in analytics with 60% annual saving
+
+~~$19.99/mo~~       60% OFF
+$7.99
+    / month
+
+┌─────────────────────────────────┐
+│ Billed annually         HUGE DEAL│
+│ $95.90                   / year  │
+│ ─────────────────────────────── │
+│ ✦ You save $143.98 per year     │
+│   vs regular price of $239.88/yr│
+└─────────────────────────────────┘
+```
+
+**When user IS on `bucks_premium_pro_annual` (post-upgrade):** Show `acceptedPrice` from DB, calculate actual discount, button text → "Current plan".
+
+---
+
+## 5. `replacementBehavior` Rules
+
+| From Plan | From Interval | To Plan | To Interval | `replacementBehavior` |
 |---|---|---|---|---|
-| Standard Monthly | `bucks_premium_standard` | $9.99/mo | ❌ None | No coupon; shown as "Plus Plan" to free/new users, "Standard" to existing paid |
-| Pro Monthly | `bucks_premium_pro` | $19.99/mo | ✅ Full | Coupon `BUCKS33` (50.03% off) → $9.99/mo |
-| Pro Annual | `bucks_premium_pro_annual` | $95.90/yr | ✅ Full | 39.98% of $239.88 full price; no coupon; partners pay $83.93/yr |
+| Free / Standard | — / monthly | Any | Any | `undefined` |
+| Legacy $7.99 | Monthly | Standard / Pro Monthly | Monthly | **`"APPLY_IMMEDIATELY"`** |
+| Legacy $7.99 | Monthly | Pro Annual | Annual | `undefined` (cross-interval) |
+| Legacy Annual | Annual | Standard / Pro Monthly | Monthly | `undefined` (cross-interval) |
+| Legacy Annual | Annual | Pro Annual | Annual | **`"APPLY_IMMEDIATELY"`** |
+| Pro Monthly | Monthly | Standard | Monthly | **`"APPLY_IMMEDIATELY"`** |
+| Pro Monthly | Monthly | Pro Annual | Annual | `undefined` (cross-interval) |
+| Pro Annual | Annual | Pro Monthly | Monthly | `undefined` (cross-interval) |
 
-**Annual price derivation:**
-```
-Pro Monthly full price:   $19.99/mo
-Annual equivalent:        $19.99 × 12 = $239.88 (compare/strikethrough price)
-Default annual price:     $239.88 × 0.3998 = $95.90/year  (merchant pays 39.98% of full)
-Partner annual price:     $239.88 × 0.3498 = $83.93/year  (merchant pays 34.98% of full)
-Effective monthly:        $95.90 / 12 = $7.99/month
-```
-
-> The $95.90/year effective monthly rate ($7.99) matches the legacy plan price — a natural anchor showing Pro Annual delivers analytics at no extra monthly cost vs. the old plan.
-
-**Coupon scope — BUCKS33:**
-- Applies **only** to Pro Monthly ($19.99 → $9.99/month, 50.03% off).
-- Does **not** apply to Pro Annual — discount is built into the $95.90 price.
-- Does **not** apply to Standard Monthly — $9.99 is a fixed base price, no coupon accepted.
-
-**Key design decisions:**
-
-- **Standard ($9.99) and Pro ($19.99) are separate plans** — each has its own `bucks_plan` DB value and distinct Shopify subscription. $9.99 is not a coupon-applied $19.99.
-- **Display name per segment** — the $9.99 Standard plan is shown as **"Plus Plan"** to free/new users and **"Standard"** to existing paid users (frontend label only; DB ID remains `bucks_premium_standard`).
-- **Legacy cards hide after upgrade** — once an existing monthly subscriber activates Pro Monthly, the Legacy $7.99 card is removed from their pricing view. Same for existing annual users who activate Pro Annual.
-- **`replacementBehavior: "APPLY_IMMEDIATELY"`** is set for same-interval upgrades from an active paid plan. Shopify credits the remaining balance and switches the plan immediately.
-- **Cross-interval upgrades** rely on Shopify's default behavior (no `replacementBehavior`).
-- **Partner discount on Pro Annual** is applied server-side based on the user's partner referral status — no separate coupon needed.
-
-**Edge cases:**
-- Legacy monthly → Pro Annual (cross-interval): `replacementBehavior` omitted → Shopify default.
-- Legacy annual → Pro Monthly (cross-interval): `replacementBehavior` omitted → Shopify default.
-- Trial days: same 7-day trial logic; users who exhausted their trial get 0 days.
-- Coupon entered for Annual or Standard: backend rejects, price unchanged.
-
----
-
-## 4. End-to-End Flow
-
-### 4a. Merchant Segment: New User / Existing Free
-
-**Pricing page shows 4 cards:**
-```
-[ Free $0/mo (Current) ]  [ Plus Plan $9.99/mo ]  [ Pro $19.99/mo ]  [ Pro Annual $95.90/yr ]
-```
-
-> The $9.99 plan is displayed as **"Plus Plan"** to free/new users (frontend label only; internal DB ID remains `bucks_premium_standard`).
-
-**Standard $9.99 flow:**
-1. Opens Pricing page → sees 4 cards
-2. Clicks "Start Trial" on Plus Plan → redirected to Shopify billing confirmation
-3. Approves → `checkSubscriptionStatus` writes `bucks_plan: "bucks_premium_standard"` to DB
-4. Redirected back to pricing page with success message
-
-**Pro Monthly with coupon (free/new):**
-1. Merchant opens Pro Monthly card → enters `BUCKS33` in the coupon input on the card → price updates instantly to $9.99 in the UI
-2. Clicks upgrade → `initSubscription` detects: `currentPlan = "bucks_free"` → no `replacementBehavior`
-3. Backend validates coupon → sets `price.amount = 9.99` before Shopify mutation
-4. Shopify confirmation → approved → DB updated with `bucks_plan: "bucks_premium_pro"`
-
----
-
-### 4b. Merchant Segment: Existing $7.99 Monthly
-
-**Pricing page shows 4 cards:**
-```
-[ Free $0/mo ]  [ Legacy $7.99/mo (Current) ]  [ Pro $19.99/mo ]  [ Pro Annual $95.90/yr ]
-```
-
-> Standard $9.99 card is **not shown** to existing paid users.
-
-**Same-interval upgrade (Monthly → Pro $19.99):**
-1. Merchant opens Pro card → enters `BUCKS33` in the coupon input on the card → price updates instantly to $9.99 in the UI
-2. Clicks upgrade → `initSubscription` detects: `currentPlan = "bucks_premium"` (monthly), `newPlan interval = monthly` → same interval
-3. Sets `replacementBehavior: "APPLY_IMMEDIATELY"` in Shopify mutation
-4. Shopify: credits remaining $7.99 balance, switches plan immediately
-5. Merchant approves → DB updated with `bucks_plan: "bucks_premium_pro"`
-6. **Legacy $7.99 card is removed** from pricing page for this merchant going forward
-
-**Cross-interval upgrade (Monthly → Pro Annual $95.90):**
-1. `replacementBehavior` is omitted → Shopify default
-2. Old monthly removed when new annual activates
-3. **Legacy $7.99 card is removed** from pricing page once new annual is active
-
----
-
-### 4c. Merchant Segment: Existing Annual Subscriber
-
-**Pricing page shows 4 cards:**
-```
-[ Free $0/mo ]  [ Pro $19.99/mo ]  [ Legacy Annual (Current) ]  [ Pro Annual $95.90/yr ]
-```
-
-> Standard $9.99 card is **not shown** to existing paid users.
-
-**Same-interval upgrade (Annual → Pro Annual $95.90):**
-1. Merchant clicks upgrade on Pro Annual card
-2. `initSubscription` detects: same interval (annual → annual)
-3. Sets `replacementBehavior: "APPLY_IMMEDIATELY"` → Shopify credits remaining annual balance and switches immediately
-4. **Legacy Annual card is removed** from pricing page for this merchant going forward
-
-**Cross-interval upgrade (Annual → Pro Monthly $19.99):**
-1. Merchant opens Pro Monthly card → enters `BUCKS33` → price shows $9.99 in UI
-2. `replacementBehavior` omitted (cross-interval) → Shopify default
-3. Legacy Annual continues until replaced when new monthly activates
-
----
-
-### 4d. Technical Flow — `initSubscription.js`
-
-```
-POST /api/v1/billing/initSubscription
-  │
-  ├─ Fetch userRecord from DB
-  │    - bucks_plan, plan_type, subscription_id
-  │
-  ├─ Determine replacementBehavior
-  │    - isOnActivePaidPlan = isPremiumPlan(bucks_plan) && subscription_id exists
-  │    - currentInterval = getPlanType(userRecord)  // "monthly" | "annual"
-  │    - newInterval = body.plan_type
-  │    - isSameInterval = currentInterval === newInterval
-  │    - replacementBehavior = (isOnActivePaidPlan && isSameInterval) ? "APPLY_IMMEDIATELY" : undefined
-  │
-  ├─ Validate coupon (Pro Monthly only)
-  │    - if newPlan == "bucks_premium_pro" && couponCode === "BUCKS33"
-  │        → override price.amount = 9.99  (50.03% off $19.99)
-  │    - if newPlan == "bucks_premium_pro_annual" OR "bucks_premium_standard"
-  │        → ignore couponCode entirely
-  │
-  ├─ Apply partner discount (Pro Annual only)
-  │    - if newPlan == "bucks_premium_pro_annual" && userRecord.isPartner
-  │        → price.amount = 83.93  (34.98% of $239.88)
-  │    - else
-  │        → price.amount = 95.90  (39.98% of $239.88)
-  │
-  ├─ Determine trial days (existing logic unchanged)
-  │
-  └─ Call createAppSubscription(session, subscriptionDetails, shop, testMode, trialDays, replacementBehavior)
-       │
-       └─ Shopify mutation → returns confirmationUrl
-            │
-            └─ Redirect merchant to Shopify billing confirmation
-                 │
-                 └─ On approval → checkSubscriptionStatus
-                      → write bucks_plan, plan_type, subscription_id to DB
+**Detection logic:**
+```js
+const isOnActivePaidPlan = (PREMIUM_PLAN_IDS.includes(currentPlan) || NEW_PLAN_IDS.includes(currentPlan)) && !!subscriptionId;
+const isSameInterval = !!currentInterval && currentInterval === newInterval;
+const replacementBehavior = isOnActivePaidPlan && isSameInterval ? "APPLY_IMMEDIATELY" : undefined;
 ```
 
 ---
 
-## 5. Implementation Details
+## 6. Analytics Page Gate
 
-### Data Model
-No new database columns required. The existing `users` table fields handle all new plans:
-- `bucks_plan` (String) — stores new values: `bucks_premium_standard`, `bucks_premium_pro`, `bucks_premium_pro_annual`
-- `plan_type` (String) — `"monthly"` or `"annual"` (unchanged)
-- `subscription_id` (String) — Shopify subscription GID (unchanged)
+### Access Matrix
 
-### Backend Changes
+| Plan | StatsCards | ChartsSection | PerformanceTables | SmartRecommendations |
+|---|---|---|---|---|
+| `bucks_free` | ✅ Visible | 🔒 Locked | 🔒 Locked | 🔒 Hidden |
+| Legacy `bucks_premium` | ✅ Visible | 🔒 Locked | 🔒 Locked | 🔒 Hidden |
+| Legacy annual plans | ✅ Visible | 🔒 Locked | 🔒 Locked | 🔒 Hidden |
+| `bucks_premium_standard` | ✅ Visible | 🔒 Locked | 🔒 Locked | 🔒 Hidden |
+| `bucks_premium_pro` | ✅ Visible | ✅ Visible | ✅ Visible | ✅ Visible |
+| `bucks_premium_pro_annual` | ✅ Visible | ✅ Visible | ✅ Visible | ✅ Visible |
 
-**`utils/graphQl/createAppSubscription.js`**
-- Add `replacementBehavior` as a new parameter
-- Include it conditionally in the GraphQL mutation variables (only when not `undefined`)
+### Locked Section UI (AnalyticsUpgradeLock component)
 
-```graphql
-# Updated mutation signature
-mutation AppSubscriptionCreate(
-  $name: String!
-  $lineItems: [AppSubscriptionLineItemInput!]!
-  $returnUrl: URL!
-  $trialDays: Int!
-  $replacementBehavior: AppSubscriptionReplacementBehavior  # NEW (optional)
-) {
-  appSubscriptionCreate(
-    name: $name
-    returnUrl: $returnUrl
-    lineItems: $lineItems
-    test: false
-    trialDays: $trialDays
-    replacementBehavior: $replacementBehavior  # passed only when APPLY_IMMEDIATELY
-  ) { ... }
+```
+┌──────────────────────────────────────────────┐
+│  [blurred/greyed placeholder — height 200px] │
+│                                              │
+│         ┌───────────────────────┐            │
+│         │  Unlock Full Analytics│            │
+│         │  Upgrade to Pro to    │            │
+│         │  access charts,       │            │
+│         │  tables, and AI recs. │            │
+│         │  [  Upgrade to Pro  ] │            │
+│         └───────────────────────┘            │
+└──────────────────────────────────────────────┘
+```
+
+- Blur: `filter: blur(2px)` on placeholder background div
+- Overlay: `rgba(255,255,255,0.75)` positioned absolutely, centered card
+- "Upgrade to Pro" button: `router.push('/pricing?shop={shop}')`
+- SmartRecommendations: hidden entirely (`{hasFullAnalytics && <SmartRecommendations />}`) — no lock overlay
+
+---
+
+## 7. PricingCard Component Changes
+
+### New props added
+
+| Prop | Type | Purpose |
+|---|---|---|
+| `couponEnabled` | `boolean` | Renders coupon input on this card (Pro Monthly only) |
+
+### Updated conditionals
+
+```js
+// OLD — only legacy IDs
+const isAnnualPlan = id === "pro-annual";
+
+// NEW — includes new Pro Annual
+const isAnnualPlan = id === "pro-annual" || id === "new-pro-annual";
+```
+
+```js
+// OLD — trial text only for legacy "pro"
+if (id === "pro") { /* trial text logic */ }
+
+// NEW — trial text also for new pro-monthly
+if (id === "pro" || id === "pro-monthly") { /* trial text logic */ }
+```
+
+### Coupon input — local state
+
+```js
+const [couponInput, setCouponInput] = React.useState("");
+const [appliedCoupon, setAppliedCoupon] = React.useState(null);
+const [couponDisplayPrice, setCouponDisplayPrice] = React.useState(null); // 9.99 when applied
+const [couponError, setCouponError] = React.useState("");
+```
+
+### Upgrade button onClick
+
+```js
+// OLD
+onClick={() => id === "free" ? downgradeHandler() : upgradePlanHandler(plan)}
+
+// NEW — includes coupon in payload when applied
+onClick={() => id === "free"
+  ? downgradeHandler()
+  : upgradePlanHandler({ ...plan, couponCode: appliedCoupon || undefined })}
+```
+
+---
+
+## 8. Plan ID Safety: PREMIUM_PLAN_IDS vs NEW_PLAN_IDS
+
+**Critical architectural decision:** New plan IDs must NOT be added to `PREMIUM_PLAN_IDS`.
+
+**Why:** `isCurrentPlanCard` has a second condition:
+```js
+const planMatches = currentPlan === plan_text ||
+    (plan_text === "bucks_premium" && PREMIUM_PLAN_IDS.includes(currentPlan));
+```
+If `"bucks_premium_pro"` were in `PREMIUM_PLAN_IDS`, a Pro user's DB plan would trigger the fallback and the **legacy $7.99 card** would incorrectly show as "Current plan."
+
+**Solution:**
+```js
+// trialHelpers.js
+export const PREMIUM_PLAN_IDS = [  // LEGACY ONLY — do NOT add new IDs
+  "bucks_premium",
+  "bucks_premium_60",
+  "bucks_premium_65",
+  "bucks_premium_70",
+];
+
+export const NEW_PLAN_IDS = [       // NEW — separate from legacy
+  "bucks_premium_standard",
+  "bucks_premium_pro",
+  "bucks_premium_pro_annual",
+];
+
+export const isPremiumPlan = (currentPlan) =>
+  PREMIUM_PLAN_IDS.includes(currentPlan) || NEW_PLAN_IDS.includes(currentPlan);
+```
+
+New plan cards use **exact match** (`currentPlan === plan_text`) since their `plan_name` in planDetails is unique.
+
+---
+
+## 9. Trial Days Logic (Unchanged)
+
+| User State | Trial Days |
+|---|---|
+| Never subscribed (no `subscription_id`) | `partnerData.trialDays` or `DEFAULT_TRIAL_DAYS` (7) |
+| On premium with active `trialEndDate` | Remaining days from `trialEndDate` |
+| On free with preserved `trialLeft` | `trialLeft` value |
+| Previously used trial, now free | 0 |
+
+Applies identically to Standard, Pro Monthly, and Pro Annual.
+
+---
+
+## 10. Backend API Payload Shapes
+
+**Standard Monthly (no coupon):**
+```json
+{
+  "name": "Plus Plan",
+  "plan_name": "bucks_premium_standard",
+  "plan_type": "monthly",
+  "price": { "amount": 9.99, "currencyCode": "USD" },
+  "interval": "EVERY_30_DAYS",
+  "trialDays": 7
 }
 ```
 
-**`pages/api/v1/billing/initSubscription.js`**
-- Add same-interval detection logic for `replacementBehavior`
-- Add coupon validation scoped to `bucks_premium_pro` only
-- Pass `replacementBehavior` through to `createAppSubscription`
-
-**`utils/common/common-methods/pricingConfig.js` — `getPlanType`**
-- Add cases for `bucks_premium_standard` (returns `"monthly"`), `bucks_premium_pro` (returns `"monthly"`), `bucks_premium_pro_annual` (returns `"annual"`)
-
-**`pages/api/v1/billing/checkSubscriptionStatus.js`**
-- No changes needed — already reads `bucks_plan` and `plan_type` from query params and writes to DB
-
-### Frontend Changes
-
-**`utils/constants.js` — `PREMIUM_PLANS`**
-```js
-export const PREMIUM_PLANS = {
-  MONTHLY: "bucks_premium",
-  ANNUAL_60: "bucks_premium_60",
-  ANNUAL_65: "bucks_premium_65",
-  ANNUAL_70: "bucks_premium_70",
-  STANDARD_MONTHLY: "bucks_premium_standard",  // NEW
-  PRO_MONTHLY: "bucks_premium_pro",            // NEW
-  PRO_ANNUAL: "bucks_premium_pro_annual",      // NEW
-};
+**Pro Monthly with coupon:**
+```json
+{
+  "name": "Pro",
+  "plan_name": "bucks_premium_pro",
+  "plan_type": "monthly",
+  "price": { "amount": 19.99, "currencyCode": "USD" },
+  "interval": "EVERY_30_DAYS",
+  "trialDays": 7,
+  "couponCode": "BUCKS50"
+}
 ```
+→ Backend reads `process.env.PRO_COUPON_CODE`, validates `couponCode === validCoupon`, overrides `price.amount = 9.99`.
 
-**`utils/common/common-methods/trialHelpers.js` — `PREMIUM_PLAN_IDS`**
-- Add `"bucks_premium_standard"`, `"bucks_premium_pro"`, `"bucks_premium_pro_annual"`
-
-**`utils/common/constants/constants.js` — new pricing constants & `planDetails` entries**
-```js
-export const NEW_STANDARD_MONTHLY_PRICE = 9.99;           // Standard — fixed price for free/new users
-export const NEW_PRO_MONTHLY_PRICE = 19.99;               // Pro Monthly — full price before coupon
-export const NEW_PRO_MONTHLY_PRICE_WITH_COUPON = 9.99;    // Pro Monthly — after BUCKS33 (50.03% off)
-export const NEW_PRO_ANNUAL_PRICE = 95.90;                // Pro Annual — default (39.98% of $239.88)
-export const NEW_PRO_ANNUAL_PRICE_PARTNER = 83.93;        // Pro Annual — partner (34.98% of $239.88)
-export const NEW_PRO_ANNUAL_FULL_PRICE = 239.88;          // Pro Annual — compare/strikethrough price
-export const PRO_COUPON_CODE = "BUCKS33";                  // Pro Monthly only; 50.03% off
-export const PRO_COUPON_DISCOUNT_PERCENT = 50.03;
+**Pro Annual (non-partner):**
+```json
+{
+  "name": "Pro Annual",
+  "plan_name": "bucks_premium_pro_annual",
+  "plan_type": "annual",
+  "price": { "amount": 95.90, "currencyCode": "USD" },
+  "interval": "ANNUAL",
+  "trialDays": 7
+}
 ```
-
-Three new `planDetails` entries with IDs: `"standard"`, `"pro"`, `"pro-annual"`.
-
-**`pages/pricing/index.jsx`**
-- Build `visiblePlanIds` array per user segment:
-  - Free/New: `["free", "standard", "pro", "pro-annual"]` — **4 cards**
-  - Legacy Monthly (active): `["free", "legacy-monthly", "pro", "pro-annual"]` — **4 cards**
-  - Legacy Monthly (upgraded to Pro Monthly): `["free", "pro", "pro-annual"]` — **3 cards** (legacy hidden)
-  - Legacy Annual (active): `["free", "pro", "legacy-annual", "pro-annual"]` — **4 cards**
-  - Legacy Annual (upgraded to Pro Annual): `["free", "pro", "pro-annual"]` — **3 cards** (legacy hidden)
-- Legacy card visibility rule: hide legacy card when `bucks_plan` is one of the new Pro plan IDs
-- Dynamic `InlineGrid` columns: `mdDown ? 1 : lgDown ? 2 : cardCount`
-
-**`components/pricing/PricingCard.jsx`**
-- **Plan display name**: render `plan.displayName` (e.g. `"Plus Plan"` for free/new users, `"Standard"` for existing paid users) — pass as prop from parent based on user segment
-- **Coupon input field**: rendered only on the Pro Monthly card (`plan.couponCode` exists)
-  - Input + "Apply" button inline on the card
-  - On apply: validates code client-side → if valid, immediately updates displayed price to $9.99, shows `~~$19.99~~` struck-through
-  - Coupon state stored in component; sent as `couponCode` in the `initSubscription` API call
-- `isCurrentPlanCard` check extended to all new plan IDs
-
-**`pages/analytics/index.jsx`**
-```js
-const PRO_ANALYTICS_PLANS = ["bucks_premium_pro", "bucks_premium_pro_annual"];
-const hasFullAnalytics = PRO_ANALYTICS_PLANS.includes(userData?.bucks_plan);
-// If !hasFullAnalytics → show teaser/upgrade prompt
-```
-
-### PostHog Events
-| Event | Trigger |
-|---|---|
-| `"bucks standard plan initiated"` | Standard/Plus $9.99 selected (free/new users) |
-| `"bucks pro monthly initiated"` | Pro $19.99 card clicked |
-| `"bucks pro coupon applied"` | BUCKS33 applied on card (track: shop, finalPrice: 9.99) |
-| `"bucks pro annual initiated"` | Pro Annual $95.90 or $83.93 card clicked |
-| `"bucks plan activated"` | Shopify billing callback confirms any new plan (track: shop, plan, price) |
+→ Backend ignores frontend `price.amount` and sets it: `partnerData ? 83.93 : 95.90`.
 
 ---
 
-## 6. Open Questions
+## 11. PostHog Events
 
-- **Coupon expiry:** Is `BUCKS33` always active or time-limited? If time-limited, store in env var.
-- **Analytics teaser UX:** Blur overlay vs. locked rows vs. date-limited view? Needs design input.
-- **Grid responsiveness (3–4 cards):** On tablet, single-row scroll or 2-col wrap? Confirm breakpoints.
-- **Legacy plan CTA copy:** "Upgrade to Pro" vs. "Switch to Pro" vs. "Unlock Analytics"?
-- **Partner detection:** How is `isPartner` flag determined server-side for Pro Annual discount? Via existing partner referral table?
-
----
-
-## References
-
-- [Shopify AppSubscriptionCreate mutation docs](https://shopify.dev/docs/api/admin-graphql/latest/mutations/appSubscriptionCreate)
-- [Shopify AppSubscriptionReplacementBehavior enum](https://shopify.dev/docs/api/admin-graphql/latest/enums/AppSubscriptionReplacementBehavior)
-- [Detailed plan specification: `docs/new-pricing-plans.md`](./new-pricing-plans.md)
+| Event Name | When | Key Props |
+|---|---|---|
+| `"bucks standard plan initiated"` | Standard card upgrade clicked | `myshopify_domain`, `bucks_plan: "bucks_premium_standard"`, `plan_type: "monthly"` |
+| `"bucks pro plan initiated"` | Pro Monthly or Pro Annual upgrade clicked | `myshopify_domain`, `bucks_plan`, `plan_type` |
+| `"bucks coupon applied"` | BUCKS50 applied on card | `myshopify_domain`, `coupon_code: "BUCKS50"`, `original_price: 19.99`, `final_price: 9.99` |
+| `"bucks pro plan selected"` | Shopify billing callback confirms subscription | `myshopify_domain`, `bucks_plan`, `plan_type` |
 
 ---
 
-## Implementation Plan
+## 12. `checkSubscriptionStatus.js` — No Changes
 
-| Phase | Goal | Files Affected | Estimated Effort |
-|---|---|---|---|
-| **Phase 1** | Constants, PREMIUM_PLANS, PREMIUM_PLAN_IDS, planDetails, getPlanType | `constants.js`, `trialHelpers.js`, `pricingConfig.js` | 0.5 day |
-| **Phase 2** | Backend: `createAppSubscription` (APPLY_IMMEDIATELY), `initSubscription` (coupon + partner discount) | `createAppSubscription.js`, `initSubscription.js` | 1 day |
-| **Phase 3** | Frontend: Pricing page segment filtering, dynamic grid, legacy card hide logic, display name per segment, coupon input UI on card | `pages/pricing/index.jsx`, `PricingCard.jsx` | 1.5 days |
-| **Phase 4** | Analytics gate: hasFullAnalytics check + teaser UI | `pages/analytics/index.jsx` | 0.5 day |
-| **Phase 5** | QA: Test all 3 user segments, coupon apply flow, APPLY_IMMEDIATELY paths, legacy card hide | — | 1 day |
+The return URL from `createAppSubscription` already includes:
+```
+...&bucks_plan=bucks_premium_pro&plan_type=monthly
+...&bucks_plan=bucks_premium_pro_annual&plan_type=annual
+...&bucks_plan=bucks_premium_standard&plan_type=monthly
+```
+`checkSubscriptionStatus.js` reads `bucks_plan` and `plan_type` from query params and writes to DB — no changes needed.
 
-Each phase can be shipped independently. Phase 1 is a prerequisite for all others.
+---
+
+## 13. Stale Document Notice
+
+`docs/new-pricing-plans.md` contains the following confirmed errors and should be treated as **deprecated**. This spec supersedes it:
+
+| Field | Stale Value | Correct Value |
+|---|---|---|
+| Pro Monthly price | $14.99 | **$19.99** |
+| Pro Annual price | $95.88 | **$95.90** |
+| Pro Annual compare price | $119.88 | **$239.88** |
+| Coupon code | BUCKS33 | **BUCKS50** |
+| Coupon source | hardcoded | **`process.env.PRO_COUPON_CODE`** |
+| replacementBehavior value | `"STANDARD"` | **`"APPLY_IMMEDIATELY"`** |
+| Layout: free/new users | 4-card flat grid | **3 premium top + free below** |
+| Layout: legacy users | 5-card flat grid | **3-card top row + free below** |
+| `PREMIUM_PLAN_IDS` | add new IDs | **keep legacy-only; use NEW_PLAN_IDS** |
+| Analytics lock UX | "TBD" | **blur overlay + upgrade CTA card** |
+| planDetails "pro" ID | conflicts with legacy | **use "pro-monthly"** |
+
+---
+
+*Spec complete. Awaiting user review before implementation proceeds.*
+
+
