@@ -19,6 +19,7 @@
 | `bucks_premium_standard` | **Plus Plan** *(or "Standard")* | **$9.99/mo** | Monthly | ❌ | New/free users |
 | `bucks_premium_pro` | **Pro** | **$19.99/mo** | Monthly | ✅ Full | All |
 | `bucks_premium_pro_annual` | **Pro Annual** | **$95.90/yr** | Annual | ✅ Full | All |
+| `bucks_premium_pro_annual_partner` | **Pro Annual** *(partner)* | **$83.93/yr** | Annual | ✅ Full | Partner-referred users |
 
 ### Pricing Math (all confirmed)
 
@@ -32,7 +33,7 @@
 | Pro Annual monthly equivalent | ~$7.99/mo (default) / ~$6.99/mo (partner) |
 | Standard Monthly | $9.99/mo (no coupon, no discount) |
 
-> **Partner discount for Pro Annual:** No separate DB plan ID. Same `bucks_premium_pro_annual` plan; partner discount ($83.93) is applied at subscription creation time in `initSubscription.js`. The `acceptedPrice` column in the `users` table stores the actual amount the merchant paid, exactly as legacy annual plans do today.
+> **Partner discount for Pro Annual:** Separate DB plan ID `bucks_premium_pro_annual_partner`. When a partner-referred user upgrades to Pro Annual, `initSubscription.js` detects `partnerData` and overrides `bucks_plan` to the partner ID before calling Shopify. The `acceptedPrice` column stores the actual amount paid ($83.93).
 
 ---
 
@@ -85,7 +86,7 @@
 ```js
 const isLegacyMonthly = currentPlan === "bucks_premium";
 const isLegacyAnnual  = ["bucks_premium_60", "bucks_premium_65", "bucks_premium_70"].includes(currentPlan);
-const isOnProPlan     = ["bucks_premium_pro", "bucks_premium_pro_annual"].includes(currentPlan);
+const isOnProPlan     = ["bucks_premium_pro", "bucks_premium_pro_annual", "bucks_premium_pro_annual_partner"].includes(currentPlan);
 
 const useTwoRowLayout = !isOnProPlan;  // all users except Pro Monthly/Annual post-upgrade
 ```
@@ -209,7 +210,7 @@ $7.99
 └─────────────────────────────────┘
 ```
 
-**When user IS on `bucks_premium_pro_annual` (post-upgrade):** Show `acceptedPrice` from DB, calculate actual discount, button text → "Current plan".
+**When user IS on `bucks_premium_pro_annual` or `bucks_premium_pro_annual_partner` (post-upgrade):** Show `acceptedPrice` from DB, calculate actual discount, button text → "Current plan".
 
 ---
 
@@ -249,6 +250,7 @@ const replacementBehavior = (hasActiveSubscription && !isFromFree) ? "APPLY_IMME
 | `bucks_premium_standard` | ✅ Visible | 🔒 Locked | 🔒 Locked | 🔒 Hidden |
 | `bucks_premium_pro` | ✅ Visible | ✅ Visible | ✅ Visible | ✅ Visible |
 | `bucks_premium_pro_annual` | ✅ Visible | ✅ Visible | ✅ Visible | ✅ Visible |
+| `bucks_premium_pro_annual_partner` | ✅ Visible | ✅ Visible | ✅ Visible | ✅ Visible |
 
 ### Locked Section UI (AnalyticsUpgradeLock component)
 
@@ -329,7 +331,8 @@ onClick={() => id === "free"
 **Why:** `isCurrentPlanCard` has a second condition:
 ```js
 const planMatches = currentPlan === plan_text ||
-    (plan_text === "bucks_premium" && PREMIUM_PLAN_IDS.includes(currentPlan));
+    (plan_text === "bucks_premium" && PREMIUM_PLAN_IDS.includes(currentPlan)) ||
+    (plan_text === "bucks_premium_pro_annual" && currentPlan === "bucks_premium_pro_annual_partner");
 ```
 If `"bucks_premium_pro"` were in `PREMIUM_PLAN_IDS`, a Pro user's DB plan would trigger the fallback and the **legacy $7.99 card** would incorrectly show as "Current plan."
 
@@ -347,6 +350,7 @@ export const NEW_PLAN_IDS = [       // NEW — separate from legacy
   "bucks_premium_standard",
   "bucks_premium_pro",
   "bucks_premium_pro_annual",
+  "bucks_premium_pro_annual_partner",
 ];
 
 export const isPremiumPlan = (currentPlan) =>
@@ -411,7 +415,19 @@ Applies identically to Standard, Pro Monthly, and Pro Annual.
   "trialDays": 7
 }
 ```
-→ Backend ignores frontend `price.amount` and sets it: `partnerData ? 83.93 : 95.90`.
+
+**Pro Annual (partner):**
+```json
+{
+  "name": "Pro Annual",
+  "plan_name": "bucks_premium_pro_annual_partner",
+  "plan_type": "annual",
+  "price": { "amount": 83.93, "currencyCode": "USD" },
+  "interval": "ANNUAL",
+  "trialDays": 7
+}
+```
+→ Backend detects `partnerData`, overrides `bucks_plan` to `bucks_premium_pro_annual_partner` and `price.amount` to $83.93.
 
 ---
 
