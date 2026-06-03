@@ -26,11 +26,13 @@
 |---|---|
 | Pro Monthly full price | $19.99/mo |
 | Pro Monthly with coupon (BUCKS50) | $9.99/mo (50.03% off) |
-| Pro Annual default | $95.90/yr (39.98% off $239.88) |
-| Pro Annual partner price | $83.93/yr (34.98% off $239.88) |
+| Pro Annual default | $95.90/yr (60.02% off $239.88) |
+| Pro Annual partner price | $83.93/yr (65.00% off $239.88) |
 | Pro Annual compare/strikethrough price | $239.88/yr ($19.99 × 12) |
-| Pro Annual monthly equivalent | ~$7.99/mo |
+| Pro Annual monthly equivalent | ~$7.99/mo (default) / ~$6.99/mo (partner) |
 | Standard Monthly | $9.99/mo (no coupon, no discount) |
+
+> **Partner discount for Pro Annual:** No separate DB plan ID. Same `bucks_premium_pro_annual` plan; partner discount ($83.93) is applied at subscription creation time in `initSubscription.js`. The `acceptedPrice` column in the `users` table stores the actual amount the merchant paid, exactly as legacy annual plans do today.
 
 ---
 
@@ -155,13 +157,15 @@ const useTwoRowLayout = !isOnProPlan;  // all users except Pro Monthly/Annual po
 
 ### 3e. Standard Plan Display Name Rule
 
+The Standard card (`id: "standard"`, `plan_name: "bucks_premium_standard"`) is **only visible to free, new, and Standard users** — legacy monthly and legacy annual segments do NOT include it in their `topRowIds`.
+
 | User Segment | `id: "standard"` renders as |
 |---|---|
-| Free / New (no legacy plan) | **"Plus Plan"** |
-| Legacy $7.99 monthly (active) | **"Standard"** |
-| Legacy annual (active) | **"Standard"** |
+| Free / New / Standard (no legacy plan) | **"Plus Plan"** |
 
-Logic: `plan.id === "standard" ? (hasActiveLegacy ? "Standard" : "Plus Plan") : plan.name`
+Logic: `plan.id === "standard" ? "Plus Plan" : plan.name`
+
+> Simplification note: Because legacy users never see the Standard card, the conditional `hasActiveLegacy ? "Standard" : "Plus Plan"` always resolves to `"Plus Plan"` in practice. The conditional is kept for defensive clarity but the else-branch is effectively dead code.
 
 ---
 
@@ -177,6 +181,15 @@ The Pro Annual card uses the existing annual card rendering in `PricingCard.jsx`
 | `discountPercent` | 60% | 65% |
 | `savingsText` | "You save $143.98 per year" | "You save $155.95 per year" |
 | `dynamicButtonText` | "Upgrade and save $143.98 now" | "Upgrade and save $155.95 now" |
+
+**Discount badge (same pattern as legacy annual):**
+
+| Partner Status | `discountPercent` | Badge Text |
+|---|---|---|
+| Non-partner | 60 | **"60% OFF"** |
+| Partner | 65 | **"60% OFF"** + **"5% EXTRA DISCOUNT"** overlay |
+
+The existing `PricingCard.jsx` annual badge logic uses `STANDARD_ANNUAL_DISCOUNT` (60) as the baseline and renders `(discountPercent - 60)% EXTRA DISCOUNT` when `partnerReferral && discountPercent > 60`. Pro Annual naturally fits this pattern.
 
 **Card visual (top section):**
 ```
@@ -202,23 +215,25 @@ $7.99
 
 ## 5. `replacementBehavior` Rules
 
-| From Plan | From Interval | To Plan | To Interval | `replacementBehavior` |
-|---|---|---|---|---|
-| Free / Standard | — / monthly | Any | Any | `undefined` |
-| Legacy $7.99 | Monthly | Standard / Pro Monthly | Monthly | **`"APPLY_IMMEDIATELY"`** |
-| Legacy $7.99 | Monthly | Pro Annual | Annual | `undefined` (cross-interval) |
-| Legacy Annual | Annual | Standard / Pro Monthly | Monthly | `undefined` (cross-interval) |
-| Legacy Annual | Annual | Pro Annual | Annual | **`"APPLY_IMMEDIATELY"`** |
-| Pro Monthly | Monthly | Standard | Monthly | **`"APPLY_IMMEDIATELY"`** |
-| Pro Monthly | Monthly | Pro Annual | Annual | `undefined` (cross-interval) |
-| Pro Annual | Annual | Pro Monthly | Monthly | `undefined` (cross-interval) |
+**Simplified rule:** `APPLY_IMMEDIATELY` for **every transition from an active paid plan to any paid plan** (same-interval or cross-interval). The **only** case that uses `undefined` is upgrading **from a free plan**.
+
+| From Plan | To Plan | `replacementBehavior` |
+|---|---|---|
+| Free (`bucks_free`) | Standard / Pro Monthly / Pro Annual | `undefined` |
+| Legacy $7.99 | Standard / Pro Monthly / Pro Annual | **`"APPLY_IMMEDIATELY"`** |
+| Legacy Annual | Standard / Pro Monthly / Pro Annual | **`"APPLY_IMMEDIATELY"`** |
+| Standard | Pro Monthly / Pro Annual | **`"APPLY_IMMEDIATELY"`** |
+| Pro Monthly | Standard / Pro Annual | **`"APPLY_IMMEDIATELY"`** |
+| Pro Annual | Pro Monthly / Standard | **`"APPLY_IMMEDIATELY"`** |
 
 **Detection logic:**
 ```js
-const isOnActivePaidPlan = (PREMIUM_PLAN_IDS.includes(currentPlan) || NEW_PLAN_IDS.includes(currentPlan)) && !!subscriptionId;
-const isSameInterval = !!currentInterval && currentInterval === newInterval;
-const replacementBehavior = isOnActivePaidPlan && isSameInterval ? "APPLY_IMMEDIATELY" : undefined;
+const hasActiveSubscription = !!subscriptionId && (PREMIUM_PLAN_IDS.includes(currentPlan) || NEW_PLAN_IDS.includes(currentPlan));
+const isFromFree = !currentPlan || currentPlan === "bucks_free" || !subscriptionId;
+const replacementBehavior = (hasActiveSubscription && !isFromFree) ? "APPLY_IMMEDIATELY" : undefined;
 ```
+
+> This removes the previous `isSameInterval` check. Shopify's `APPLY_IMMEDIATELY` works for cross-interval replacements — the merchant is billed immediately for the prorated difference and the old subscription is replaced.
 
 ---
 
@@ -353,6 +368,8 @@ New plan cards use **exact match** (`currentPlan === plan_text`) since their `pl
 
 Applies identically to Standard, Pro Monthly, and Pro Annual.
 
+> **Partner 30-day trial:** When a user comes through a partner referral (`partnerData` present), `partnerData.trialDays` overrides the default. If the partner config specifies 30 days, the Pro Annual card will show "Start your 30-day free trial" exactly as legacy annual plans do today. No new logic needed.
+
 ---
 
 ## 10. Backend API Payload Shapes
@@ -442,5 +459,3 @@ The return URL from `createAppSubscription` already includes:
 ---
 
 *Spec complete. Awaiting user review before implementation proceeds.*
-
-
