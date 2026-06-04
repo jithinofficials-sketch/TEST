@@ -18,7 +18,8 @@
 | `bucks_premium_60/65/70` | Legacy Annual | varies/yr | Annual | ❌ | Legacy subscribers only |
 | `bucks_plus` | **Plus Plan** | **$9.99/mo** | Monthly | ❌ | New/free users |
 | `bucks_premium_pro` | **Pro** | **$19.99/mo** | Monthly | ✅ Full | All |
-| `bucks_premium_pro_annual` | **Pro Annual** | **$95.90/yr** (default) / **$83.93/yr** (partner) | Annual | ✅ Full | All |
+| `bucks_premium_pro_annual_60` | **Pro Annual** | **$95.90/yr** (60% off) | Annual | ✅ Full | All (default) |
+| `bucks_premium_pro_annual_65` | **Pro Annual** | **$83.93/yr** (65% off) | Annual | ✅ Full | Partner-referred users |
 
 ### Pricing Math (all confirmed)
 
@@ -32,7 +33,7 @@
 | Pro Annual monthly equivalent | ~$7.99/mo (default) / ~$6.99/mo (partner) |
 | Plus Plan Monthly | $9.99/mo (no coupon, no discount) |
 
-> **Partner discount for Pro Annual:** A single DB plan ID `bucks_premium_pro_annual` is used for all users. When a partner-referred user upgrades to Pro Annual, `initSubscription.js` detects `partnerData` and overrides `price.amount` to $83.93 before calling Shopify. `discountPercent` is 60% for default, 65% for partner. The `acceptedPrice` column stores the actual amount paid.
+> **Partner discount for Pro Annual:** Two separate plan IDs encode the discount tier. `initSubscription.js` detects `partnerData` and sets `bucks_plan` to `bucks_premium_pro_annual_65` ($83.93) for partners, or `bucks_premium_pro_annual_60` ($95.90) for everyone else. The `acceptedPrice` column stores the actual amount paid.
 
 ---
 
@@ -118,7 +119,7 @@ The grid column count always stays at 3. No blank slots — every layout has exa
 | `"free"` | `bucks_free` | Always (bottom row or flat position 1) |
 | `"plus"` | `bucks_plus` | Non-legacy users only |
 | `"pro-monthly"` | `bucks_premium_pro` | Always |
-| `"pro-annual"` | `bucks_premium_pro_annual` | Always (new Pro Annual) |
+| `"pro-annual"` | `bucks_premium_pro_annual_60` (default) / `bucks_premium_pro_annual_65` (partner) | Always (resolved at upgrade time by `initSubscription.js`) |
 | `"legacy-monthly"` | `bucks_premium` | Legacy monthly segment only |
 | `"legacy-annual"` | `bucks_premium_60/65/70` | Legacy annual segment only |
 
@@ -230,7 +231,7 @@ $7.99
 └─────────────────────────────────┘
 ```
 
-**When user IS on `bucks_premium_pro_annual` (post-upgrade):** Show `acceptedPrice` from DB, calculate actual discount (60% default / 65% partner), button text → "Current plan".
+**When user IS on `bucks_premium_pro_annual_60` or `bucks_premium_pro_annual_65` (post-upgrade):** Show `acceptedPrice` from DB, calculate actual discount from the plan ID suffix (60 or 65), button text → "Current plan".
 
 ---
 
@@ -267,7 +268,8 @@ const replacementBehavior = "APPLY_IMMEDIATELY"; // always — Shopify handles p
 | Legacy annual plans | ✅ Visible | 🔒 Locked | 🔒 Locked | 🔒 Hidden |
 | `bucks_plus` | ✅ Visible | 🔒 Locked | 🔒 Locked | 🔒 Hidden |
 | `bucks_premium_pro` | ✅ Visible | ✅ Visible | ✅ Visible | ✅ Visible |
-| `bucks_premium_pro_annual` | ✅ Visible | ✅ Visible | ✅ Visible | ✅ Visible |
+| `bucks_premium_pro_annual_60` | ✅ Visible | ✅ Visible | ✅ Visible | ✅ Visible |
+| `bucks_premium_pro_annual_65` | ✅ Visible | ✅ Visible | ✅ Visible | ✅ Visible |
 
 ### Locked Section UI (AnalyticsUpgradeLock component)
 
@@ -341,7 +343,7 @@ onClick={() => id === "free"
 
 ---
 
-## 8. Plan ID Safety: LEGACY_PLAN_IDS vs NEW_MONTHLY/ANNUAL_PLAN_IDS
+## 8. Plan ID Safety: LEGACY_PLAN_IDS vs JUNE_2026 plan ID arrays
 
 **Critical architectural decision:** New plan IDs must NOT be added to `LEGACY_PLAN_IDS`.
 
@@ -355,26 +357,27 @@ If `"bucks_premium_pro"` were in `LEGACY_PLAN_IDS`, a Pro user's DB plan would t
 **Solution:**
 ```js
 // trialHelpers.js
-export const LEGACY_PLAN_IDS = [           // Legacy only — do NOT add new IDs
+export const LEGACY_PLAN_IDS = [                // Legacy only — do NOT add new IDs
   "bucks_premium",
   "bucks_premium_60",
   "bucks_premium_65",
   "bucks_premium_70",
 ];
 
-export const NEW_MONTHLY_PLAN_IDS = [      // New monthly plans
+export const JUNE_2026_MONTHLY_PLAN_IDS = [     // New monthly plans (June 2026)
   "bucks_plus",
   "bucks_premium_pro",
 ];
 
-export const NEW_ANNUAL_PLAN_IDS = [       // New annual plans
-  "bucks_premium_pro_annual",
+export const JUNE_2026_ANNUAL_PLAN_IDS = [      // New annual plans (June 2026)
+  "bucks_premium_pro_annual_60",               // default — 60% off
+  "bucks_premium_pro_annual_65",               // partner — 65% off
 ];
 
-export const NEW_PLAN_IDS = [...NEW_MONTHLY_PLAN_IDS, ...NEW_ANNUAL_PLAN_IDS]; // combined
+export const JUNE_2026_PLAN_IDS = [...JUNE_2026_MONTHLY_PLAN_IDS, ...JUNE_2026_ANNUAL_PLAN_IDS];
 
 export const isPremiumPlan = (currentPlan) =>
-  LEGACY_PLAN_IDS.includes(currentPlan) || NEW_PLAN_IDS.includes(currentPlan);
+  LEGACY_PLAN_IDS.includes(currentPlan) || JUNE_2026_PLAN_IDS.includes(currentPlan);
 ```
 
 New plan cards use **exact match** (`currentPlan === plan_text`) since their `plan_name` in planDetails is unique.
@@ -469,8 +472,8 @@ Applies identically to Standard, Pro Monthly, and Pro Annual.
 The return URL from `createAppSubscription` already includes:
 ```
 ...&bucks_plan=bucks_premium_pro&plan_type=monthly
-...&bucks_plan=bucks_premium_pro_annual&plan_type=annual
-...&bucks_plan=bucks_premium_pro_annual&plan_type=annual   ← partner pricing applied server-side, same plan ID
+...&bucks_plan=bucks_premium_pro_annual_60&plan_type=annual
+...&bucks_plan=bucks_premium_pro_annual_65&plan_type=annual   ← partner
 ...&bucks_plan=bucks_plus&plan_type=monthly
 ```
 
