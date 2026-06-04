@@ -16,10 +16,9 @@
 | `bucks_free` | Free | $0 | — | ❌ | All |
 | `bucks_premium` | Legacy Plus | $7.99/mo | Monthly | ❌ | Legacy subscribers only |
 | `bucks_premium_60/65/70` | Legacy Annual | varies/yr | Annual | ❌ | Legacy subscribers only |
-| `bucks_premium_standard` | **Plus Plan** *(or "Standard")* | **$9.99/mo** | Monthly | ❌ | New/free users |
+| `bucks_plus` | **Plus Plan** | **$9.99/mo** | Monthly | ❌ | New/free users |
 | `bucks_premium_pro` | **Pro** | **$19.99/mo** | Monthly | ✅ Full | All |
-| `bucks_premium_pro_annual` | **Pro Annual** | **$95.90/yr** | Annual | ✅ Full | All |
-| `bucks_premium_pro_annual_partner` | **Pro Annual** *(partner)* | **$83.93/yr** | Annual | ✅ Full | Partner-referred users |
+| `bucks_premium_pro_annual` | **Pro Annual** | **$95.90/yr** (default) / **$83.93/yr** (partner) | Annual | ✅ Full | All |
 
 ### Pricing Math (all confirmed)
 
@@ -31,9 +30,9 @@
 | Pro Annual partner price | $83.93/yr (65.00% off $239.88) |
 | Pro Annual compare/strikethrough price | $239.88/yr ($19.99 × 12) |
 | Pro Annual monthly equivalent | ~$7.99/mo (default) / ~$6.99/mo (partner) |
-| Standard Monthly | $9.99/mo (no coupon, no discount) |
+| Plus Plan Monthly | $9.99/mo (no coupon, no discount) |
 
-> **Partner discount for Pro Annual:** Separate DB plan ID `bucks_premium_pro_annual_partner`. When a partner-referred user upgrades to Pro Annual, `initSubscription.js` detects `partnerData` and overrides `bucks_plan` to the partner ID before calling Shopify. The `acceptedPrice` column stores the actual amount paid ($83.93).
+> **Partner discount for Pro Annual:** A single DB plan ID `bucks_premium_pro_annual` is used for all users. When a partner-referred user upgrades to Pro Annual, `initSubscription.js` detects `partnerData` and overrides `price.amount` to $83.93 before calling Shopify. `discountPercent` is 60% for default, 65% for partner. The `acceptedPrice` column stores the actual amount paid.
 
 ---
 
@@ -41,7 +40,7 @@
 
 - **Code:** `BUCKS50` — stored in `process.env.PRO_COUPON_CODE` (fallback: `"BUCKS50"`)
 - **Applies to:** Pro Monthly (`bucks_premium_pro`) **only**
-- **Does NOT apply to:** Standard Monthly, Pro Annual
+- **Does NOT apply to:** Plus Plan Monthly (`bucks_plus`), Pro Annual
 - **Discount:** $19.99 → $9.99/mo (50.03% off)
 - **Validation:** Backend only. Frontend shows instant price preview on apply; wrong codes are silently ignored server-side (no price change)
 - **UI location:** Input field with Apply button, rendered **on the Pro Monthly card only** (`couponEnabled: true` flag in planDetails)
@@ -75,32 +74,53 @@
 
 | User Segment | Layout Mode | Top Row (3 cols) | Bottom |
 |---|---|---|---|
-| **New / Free / Standard** | 2-row | Plus Plan $9.99 · Pro $19.99 · Pro Annual $95.90 | Free card (full width) |
-| **Legacy $7.99 monthly (active)** | 2-row | Legacy $7.99 · Pro $19.99 · Pro Annual $95.90 | Free card (full width) |
-| **Legacy annual (active)** | 2-row | Pro $19.99 · Legacy Annual · Pro Annual $95.90 | Free card (full width) |
-| **Pro Monthly user (post-upgrade)** | Flat 3-col | Free · Pro $19.99 (Active) · Pro Annual $95.90 | *(none)* |
-| **Pro Annual user (post-upgrade)** | Flat 3-col | Free · Pro $19.99 · Pro Annual $95.90 (Active) | *(none)* |
+| **New / Non-legacy (any plan, incl. Pro)** | 2-row | Plus Plan $9.99 · Pro $19.99 · Pro Annual $95.90 | Free card (full width) |
+| **Legacy $7.99 monthly (still active)** | 2-row | Legacy $7.99 · Pro $19.99 · Pro Annual $95.90 | Free card (full width) |
+| **Legacy annual (still active)** | 2-row | Pro $19.99 · Legacy Annual · Pro Annual $95.90 | Free card (full width) |
+| **Former legacy (switched to any plan OR on free)** | Flat 3-col | Free · Pro $19.99 · Pro Annual $95.90 | *(none)* |
+
+> **Key rule:** Non-legacy users (`isLegacyUser = false`) always see the Standard ($9.99) plan regardless of their current plan. Standard is only hidden for legacy users who have switched away from their legacy plan.
 
 ### 3b. Segment Detection Logic
 
 ```js
+const isLegacyUser    = initialData?.userData?.isLegacyUser === true; // from DB, in initialDataSelectors
 const isLegacyMonthly = currentPlan === "bucks_premium";
 const isLegacyAnnual  = ["bucks_premium_60", "bucks_premium_65", "bucks_premium_70"].includes(currentPlan);
-const isOnProPlan     = ["bucks_premium_pro", "bucks_premium_pro_annual", "bucks_premium_pro_annual_partner"].includes(currentPlan);
+const isFormerLegacy  = isLegacyUser && !isLegacyMonthly && !isLegacyAnnual; // legacy user who switched away
 
-const useTwoRowLayout = !isOnProPlan;  // all users except Pro Monthly/Annual post-upgrade
+const useTwoRowLayout = !isFormerLegacy; // flat layout only for former legacy users
+
+const topRowIds = useMemo(() => {
+  if (isLegacyMonthly) return ["legacy-monthly", "pro-monthly", "pro-annual"];
+  if (isLegacyAnnual)  return ["pro-monthly", "legacy-annual", "pro-annual"];
+  return ["plus", "pro-monthly", "pro-annual"]; // always for non-legacy (any current plan)
+}, [isLegacyMonthly, isLegacyAnnual]);
+
+const flatRowIds = ["free", "pro-monthly", "pro-annual"]; // former legacy: no plus plan
 ```
+
+> **`isLegacyUser` must be in `initialDataSelectors`** (`utils/constants.js`) so SSR passes it to the pricing page.
+
+### 3b-ii. Rendering Conditional
+
+The two values above drive a single conditional in `pages/pricing/index.jsx`:
+
+- **`useTwoRowLayout = true`** → renders `topRowIds` as a 3-column grid + Free card below as a separate full-width row
+- **`useTwoRowLayout = false`** → renders `flatRowIds` as a single 3-column grid (Free is position 1 in the row, no separate row below)
+
+The grid column count always stays at 3. No blank slots — every layout has exactly 3 cards in the grid row.
 
 ### 3c. Card ID → planDetails Mapping
 
 | Card ID | plan_name (DB) | Shown When |
 |---|---|---|
 | `"free"` | `bucks_free` | Always (bottom row or flat position 1) |
-| `"standard"` | `bucks_premium_standard` | Free/new/standard segment |
+| `"plus"` | `bucks_plus` | Non-legacy users only |
 | `"pro-monthly"` | `bucks_premium_pro` | Always |
-| `"new-pro-annual"` | `bucks_premium_pro_annual` | Always |
-| `"pro"` | `bucks_premium` | Legacy monthly segment only |
-| `"pro-annual"` | `bucks_premium` (legacy) | Legacy annual segment only |
+| `"pro-annual"` | `bucks_premium_pro_annual` | Always (new Pro Annual) |
+| `"legacy-monthly"` | `bucks_premium` | Legacy monthly segment only |
+| `"legacy-annual"` | `bucks_premium_60/65/70` | Legacy annual segment only |
 
 ### 3d. ASCII Wireframes
 
@@ -146,7 +166,7 @@ const useTwoRowLayout = !isOnProPlan;  // all users except Pro Monthly/Annual po
 └──────────────────────────────────────────────────────────────┘
 ```
 
-**Pro Monthly user (post-upgrade, flat layout):**
+**Former legacy user — switched to any plan (flat layout):**
 ```
 ┌──────────────────────────────────────────────────────────────┐
 │  [ Free — $0   ]     [ Pro $19.99    ]   [ Pro Annual       ]│
@@ -158,15 +178,15 @@ const useTwoRowLayout = !isOnProPlan;  // all users except Pro Monthly/Annual po
 
 ### 3e. Standard Plan Display Name Rule
 
-The Standard card (`id: "standard"`, `plan_name: "bucks_premium_standard"`) is **only visible to free, new, and Standard users** — legacy monthly and legacy annual segments do NOT include it in their `topRowIds`.
+The Plus Plan card (`id: "plus"`, `plan_name: "bucks_plus"`) is **only visible to non-legacy users** — any user with `isLegacyUser = true` never sees it, whether they are currently on a legacy plan or have switched away.
 
-| User Segment | `id: "standard"` renders as |
+| User Segment | Sees Standard card |
 |---|---|
-| Free / New / Standard (no legacy plan) | **"Plus Plan"** |
+| New / Non-legacy (any current plan) | ✅ Always |
+| Legacy monthly or annual (still active) | ❌ Not in `topRowIds` |
+| Former legacy (switched to Pro, Free, or Plus) | ❌ Flat layout uses `flatRowIds` (no plus plan) |
 
-Logic: `plan.id === "standard" ? "Plus Plan" : plan.name`
-
-> Simplification note: Because legacy users never see the Standard card, the conditional `hasActiveLegacy ? "Standard" : "Plus Plan"` always resolves to `"Plus Plan"` in practice. The conditional is kept for defensive clarity but the else-branch is effectively dead code.
+Display name: always rendered as **"Plus Plan"** (`plan.id === "plus" ? "Plus Plan" : plan.name`).
 
 ---
 
@@ -210,31 +230,29 @@ $7.99
 └─────────────────────────────────┘
 ```
 
-**When user IS on `bucks_premium_pro_annual` or `bucks_premium_pro_annual_partner` (post-upgrade):** Show `acceptedPrice` from DB, calculate actual discount, button text → "Current plan".
+**When user IS on `bucks_premium_pro_annual` (post-upgrade):** Show `acceptedPrice` from DB, calculate actual discount (60% default / 65% partner), button text → "Current plan".
 
 ---
 
 ## 5. `replacementBehavior` Rules
 
-**Simplified rule:** `APPLY_IMMEDIATELY` for **every transition from an active paid plan to any paid plan** (same-interval or cross-interval). The **only** case that uses `undefined` is upgrading **from a free plan**.
+**Simplified rule:** `APPLY_IMMEDIATELY` for **every transition to any paid plan**, including from free.
 
 | From Plan | To Plan | `replacementBehavior` |
 |---|---|---|
-| Free (`bucks_free`) | Standard / Pro Monthly / Pro Annual | `undefined` |
-| Legacy $7.99 | Standard / Pro Monthly / Pro Annual | **`"APPLY_IMMEDIATELY"`** |
-| Legacy Annual | Standard / Pro Monthly / Pro Annual | **`"APPLY_IMMEDIATELY"`** |
-| Standard | Pro Monthly / Pro Annual | **`"APPLY_IMMEDIATELY"`** |
-| Pro Monthly | Standard / Pro Annual | **`"APPLY_IMMEDIATELY"`** |
-| Pro Annual | Pro Monthly / Standard | **`"APPLY_IMMEDIATELY"`** |
+| Free (`bucks_free`) | Plus / Pro Monthly / Pro Annual | **`"APPLY_IMMEDIATELY"`** |
+| Legacy $7.99 | Plus / Pro Monthly / Pro Annual | **`"APPLY_IMMEDIATELY"`** |
+| Legacy Annual | Plus / Pro Monthly / Pro Annual | **`"APPLY_IMMEDIATELY"`** |
+| Plus | Pro Monthly / Pro Annual | **`"APPLY_IMMEDIATELY"`** |
+| Pro Monthly | Plus / Pro Annual | **`"APPLY_IMMEDIATELY"`** |
+| Pro Annual | Pro Monthly / Plus | **`"APPLY_IMMEDIATELY"`** |
 
 **Detection logic:**
 ```js
-const hasActiveSubscription = !!subscriptionId && (PREMIUM_PLAN_IDS.includes(currentPlan) || NEW_PLAN_IDS.includes(currentPlan));
-const isFromFree = !currentPlan || currentPlan === "bucks_free" || !subscriptionId;
-const replacementBehavior = (hasActiveSubscription && !isFromFree) ? "APPLY_IMMEDIATELY" : undefined;
+const replacementBehavior = "APPLY_IMMEDIATELY"; // always — Shopify handles proration
 ```
 
-> This removes the previous `isSameInterval` check. Shopify's `APPLY_IMMEDIATELY` works for cross-interval replacements — the merchant is billed immediately for the prorated difference and the old subscription is replaced.
+> Shopify's `APPLY_IMMEDIATELY` works for all transitions including free-to-paid. The merchant is billed immediately for the prorated difference and any previous subscription is replaced.
 
 ---
 
@@ -247,10 +265,9 @@ const replacementBehavior = (hasActiveSubscription && !isFromFree) ? "APPLY_IMME
 | `bucks_free` | ✅ Visible | 🔒 Locked | 🔒 Locked | 🔒 Hidden |
 | Legacy `bucks_premium` | ✅ Visible | 🔒 Locked | 🔒 Locked | 🔒 Hidden |
 | Legacy annual plans | ✅ Visible | 🔒 Locked | 🔒 Locked | 🔒 Hidden |
-| `bucks_premium_standard` | ✅ Visible | 🔒 Locked | 🔒 Locked | 🔒 Hidden |
+| `bucks_plus` | ✅ Visible | 🔒 Locked | 🔒 Locked | 🔒 Hidden |
 | `bucks_premium_pro` | ✅ Visible | ✅ Visible | ✅ Visible | ✅ Visible |
 | `bucks_premium_pro_annual` | ✅ Visible | ✅ Visible | ✅ Visible | ✅ Visible |
-| `bucks_premium_pro_annual_partner` | ✅ Visible | ✅ Visible | ✅ Visible | ✅ Visible |
 
 ### Locked Section UI (AnalyticsUpgradeLock component)
 
@@ -290,15 +307,15 @@ const replacementBehavior = (hasActiveSubscription && !isFromFree) ? "APPLY_IMME
 const isAnnualPlan = id === "pro-annual";
 
 // NEW — includes new Pro Annual
-const isAnnualPlan = id === "pro-annual" || id === "new-pro-annual";
+const isAnnualPlan = id === "legacy-annual" || id === "pro-annual";
 ```
 
 ```js
-// OLD — trial text only for legacy "pro"
-if (id === "pro") { /* trial text logic */ }
+// OLD — trial text only for legacy monthly
+if (id === "legacy-monthly") { /* trial text logic */ }
 
 // NEW — trial text also for new pro-monthly
-if (id === "pro" || id === "pro-monthly") { /* trial text logic */ }
+if (id === "legacy-monthly" || id === "pro-monthly") { /* trial text logic */ }
 ```
 
 ### Coupon input — local state
@@ -324,37 +341,40 @@ onClick={() => id === "free"
 
 ---
 
-## 8. Plan ID Safety: PREMIUM_PLAN_IDS vs NEW_PLAN_IDS
+## 8. Plan ID Safety: LEGACY_PLAN_IDS vs NEW_MONTHLY/ANNUAL_PLAN_IDS
 
-**Critical architectural decision:** New plan IDs must NOT be added to `PREMIUM_PLAN_IDS`.
+**Critical architectural decision:** New plan IDs must NOT be added to `LEGACY_PLAN_IDS`.
 
 **Why:** `isCurrentPlanCard` has a second condition:
 ```js
 const planMatches = currentPlan === plan_text ||
-    (plan_text === "bucks_premium" && PREMIUM_PLAN_IDS.includes(currentPlan)) ||
-    (plan_text === "bucks_premium_pro_annual" && currentPlan === "bucks_premium_pro_annual_partner");
+    (plan_text === "bucks_premium" && LEGACY_PLAN_IDS.includes(currentPlan));
 ```
-If `"bucks_premium_pro"` were in `PREMIUM_PLAN_IDS`, a Pro user's DB plan would trigger the fallback and the **legacy $7.99 card** would incorrectly show as "Current plan."
+If `"bucks_premium_pro"` were in `LEGACY_PLAN_IDS`, a Pro user's DB plan would trigger the fallback and the **legacy $7.99 card** would incorrectly show as "Current plan."
 
 **Solution:**
 ```js
 // trialHelpers.js
-export const PREMIUM_PLAN_IDS = [  // LEGACY ONLY — do NOT add new IDs
+export const LEGACY_PLAN_IDS = [           // Legacy only — do NOT add new IDs
   "bucks_premium",
   "bucks_premium_60",
   "bucks_premium_65",
   "bucks_premium_70",
 ];
 
-export const NEW_PLAN_IDS = [       // NEW — separate from legacy
-  "bucks_premium_standard",
+export const NEW_MONTHLY_PLAN_IDS = [      // New monthly plans
+  "bucks_plus",
   "bucks_premium_pro",
-  "bucks_premium_pro_annual",
-  "bucks_premium_pro_annual_partner",
 ];
 
+export const NEW_ANNUAL_PLAN_IDS = [       // New annual plans
+  "bucks_premium_pro_annual",
+];
+
+export const NEW_PLAN_IDS = [...NEW_MONTHLY_PLAN_IDS, ...NEW_ANNUAL_PLAN_IDS]; // combined
+
 export const isPremiumPlan = (currentPlan) =>
-  PREMIUM_PLAN_IDS.includes(currentPlan) || NEW_PLAN_IDS.includes(currentPlan);
+  LEGACY_PLAN_IDS.includes(currentPlan) || NEW_PLAN_IDS.includes(currentPlan);
 ```
 
 New plan cards use **exact match** (`currentPlan === plan_text`) since their `plan_name` in planDetails is unique.
@@ -378,11 +398,11 @@ Applies identically to Standard, Pro Monthly, and Pro Annual.
 
 ## 10. Backend API Payload Shapes
 
-**Standard Monthly (no coupon):**
+**Plus Plan Monthly (no coupon):**
 ```json
 {
   "name": "Plus Plan",
-  "plan_name": "bucks_premium_standard",
+  "plan_name": "bucks_plus",
   "plan_type": "monthly",
   "price": { "amount": 9.99, "currencyCode": "USD" },
   "interval": "EVERY_30_DAYS",
@@ -416,18 +436,18 @@ Applies identically to Standard, Pro Monthly, and Pro Annual.
 }
 ```
 
-**Pro Annual (partner):**
+**Pro Annual (partner) — what the frontend sends:**
 ```json
 {
   "name": "Pro Annual",
-  "plan_name": "bucks_premium_pro_annual_partner",
+  "plan_name": "bucks_premium_pro_annual",
   "plan_type": "annual",
-  "price": { "amount": 83.93, "currencyCode": "USD" },
+  "price": { "amount": 95.90, "currencyCode": "USD" },
   "interval": "ANNUAL",
   "trialDays": 7
 }
 ```
-→ Backend detects `partnerData`, overrides `bucks_plan` to `bucks_premium_pro_annual_partner` and `price.amount` to $83.93.
+→ Frontend **always sends `bucks_premium_pro_annual`** regardless of partner status. The backend detects `partnerData`, overrides `price.amount` to $83.93, and overrides `bucks_plan` to `bucks_premium_pro_annual_partner` before calling Shopify. The return URL will then carry `bucks_plan=bucks_premium_pro_annual_partner`.
 
 ---
 
@@ -442,15 +462,27 @@ Applies identically to Standard, Pro Monthly, and Pro Annual.
 
 ---
 
-## 12. `checkSubscriptionStatus.js` — No Changes
+## 12. `checkSubscriptionStatus.js` and `cancelSubscription.js` — `isLegacyUser` Flag Persistence
+
+### Return URL (unchanged)
 
 The return URL from `createAppSubscription` already includes:
 ```
 ...&bucks_plan=bucks_premium_pro&plan_type=monthly
 ...&bucks_plan=bucks_premium_pro_annual&plan_type=annual
-...&bucks_plan=bucks_premium_standard&plan_type=monthly
+...&bucks_plan=bucks_premium_pro_annual&plan_type=annual   ← partner pricing applied server-side, same plan ID
+...&bucks_plan=bucks_plus&plan_type=monthly
 ```
-`checkSubscriptionStatus.js` reads `bucks_plan` and `plan_type` from query params and writes to DB — no changes needed.
+
+### `isLegacyUser` write (new)
+
+`checkSubscriptionStatus.js` reads `bucks_plan` and `plan_type` from query params and writes to DB. It also **stamps `isLegacyUser: true`** when the user's plan immediately before the upgrade was a legacy plan ID (`bucks_premium`, `bucks_premium_60`, `bucks_premium_65`, `bucks_premium_70`). The existing user row is fetched before the update, so the pre-upgrade plan is available for this check.
+
+`cancelSubscription.js` applies the same check when downgrading to free: if the user's current plan before cancellation is a legacy plan ID, `isLegacyUser: true` is written alongside `bucks_plan: "bucks_free"`.
+
+**The flag is sticky** — it is only ever written as `true`, never reset to `false`. Once a user is marked legacy, they remain legacy regardless of subsequent plan changes.
+
+The partner override flows automatically because `finalDetails.bucks_plan` is set to the partner ID server-side before `createAppSubscription` is called.
 
 ---
 
