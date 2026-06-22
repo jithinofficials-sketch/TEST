@@ -1,546 +1,465 @@
-# New Pricing Plans — Design Spec
+# RFC: Monthly Analytics Report for Pro Merchants
 
-**Created:** June 3, 2026  
-**Status:** Confirmed — Ready for Implementation  
-**RFC:** `docs/rfc-new-pricing-plans.md`  
-**Implementation Plan:** `docs/superpowers/plans/2026-06-03-new-pricing-plans.md`
+**Metadata:**
 
-> ⚠️ **Note:** `docs/new-pricing-plans.md` contains stale values ($14.99, $95.88, BUCKS33, "STANDARD" replacementBehavior, flat grid layout). This spec supersedes it with confirmed final values.
-
----
-
-## 1. Plan Catalogue (Confirmed Final)
-
-| DB ID | Display Name | Price | Interval | Analytics | Audience |
-|---|---|---|---|---|---|
-| `bucks_free` | Free | $0 | — | ❌ | All |
-| `bucks_premium` | Legacy Plus | $7.99/mo | Monthly | ❌ | Legacy subscribers only |
-| `bucks_premium_60/65/70` | Legacy Annual | varies/yr | Annual | ❌ | Legacy subscribers only |
-| `bucks_plus` | **Plus Plan** | **$9.99/mo** | Monthly | ❌ | New/free users |
-| `bucks_premium_pro` | **Pro** | **$19.99/mo** | Monthly | ✅ Full | All |
-| `bucks_premium_pro_annual_60` | **Pro Annual** | **$95.90/yr** (60% off) | Annual | ✅ Full | All (default) |
-| `bucks_premium_pro_annual_65` | **Pro Annual** | **$83.93/yr** (65% off) | Annual | ✅ Full | Partner-referred users |
-
-### Pricing Math (all confirmed)
-
-| Value | Amount |
-|---|---|
-| Pro Monthly full price | $19.99/mo |
-| Pro Monthly with coupon (BUCKS50) | $9.99/mo (50.03% off) |
-| Pro Annual default | $95.90/yr (60.02% off $239.88) |
-| Pro Annual partner price | $83.93/yr (65.00% off $239.88) |
-| Pro Annual compare/strikethrough price | $239.88/yr ($19.99 × 12) |
-| Pro Annual monthly equivalent | ~$7.99/mo (default) / ~$6.99/mo (partner) |
-| Plus Plan Monthly | $9.99/mo (no coupon, no discount) |
-
-> **Partner discount for Pro Annual:** Two separate plan IDs encode the discount tier. `initSubscription.js` detects `partnerData` and sets `bucks_plan` to `bucks_premium_pro_annual_65` ($83.93) for partners, or `bucks_premium_pro_annual_60` ($95.90) for everyone else. The `acceptedPrice` column stores the actual amount paid.
+- **Author:** BUCKS Engineering
+- **Status:** Draft
+- **Reviewers:** CPO, Product Owner, Analytics Team
+- **Type:** #feature-rfc
 
 ---
 
-## 2. Coupon Design
+## 1. Problem
 
-- **Code:** `BUCKS50` — stored in `process.env.PRO_COUPON_CODE` (fallback: `"BUCKS50"`)
-- **Applies to:** Pro Monthly (`bucks_premium_pro`) **only**
-- **Does NOT apply to:** Plus Plan Monthly (`bucks_plus`), Pro Annual
-- **Discount:** $19.99 → $9.99/mo (50.03% off)
-- **Validation:** Backend only. Frontend shows instant price preview on apply; wrong codes are silently ignored server-side (no price change)
-- **UI location:** Rendered **on the Pro Monthly card only** (`couponEnabled: true` flag in planDetails)
-- **Copy button:** The coupon code `BUCKS50` is shown as a badge with a copy-to-clipboard icon. Clicking it copies the code and shows a brief ✓ confirmation (reverts after ~2s). This is separate from the input field — it lets the user copy the code before or instead of typing it.
-- **Price change on apply:** When the coupon is applied, the card's **main displayed price** updates from $19.99 to **$9.99** (strikethrough on $19.99). The price change is local state only — the actual Shopify charge is confirmed on the backend.
+Pro merchants with full analytics access must **manually log into BUCKS** to review store performance. There is no automated way to deliver a periodic summary of currency conversion activity, sales by market, or actionable recommendations.
 
-### Coupon Input States
-
-```
-── State 1: Default (no coupon entered) ──────────────────────────
-  BUCKS50  [ Copy ]
-  [         Enter coupon code          ] [ Apply ]
-  Then $19.99/month · Cancel anytime
-
-── State 2: Applied ──────────────────────────────────────────────
-  Card main price: ~~$19.99/mo~~  $9.99/mo
-  ──────────────────────────────────────────
-  ~~$19.99/mo~~   $9.99/mo ✓   [ Remove ]
-  Then $9.99/month with BUCKS50 · Cancel anytime
-
-── State 3: Empty submit ─────────────────────────────────────────
-  [         Enter coupon code          ] [ Apply ]
-  Please enter a coupon code.   ← red error text
-
-── State 4: Copy button clicked ─────────────────────────────────
-  BUCKS50  [ ✓ Copied ]   ← checkmark, reverts to [ Copy ] after 2s
-
-── State 5: Wrong code (frontend-only note) ──────────────────────
-  Client accepts any non-empty code (shows $9.99 preview).
-  Backend validates — if invalid, Shopify charges $19.99.
-  Design decision: No client-side code rejection.
-```
+- **Merchant pain points:**
+  - Performance insights are only available inside the app; merchants forget to check.
+  - No monthly touchpoint reinforcing the value of the Pro analytics plan.
+  - Merchants who are busy running their store miss trends (top currencies, country performance, low-conversion markets).
+- **Current workarounds:**
+  - Merchants open `/analytics` and change the date filter to "Last month" themselves.
+  - Support cannot proactively share performance summaries.
+- **Competitor context:**
+  - Many SaaS analytics products (Klaviyo, Google Analytics email summaries, Shopify reports) send periodic email digests. Merchants expect a monthly "here's how you did" email for paid analytics tiers.
 
 ---
 
-## 3. Pricing Page Layout
+## 2. Why This Matters?
 
-### 3a. Layout Rule
-
-| User Segment | Layout Mode | Top Row (3 cols) | Bottom |
-|---|---|---|---|
-| **New / Non-legacy (any plan, incl. Pro)** | 2-row | Plus Plan $9.99 · Pro $19.99 · Pro Annual $95.90 | Free card (full width) |
-| **Legacy $7.99 monthly (still active)** | 2-row | Legacy $7.99 · Pro $19.99 · Pro Annual $95.90 | Free card (full width) |
-| **Legacy annual (still active)** | 2-row | Pro $19.99 · Legacy Annual · Pro Annual $95.90 | Free card (full width) |
-| **Former legacy (switched to any plan OR on free)** | Flat 3-col | Free · Pro $19.99 · Pro Annual $95.90 | *(none)* |
-
-> **Key rule:** Non-legacy users (`isLegacyUser = false`) always see the Standard ($9.99) plan regardless of their current plan. Standard is only hidden for legacy users who have switched away from their legacy plan.
-
-### 3b. Segment Detection Logic
-
-```js
-const isLegacyUser    = initialData?.userData?.isLegacyUser === true; // from DB, in initialDataSelectors
-const isLegacyMonthly = currentPlan === "bucks_premium";
-const isLegacyAnnual  = ["bucks_premium_60", "bucks_premium_65", "bucks_premium_70"].includes(currentPlan);
-const isFormerLegacy  = isLegacyUser && !isLegacyMonthly && !isLegacyAnnual; // legacy user who switched away
-
-const useTwoRowLayout = !isFormerLegacy; // flat layout only for former legacy users
-
-const topRowIds = useMemo(() => {
-  if (isLegacyMonthly) return ["legacy-monthly", "pro-monthly", "pro-annual"];
-  if (isLegacyAnnual)  return ["pro-monthly", "legacy-annual", "pro-annual"];
-  return ["plus", "pro-monthly", "pro-annual"]; // always for non-legacy (any current plan)
-}, [isLegacyMonthly, isLegacyAnnual]);
-
-const flatRowIds = ["free", "pro-monthly", "pro-annual"]; // former legacy: no plus plan
-```
-
-> **`isLegacyUser` must be in `initialDataSelectors`** (`utils/constants.js`) so SSR passes it to the pricing page.
-
-### 3b-ii. Rendering Conditional
-
-The two values above drive a single conditional in `pages/pricing/index.jsx`:
-
-- **`useTwoRowLayout = true`** → renders `topRowIds` as a 3-column grid + Free card below as a separate full-width row
-- **`useTwoRowLayout = false`** → renders `flatRowIds` as a single 3-column grid (Free is position 1 in the row, no separate row below)
-
-The grid column count always stays at 3. No blank slots — every layout has exactly 3 cards in the grid row.
-
-### 3c. Card ID → planDetails Mapping
-
-| Card ID | plan_name (DB) | Shown When |
-|---|---|---|
-| `"free"` | `bucks_free` | Always (bottom row or flat position 1) |
-| `"plus"` | `bucks_plus` | Non-legacy users only |
-| `"pro-monthly"` | `bucks_premium_pro` | Always |
-| `"pro-annual"` | `bucks_premium_pro_annual_60` (default) / `bucks_premium_pro_annual_65` (partner) | Always (resolved at upgrade time by `initSubscription.js`) |
-| `"legacy-monthly"` | `bucks_premium` | Legacy monthly segment only |
-| `"legacy-annual"` | `bucks_premium_60/65/70` | Legacy annual segment only |
-
-### 3d. ASCII Wireframes
-
-**New / Free / Standard users:**
-```
-┌──────────────────────────────────────────────────────────────┐
-│  [ Plus Plan $9.99 ]  [ Pro $19.99     ]  [ Pro Annual      ]│
-│  Billed monthly       Coupon: BUCKS50     $95.90/yr          │
-│  No analytics         Full analytics      Full analytics     │
-│  [Start 7-day trial]  [Start 7-day trial] [Upgrade & save]  │
-└──────────────────────────────────────────────────────────────┘
-┌──────────────────────────────────────────────────────────────┐
-│                    [ Free — $0 ]                             │
-│                    [ Current plan ] (if on free)             │
-└──────────────────────────────────────────────────────────────┘
-```
-
-**Legacy $7.99 monthly user (active):**
-```
-┌──────────────────────────────────────────────────────────────┐
-│  [ Legacy $7.99   ]   [ Pro $19.99    ]   [ Pro Annual      ]│
-│  [Current plan  ✓]   Coupon: BUCKS50     $95.90/yr          │
-│                       Full analytics      Full analytics     │
-│  [Current plan  ]    [Start trial    ]   [Upgrade & save]   │
-└──────────────────────────────────────────────────────────────┘
-┌──────────────────────────────────────────────────────────────┐
-│                    [ Free — $0 ]                             │
-│                    [ Free plan ]                             │
-└──────────────────────────────────────────────────────────────┘
-```
-
-**Legacy annual user (active):**
-```
-┌──────────────────────────────────────────────────────────────┐
-│  [ Pro $19.99     ]  [ Legacy Annual  ]  [ Pro Annual       ]│
-│  Coupon: BUCKS50     [Current plan  ✓]   $95.90/yr          │
-│  Full analytics                           Full analytics     │
-│  [Start trial    ]   [Current plan  ]    [Upgrade & save]   │
-└──────────────────────────────────────────────────────────────┘
-┌──────────────────────────────────────────────────────────────┐
-│                    [ Free — $0 ]                             │
-│                    [ Free plan ]                             │
-└──────────────────────────────────────────────────────────────┘
-```
-
-**Former legacy user — switched to any plan (flat layout):**
-```
-┌──────────────────────────────────────────────────────────────┐
-│  [ Free — $0   ]     [ Pro $19.99    ]   [ Pro Annual       ]│
-│  [ Free plan  ]      [ Current plan ✓]   $95.90/yr          │
-│                       Full analytics      Full analytics     │
-│                       [Current plan  ]   [Upgrade & save]   │
-└──────────────────────────────────────────────────────────────┘
-```
-
-### 3e. Standard Plan Display Name Rule
-
-The Plus Plan card (`id: "plus"`, `plan_name: "bucks_plus"`) is **only visible to non-legacy users** — any user with `isLegacyUser = true` never sees it, whether they are currently on a legacy plan or have switched away.
-
-| User Segment | Sees Standard card |
-|---|---|
-| New / Non-legacy (any current plan) | ✅ Always |
-| Legacy monthly or annual (still active) | ❌ Not in `topRowIds` |
-| Former legacy (switched to Pro, Free, or Plus) | ❌ Flat layout uses `flatRowIds` (no plus plan) |
-
-Display name: always rendered as **"Plus Plan"** (`plan.id === "plus" ? "Plus Plan" : plan.name`).
+- **Why now:**
+  - Full analytics dashboard is live for Pro plan merchants (`bucks_premium_pro*`).
+  - Analytics backend (Express) already aggregates all required data via existing endpoints.
+  - Shared MongoDB gives the analytics backend access to merchant email and plan eligibility.
+  - Team already uses **Google Cloud Scheduler** for scheduled jobs — no new scheduling infra required.
+- **Benefits:**
+  - Increases perceived value of Pro analytics subscription.
+  - Drives re-engagement with the analytics dashboard (email CTA → in-app analytics).
+  - Surfaces `suggestions` proactively without merchants opening the app.
+  - Reduces "I didn't know my store was performing well in EUR" support conversations.
+- **Cost of inaction:**
+  - Pro analytics remains a passive feature merchants must remember to use.
+  - Lower differentiation vs competitors offering automated reporting.
+  - Missed opportunity for retention and upgrade justification.
 
 ---
 
-## 4. Pro Annual Card Pricing Display
+## 3. Proposed Solution
 
-The Pro Annual card uses the existing annual card rendering in `PricingCard.jsx`. Values passed from `pricing/index.jsx`:
+Build a **monthly automated email report** generated and sent entirely from the **analytics Express backend**. The main Next.js app is not involved in report generation or delivery.
 
-| Value | Non-Partner | Partner |
-|---|---|---|
-| `annualTotal` | $95.90 | $83.93 |
-| `displayAmount` (monthly equiv) | $7.99/mo | ~$6.99/mo |
-| `displayComparePrice` (monthly equiv) | $19.99/mo | $19.99/mo |
-| `discountPercent` | 60% | 65% |
-| `savingsText` | "You save $143.98 per year" | "You save $155.95 per year" |
-| `dynamicButtonText` | "Upgrade and save $143.98 now" | "Upgrade and save $155.95 now" |
+### Approach summary
 
-**Discount badge (same pattern as legacy annual):**
+| Concern | Owner |
+|---------|--------|
+| Cron trigger | Google Cloud Scheduler → HTTP POST to analytics backend |
+| Eligibility (Pro plan, email, active) | Analytics backend (query shared MongoDB `users`) |
+| Analytics data | Analytics backend (internal service calls — not self-HTTP) |
+| HTML email rendering | Analytics backend (email-safe HTML) |
+| Email delivery | Analytics backend (Brevo) |
+| Deep link to full dashboard | Main app URL in CTA button only |
 
-| Partner Status | `discountPercent` | Badge Text |
-|---|---|---|
-| Non-partner | 60 | **"60% OFF"** |
-| Partner | 65 | **"60% OFF"** + **"5% EXTRA DISCOUNT"** overlay |
+### Why analytics backend (not main app)?
 
-The existing `PricingCard.jsx` annual badge logic uses `STANDARD_ANNUAL_DISCOUNT` (60) as the baseline and renders `(discountPercent - 60)% EXTRA DISCOUNT` when `partnerReferral && discountPercent > 60`. Pro Annual naturally fits this pattern.
+- Analytics data already lives here; internal calls avoid HTTP round-trips per shop.
+- `suggestions` controller already exists on the same server.
+- Shared MongoDB provides `email`, `bucks_plan`, `shop_owner`, `currency` without cross-service calls.
+- Monthly batch job is naturally co-located with data aggregation.
 
-**Card visual (top section):**
+### Why HTML-only email (primary)?
+
+- Email clients do not support React, Polaris, or Recharts.
+- Hand-built email HTML can closely match the analytics dashboard design for stats cards, tables, and bar-style chart visualizations.
+- Reliable across Gmail, Outlook, and mobile clients.
+- No Puppeteer/headless browser dependency in production.
+
+### What existing systems are reused?
+
+- Analytics Express routes/controllers: `getSummary`, `getTrends`, `getRevenueByCurrency`, `getSalesByCountry`, `getSuggestions`
+- Shared MongoDB `users` collection (plan, email, shop domain)
+- `calculateDateRange("last_month")` logic (ported or duplicated in analytics backend)
+- Brevo API pattern (same as main app `mailEngine.js`)
+- Google Cloud Scheduler (existing team pattern)
+
+### What new systems are introduced?
+
+- `POST /api/analytics/cron/monthly-report` — secured cron endpoint on analytics backend
+- `monthlyReportService` — orchestrates fetch → render → send per shop
+- `renderMonthlyReportHtml` — email HTML template builders
+- `mailService` — Brevo send wrapper on analytics backend
+- `lastMonthlyReportSentAt` field on `users` (idempotency)
+
+### Architecture diagram
+
 ```
-Pro Annual                          [BEST VALUE]
-Lock in analytics with 60% annual saving
-
-~~$19.99/mo~~       60% OFF
-$7.99
-    / month
-
-┌─────────────────────────────────┐
-│ Billed annually         HUGE DEAL│
-│ $95.90                   / year  │
-│ ─────────────────────────────── │
-│ ✦ You save $143.98 per year     │
-│   vs regular price of $239.88/yr│
-└─────────────────────────────────┘
+┌──────────────────────────┐
+│  Google Cloud Scheduler   │
+│  Schedule: 0 9 1 * *      │
+└────────────┬─────────────┘
+             │ POST /api/analytics/cron/monthly-report
+             │ Authorization: Bearer CRON_SECRET
+             ▼
+┌──────────────────────────────────────────────────────────┐
+│  Analytics Express Backend                                │
+│                                                           │
+│  1. Verify CRON_SECRET                                    │
+│  2. Query MongoDB users (Pro plan + active + email)       │
+│  3. For each shop (batched):                              │
+│     a. Internal: getSummary, getTrends, getRevenue...     │
+│     b. Internal: getSuggestions                           │
+│     c. renderMonthlyReportHtml()                          │
+│     d. send via Brevo                                     │
+│     e. Update lastMonthlyReportSentAt                     │
+└──────────────────────────────────────────────────────────┘
+             │
+             ▼
+┌──────────────────────────┐     ┌──────────────────────────┐
+│  MongoDB (shared)         │     │  Brevo (transactional)    │
+│  users collection         │     │  merchant inbox           │
+└──────────────────────────┘     └──────────────────────────┘
 ```
 
-**When user IS on `bucks_premium_pro_annual_60` or `bucks_premium_pro_annual_65` (post-upgrade):** Show `acceptedPrice` from DB, calculate actual discount from the plan ID suffix (60 or 65), button text → "Current plan".
+### Edge cases & limitations
+
+| Case | Handling |
+|------|----------|
+| No analytics activity in period | Send report with zeros + encouragement copy |
+| Missing email on user | Skip shop, log |
+| User not on Pro plan | Excluded by query filter |
+| User uninstalled (`is_active: false`) | Excluded by query filter |
+| Analytics query fails for one shop | Retry 3×, skip, continue batch, log error |
+| Duplicate cron trigger | `lastMonthlyReportSentAt` idempotency check |
+| Large merchant count | Process in batches; return job summary JSON |
+| Charts in email | HTML bar/table visualizations — not interactive Recharts |
+| Outlook CSS limitations | Table-based layout, inline styles only |
+
+### Migrations from existing
+
+- No changes to existing analytics tracking endpoints (`/track-visit`, `/order`, etc.).
+- No changes to main app analytics proxy or dashboard UI.
+- Main app only needs `SHOPIFY_APP_URL` referenced in email CTA link (env var on analytics backend).
 
 ---
 
-## 5. `replacementBehavior` Rules
+## 4. End-to-End Flow
 
-**Simplified rule:** `APPLY_IMMEDIATELY` for **every transition to any paid plan**, including from free.
+### Merchant flow (admin)
 
-| From Plan | To Plan | `replacementBehavior` |
-|---|---|---|
-| Free (`bucks_free`) | Plus / Pro Monthly / Pro Annual | **`"APPLY_IMMEDIATELY"`** |
-| Legacy $7.99 | Plus / Pro Monthly / Pro Annual | **`"APPLY_IMMEDIATELY"`** |
-| Legacy Annual | Plus / Pro Monthly / Pro Annual | **`"APPLY_IMMEDIATELY"`** |
-| Plus | Pro Monthly / Pro Annual | **`"APPLY_IMMEDIATELY"`** |
-| Pro Monthly | Plus / Pro Annual | **`"APPLY_IMMEDIATELY"`** |
-| Pro Annual | Pro Monthly / Plus | **`"APPLY_IMMEDIATELY"`** |
+1. Merchant is on Pro analytics plan (`bucks_premium_pro`, `bucks_premium_pro_annual_60`, or `bucks_premium_pro_annual_65`).
+2. On the **1st of each month**, merchant receives email: **"Your BUCKS Analytics Report — [Month Year]"**.
+3. Email contains:
+   - Greeting with shop owner name
+   - 4 stat cards (visits, currency clicks, total sales, top currency)
+   - Currency conversion trends (HTML horizontal bars, top 5)
+   - Revenue by currency breakdown (HTML table with % bars)
+   - Top sales by currency and country tables
+   - Smart recommendations (from `suggestions` API)
+   - **"View full analytics"** button → main app `/analytics?shop=...`
+4. Merchant takes no action to opt in for v1 (automatic for eligible Pro users).
 
-**Detection logic:**
-```js
-const replacementBehavior = "APPLY_IMMEDIATELY"; // always — Shopify handles proration
-```
+### Customer flow (storefront)
 
-> Shopify's `APPLY_IMMEDIATELY` works for all transitions including free-to-paid. The merchant is billed immediately for the prorated difference and any previous subscription is replaced.
+No storefront impact. Report is merchant-facing only.
 
----
-
-## 6. Analytics Page Gate
-
-### Access Matrix
-
-| Plan | StatsCards | ChartsSection | PerformanceTables | SmartRecommendations |
-|---|---|---|---|---|
-| `bucks_free` | ✅ Visible | 🔒 Locked | 🔒 Locked | 🔒 Hidden |
-| Legacy `bucks_premium` | ✅ Visible | 🔒 Locked | 🔒 Locked | 🔒 Hidden |
-| Legacy annual plans | ✅ Visible | 🔒 Locked | 🔒 Locked | 🔒 Hidden |
-| `bucks_plus` | ✅ Visible | 🔒 Locked | 🔒 Locked | 🔒 Hidden |
-| `bucks_premium_pro` | ✅ Visible | ✅ Visible | ✅ Visible | ✅ Visible |
-| `bucks_premium_pro_annual_60` | ✅ Visible | ✅ Visible | ✅ Visible | ✅ Visible |
-| `bucks_premium_pro_annual_65` | ✅ Visible | ✅ Visible | ✅ Visible | ✅ Visible |
-
-### Locked Section UI (AnalyticsUpgradeLock component)
+### Technical flow
 
 ```
-┌──────────────────────────────────────────────┐
-│  [blurred/greyed placeholder — height 200px] │
-│                                              │
-│         ┌───────────────────────┐            │
-│         │  Unlock Full Analytics│            │
-│         │  Upgrade to Pro to    │            │
-│         │  access charts,       │            │
-│         │  tables, and AI recs. │            │
-│         │  [  Upgrade to Pro  ] │            │
-│         └───────────────────────┘            │
-└──────────────────────────────────────────────┘
+Day 1 of month, 09:00 UTC
+  → Cloud Scheduler fires POST to analytics backend
+  → Endpoint validates Bearer CRON_SECRET
+  → Query: users where bucks_plan IN PRO_ANALYTICS_PLANS
+           AND is_active = true
+           AND (email OR customer_email) IS NOT empty
+           AND lastMonthlyReportSentAt < start of current month
+  → For each shop (batch of 10):
+       startDate/endDate = previous calendar month (UTC)
+       summary    = getSummary(shop, dates)      // internal
+       trends     = getTrends(shop, dates)       // internal
+       revenue    = getRevenueByCurrency(...)    // internal
+       countries  = getSalesByCountry(...)       // internal
+       suggestions = getSuggestions(shop, ...)   // internal
+       html = renderMonthlyReportHtml(payload)
+       brevo.send({ to: email, html, subject })
+       users.update({ lastMonthlyReportSentAt: now })
+  → Return { sent, failed, skipped, duration }
 ```
 
-- Blur: `filter: blur(2px)` on placeholder background div
-- Overlay: `rgba(255,255,255,0.75)` positioned absolutely, centered card
-- "Upgrade to Pro" button: `router.push('/pricing?shop={shop}')`
-- SmartRecommendations: hidden entirely (`{hasFullAnalytics && <SmartRecommendations />}`) — no lock overlay
-
----
-
-## 7. PricingCard Component Changes
-
-### New props added
-
-| Prop | Type | Purpose |
-|---|---|---|
-| `couponEnabled` | `boolean` | Renders coupon input on this card (Pro Monthly only) |
-
-### Updated conditionals
-
-```js
-// OLD — only legacy IDs
-const isAnnualPlan = id === "pro-annual";
-
-// NEW — includes new Pro Annual
-const isAnnualPlan = id === "legacy-annual" || id === "pro-annual";
-```
-
-```js
-// OLD — trial text only for legacy monthly
-if (id === "legacy-monthly") { /* trial text logic */ }
-
-// NEW — trial text also for new pro-monthly
-if (id === "legacy-monthly" || id === "pro-monthly") { /* trial text logic */ }
-```
-
-### Coupon input — local state
-
-```js
-const [couponInput, setCouponInput] = React.useState("");
-const [appliedCoupon, setAppliedCoupon] = React.useState(null);
-const [couponDisplayPrice, setCouponDisplayPrice] = React.useState(null); // 9.99 when applied
-const [couponError, setCouponError] = React.useState("");
-const [couponCopied, setCouponCopied] = React.useState(false); // copy button feedback
-```
-
-### Card price display when coupon applied
-
-When `couponDisplayPrice` is non-null, the card's main price heading switches:
+### Authentication flow (Cloud Scheduler → API)
 
 ```
-Before apply:   $19.99 / month
-After apply:    ~~$19.99~~  $9.99 / month
+Cloud Scheduler job:
+  Method:  POST
+  URL:     https://analytics.bucks.helixo.co/api/analytics/cron/monthly-report
+  Header:  Authorization: Bearer <CRON_SECRET>
+  Body:    {} (optional: { "dryRun": true, "shop": "test.myshopify.com" })
+
+Analytics endpoint:
+  if Authorization !== Bearer CRON_SECRET → 401
+  if method !== POST → 405
+  else → run job
 ```
 
-- `couponDisplayPrice = 9.99` drives this — set on Apply, cleared on Remove
-- The strikethrough `$19.99` and new `$9.99` replace the normal price display
-- No separate prop needed — `couponDisplayPrice` is local state on `PricingCard`
+`CRON_SECRET` stored in:
+- GCP Secret Manager (Scheduler job header)
+- Analytics backend environment variable
 
-### Copy button behaviour
+### Email content structure (HTML)
 
-```js
-const handleCopyCoupon = () => {
-  navigator.clipboard.writeText(COUPON_CODE);
-  setCouponCopied(true);
-  setTimeout(() => setCouponCopied(false), 2000);
-};
 ```
-
-Button label: `couponCopied ? "✓ Copied" : "Copy"`
-
-### Upgrade button onClick
-
-```js
-// OLD
-onClick={() => id === "free" ? downgradeHandler() : upgradePlanHandler(plan)}
-
-// NEW — includes coupon in payload when applied
-onClick={() => id === "free"
-  ? downgradeHandler()
-  : upgradePlanHandler({ ...plan, couponCode: appliedCoupon || undefined })}
+┌─────────────────────────────────────────┐
+│  BUCKS logo + "Your May 2026 Report"    │
+├─────────────────────────────────────────┤
+│  Hi {shop_owner},                       │
+│  Here's how {shop} performed last month │
+├─────────────────────────────────────────┤
+│  [Visits] [Clicks] [Sales] [Top CCY]   │  ← 2×2 table cards
+├─────────────────────────────────────────┤
+│  Currency Conversion Trends             │  ← HTML horizontal bars
+├─────────────────────────────────────────┤
+│  Revenue by Currency                    │  ← HTML % breakdown table
+├─────────────────────────────────────────┤
+│  Sales by Currency | Sales by Country   │  ← HTML tables (top 5)
+├─────────────────────────────────────────┤
+│  Recommendations (1–3 items)            │  ← title + description
+├─────────────────────────────────────────┤
+│  [ View full analytics → ]              │  ← CTA to main app
+└─────────────────────────────────────────┘
 ```
 
 ---
 
-## 8. Plan ID Safety: LEGACY_PLAN_IDS vs JUNE_2026 plan ID arrays
+## 5. Implementation Details
 
-**Critical architectural decision:** New plan IDs must NOT be added to `LEGACY_PLAN_IDS`.
+### Data model changes
 
-**Why:** `isCurrentPlanCard` has a second condition:
-```js
-const planMatches = currentPlan === plan_text ||
-    (plan_text === "bucks_premium" && LEGACY_PLAN_IDS.includes(currentPlan));
+**MongoDB `users` collection** (shared, via Prisma on main app — analytics backend reads/writes same field):
+
+```prisma
+// prisma/schema.prisma — add to users model
+lastMonthlyReportSentAt  DateTime?
+monthlyReportOptOut      Boolean?  @default(false)  // optional v2
 ```
-If `"bucks_premium_pro"` were in `LEGACY_PLAN_IDS`, a Pro user's DB plan would trigger the fallback and the **legacy $7.99 card** would incorrectly show as "Current plan."
 
-**Solution:**
-```js
-// trialHelpers.js
-export const LEGACY_PLAN_IDS = [                // Legacy only — do NOT add new IDs
-  "bucks_premium",
-  "bucks_premium_60",
-  "bucks_premium_65",
-  "bucks_premium_70",
-];
+Analytics backend uses native MongoDB driver or existing DB client to read/write this field.
 
-export const JUNE_2026_MONTHLY_PLAN_IDS = [     // New monthly plans (June 2026)
-  "bucks_plus",
+### Backend changes (Analytics Express)
+
+#### New files
+
+| File | Responsibility |
+|------|----------------|
+| `services/monthlyReportService.js` | Orchestrate per-shop report: fetch → render → send |
+| `services/monthlyReportData.js` | Call internal controllers/services for all endpoints |
+| `email/renderMonthlyReportHtml.js` | Compose full HTML email |
+| `email/partials/statsCardsHtml.js` | 4 stat cards (table layout) |
+| `email/partials/conversionTrendsHtml.js` | HTML horizontal bar chart |
+| `email/partials/revenueByCurrencyHtml.js` | % breakdown table |
+| `email/partials/performanceTablesHtml.js` | Top 5 currency + country tables |
+| `email/partials/recommendationsHtml.js` | Suggestions section |
+| `services/mailService.js` | Brevo send wrapper |
+| `middleware/cronAuth.js` | Verify `CRON_SECRET` |
+| `controllers/monthlyReportController.js` | HTTP handler for cron endpoint |
+
+#### New route
+
+Add to `analyticsRoutes`:
+
+```ts
+import { cronAuth } from "../middleware/cronAuth";
+import { runMonthlyReport } from "../controllers/monthlyReportController";
+
+router.post("/cron/monthly-report", cronAuth, runMonthlyReport);
+```
+
+Full path: `POST /api/analytics/cron/monthly-report`
+
+#### Internal data fetch (do NOT self-HTTP)
+
+```ts
+// monthlyReportData.ts — call controller logic directly
+import { getSummaryData } from "../controllers/analyticsFetchController";
+// OR extract shared service layer from existing controllers
+
+export async function fetchMonthlyReportPayload(shop: string) {
+  const { startDate, endDate, periodLabel } = getLastMonthRange();
+
+  const [summary, trends, revenue, countries, suggestions] = await Promise.all([
+    analyticsService.getSummary(shop, startDate, endDate),
+    analyticsService.getTrends(shop, startDate, endDate),
+    analyticsService.getRevenueByCurrency(shop, startDate, endDate),
+    analyticsService.getSalesByCountry(shop, startDate, endDate),
+    suggestionsService.getSuggestions(shop, "last_month"),
+  ]);
+
+  return { shop, periodLabel, startDate, endDate, summary, trends, revenue, countries, suggestions };
+}
+```
+
+Refactor existing `analyticsFetchController` functions into a shared `analyticsService` if they are currently tied to `req/res` — this is the main structural change on the analytics backend.
+
+#### Eligibility query
+
+```ts
+const PRO_ANALYTICS_PLANS = [
   "bucks_premium_pro",
+  "bucks_premium_pro_annual_60",
+  "bucks_premium_pro_annual_65",
 ];
 
-export const JUNE_2026_ANNUAL_PLAN_IDS = [      // New annual plans (June 2026)
-  "bucks_premium_pro_annual_60",               // default — 60% off
-  "bucks_premium_pro_annual_65",               // partner — 65% off
-];
-
-export const JUNE_2026_PLAN_IDS = [...JUNE_2026_MONTHLY_PLAN_IDS, ...JUNE_2026_ANNUAL_PLAN_IDS];
-
-export const isPremiumPlan = (currentPlan) =>
-  LEGACY_PLAN_IDS.includes(currentPlan) || JUNE_2026_PLAN_IDS.includes(currentPlan);
+const users = await db.users.find({
+  bucks_plan: { $in: PRO_ANALYTICS_PLANS },
+  is_active: true,
+  $or: [{ email: { $ne: "" } }, { customer_email: { $ne: "" } }],
+  monthlyReportOptOut: { $ne: true },
+  $or: [
+    { lastMonthlyReportSentAt: null },
+    { lastMonthlyReportSentAt: { $lt: startOfCurrentMonth } },
+  ],
+});
 ```
 
-New plan cards use **exact match** (`currentPlan === plan_text`) since their `plan_name` in planDetails is unique.
+#### Cron controller
 
----
+```ts
+export async function runMonthlyReport(req: Request, res: Response) {
+  const { dryRun, shop: singleShop } = req.body ?? {};
 
-## 9. Trial Days Logic (Unchanged)
+  const users = singleShop
+    ? await getUserByShop(singleShop)
+    : await getEligibleProUsers();
 
-| User State | Trial Days |
-|---|---|
-| Never subscribed (no `subscription_id`) | `partnerData.trialDays` or `DEFAULT_TRIAL_DAYS` (7) |
-| On premium with active `trialEndDate` | Remaining days from `trialEndDate` |
-| On free with preserved `trialLeft` | `trialLeft` value |
-| Previously used trial, now free | 0 |
+  const results = { sent: 0, failed: 0, skipped: 0, errors: [] };
 
-Applies identically to Standard, Pro Monthly, and Pro Annual.
+  for (const user of users) {
+    try {
+      const payload = await fetchMonthlyReportPayload(user.myshopify_domain);
+      const html = renderMonthlyReportHtml(payload, user);
 
-> **Partner 30-day trial:** When a user comes through a partner referral (`partnerData` present), `partnerData.trialDays` overrides the default. If the partner config specifies 30 days, the Pro Annual card will show "Start your 30-day free trial" exactly as legacy annual plans do today. No new logic needed.
+      if (dryRun) {
+        results.skipped++;
+        continue; // or save HTML to /tmp for preview
+      }
 
----
+      await mailService.sendMonthlyReport(user, html, payload.periodLabel);
+      await markReportSent(user.myshopify_domain);
+      results.sent++;
+    } catch (err) {
+      results.failed++;
+      results.errors.push({ shop: user.myshopify_domain, error: err.message });
+    }
+  }
 
-## 10. Backend API Payload Shapes
-
-**Plus Plan Monthly (no coupon):**
-```json
-{
-  "name": "Plus Plan",
-  "plan_name": "bucks_plus",
-  "plan_type": "monthly",
-  "price": { "amount": 9.99, "currencyCode": "USD" },
-  "interval": "EVERY_30_DAYS",
-  "trialDays": 7
+  return res.status(200).json(results);
 }
 ```
 
-**Pro Monthly with coupon:**
-```json
-{
-  "name": "Pro",
-  "plan_name": "bucks_premium_pro",
-  "plan_type": "monthly",
-  "price": { "amount": 19.99, "currencyCode": "USD" },
-  "interval": "EVERY_30_DAYS",
-  "trialDays": 7,
-  "couponCode": "BUCKS50"
-}
-```
-→ Backend reads `process.env.PRO_COUPON_CODE`, validates `couponCode === validCoupon`, overrides `price.amount = 9.99`.
+#### Environment variables (analytics backend)
 
-**Pro Annual (non-partner):**
-```json
-{
-  "name": "Pro Annual",
-  "plan_name": "bucks_premium_pro_annual",
-  "plan_type": "annual",
-  "price": { "amount": 95.90, "currencyCode": "USD" },
-  "interval": "ANNUAL",
-  "trialDays": 7
-}
+```env
+CRON_SECRET=                          # shared with Cloud Scheduler
+BREVO_API_KEY=                        # transactional email
+SHOPIFY_APP_URL=                      # CTA link base
+MONTHLY_REPORT_FROM_EMAIL=reports@bucks.com
+MONTHLY_REPORT_FROM_NAME=BUCKS
 ```
 
-**Pro Annual (partner) — what the frontend sends:**
-```json
-{
-  "name": "Pro Annual",
-  "plan_name": "bucks_premium_pro_annual",
-  "plan_type": "annual",
-  "price": { "amount": 95.90, "currencyCode": "USD" },
-  "interval": "ANNUAL",
-  "trialDays": 7
-}
-```
-→ Frontend **always sends `bucks_premium_pro_annual`** regardless of partner status. The backend detects `partnerData`, overrides `price.amount` to $83.93, and overrides `bucks_plan` to `bucks_premium_pro_annual_partner` before calling Shopify. The return URL will then carry `bucks_plan=bucks_premium_pro_annual_partner`.
+### Frontend changes (main app)
+
+**None required for v1.**
+
+Optional later:
+- Settings toggle for `monthlyReportOptOut` on main app settings page
+- Analytics page banner: "Your monthly report was sent on [date]"
+
+### HTML email design spec
+
+| Element | Value |
+|---------|-------|
+| Max width | 600px |
+| Font | Inter, Arial, sans-serif |
+| Card border-radius | 12px |
+| Title text | 12px, `#303030A6` |
+| Value text | 14px bold, `#303030` |
+| CTA button | `#008060` background, white text |
+| Bar chart colors | Match `getColorForCurrency()` palette |
+| Section order | Stats → Trends → Revenue → Tables → Recommendations → CTA |
+
+### Edge cases & special handling
+
+| Scenario | Behavior |
+|----------|----------|
+| `dryRun: true` in request body | Render report, do not send email, do not update `lastMonthlyReportSentAt` |
+| `shop` in request body | Process single shop only (for testing) |
+| Zero data | Show empty-state copy matching in-app analytics |
+| Suggestions empty | Hide recommendations section |
+| Brevo failure | Log error, do not update `lastMonthlyReportSentAt`, count as failed |
+| Scheduler timeout | Design endpoint to complete within Scheduler HTTP timeout, or process in chunks with `?offset=0&limit=50` and chain Scheduler jobs |
+| Secret rotation | Update both GCP Secret Manager and analytics env; old secret invalid immediately |
+
+### Security
+
+- `POST` only on cron endpoint
+- `CRON_SECRET` verified on every request (constant-time compare)
+- No shop data exposed in cron response (only counts + shop domains in error log server-side)
+- Email contains only that merchant's own data
+- Preview/dry-run endpoint disabled in production unless `CRON_SECRET` provided
+
+### Monitoring
+
+- Log job summary: `{ sent, failed, skipped, durationMs }`
+- Alert if `failed > 0` or `sent === 0` when eligible users exist
+- Optional: Slack webhook on job completion (same pattern as main app install logs)
 
 ---
 
-## 11. PostHog Events
+## 6. Open Questions
 
-| Event Name | When | Key Props |
-|---|---|---|
-| `"bucks standard plan initiated"` | Standard card upgrade clicked | `myshopify_domain`, `bucks_plan: "bucks_premium_standard"`, `plan_type: "monthly"` |
-| `"bucks pro plan initiated"` | Pro Monthly or Pro Annual upgrade clicked | `myshopify_domain`, `bucks_plan`, `plan_type` |
-| `"bucks coupon applied"` | BUCKS50 applied on card | `myshopify_domain`, `coupon_code: "BUCKS50"`, `original_price: 19.99`, `final_price: 9.99` |
-| `"bucks pro plan selected"` | Shopify billing callback confirms subscription | `myshopify_domain`, `bucks_plan`, `plan_type` |
-
----
-
-## 12. `checkSubscriptionStatus.js` and `cancelSubscription.js` — `isLegacyUser` Flag Persistence
-
-### Return URL (unchanged)
-
-The return URL from `createAppSubscription` already includes:
-```
-...&bucks_plan=bucks_premium_pro&plan_type=monthly
-...&bucks_plan=bucks_premium_pro_annual_60&plan_type=annual
-...&bucks_plan=bucks_premium_pro_annual_65&plan_type=annual   ← partner
-...&bucks_plan=bucks_plus&plan_type=monthly
-```
-
-### `isLegacyUser` write (new)
-
-`checkSubscriptionStatus.js` reads `bucks_plan` and `plan_type` from query params and writes to DB. It also **stamps `isLegacyUser: true`** when the user's plan immediately before the upgrade was a legacy plan ID (`bucks_premium`, `bucks_premium_60`, `bucks_premium_65`, `bucks_premium_70`). The existing user row is fetched before the update, so the pre-upgrade plan is available for this check.
-
-`cancelSubscription.js` applies the same check when downgrading to free: if the user's current plan before cancellation is a legacy plan ID, `isLegacyUser: true` is written alongside `bucks_plan: "bucks_free"`.
-
-**The flag is sticky** — it is only ever written as `true`, never reset to `false`. Once a user is marked legacy, they remain legacy regardless of subsequent plan changes.
-
-The partner override flows automatically because `finalDetails.bucks_plan` is set to the partner ID server-side before `createAppSubscription` is called.
+1. **Opt-out in v1?** Send automatically to all Pro users, or add Settings toggle before launch?
+2. **Send time/timezone?** 09:00 UTC on the 1st — or adjust per merchant timezone later?
+3. **Brevo template vs raw HTML?** Code-generated HTML (faster v1) vs designed Brevo template (easier marketing edits)?
+4. **Empty month behavior?** Still send "quiet month" email, or skip merchants with zero visits?
+5. **Scheduler timeout at scale?** How many Pro merchants today? Do we need chunked Scheduler jobs?
+6. **Success metrics?** Track email open rate (Brevo), CTA clicks (UTM params), analytics page visits post-send?
 
 ---
 
-## 13. Stale Document Notice
+## Implementation Plan
 
-`docs/new-pricing-plans.md` contains the following confirmed errors and should be treated as **deprecated**. This spec supersedes it:
+| Phase | Goal | Scope |
+|-------|------|-------|
+| **Phase 1** | Data layer + internal service refactor | Extract `analyticsService` from controllers; `fetchMonthlyReportPayload`; `getLastMonthRange` |
+| **Phase 2** | HTML email renderer | All partials + `renderMonthlyReportHtml`; preview via `dryRun` endpoint |
+| **Phase 3** | Send + cron | `mailService` (Brevo), `cronAuth`, `POST /cron/monthly-report`, `lastMonthlyReportSentAt` |
+| **Phase 4** | Cloud Scheduler + staging test | Configure Scheduler job; test with 1 shop; test in Gmail + Outlook |
+| **Phase 5** | Production rollout | Enable for all Pro merchants; monitor first run |
+| **Phase 6 (optional)** | Merchant opt-out + metrics | Settings toggle, UTM tracking, Brevo template migration |
 
-| Field | Stale Value | Correct Value |
-|---|---|---|
-| Pro Monthly price | $14.99 | **$19.99** |
-| Pro Annual price | $95.88 | **$95.90** |
-| Pro Annual compare price | $119.88 | **$239.88** |
-| Coupon code | BUCKS33 | **BUCKS50** |
-| Coupon source | hardcoded | **`process.env.PRO_COUPON_CODE`** |
-| replacementBehavior value | `"STANDARD"` | **`"APPLY_IMMEDIATELY"`** |
-| Layout: free/new users | 4-card flat grid | **3 premium top + free below** |
-| Layout: legacy users | 5-card flat grid | **3-card top row + free below** |
-| `PREMIUM_PLAN_IDS` | add new IDs | **keep legacy-only; use NEW_PLAN_IDS** |
-| Analytics lock UX | "TBD" | **blur overlay + upgrade CTA card** |
-| planDetails "pro" ID | conflicts with legacy | **use "pro-monthly"** |
+Each phase ships independently. Phase 1–3 can be tested locally without Scheduler.
+
+### Testing checklist
+
+- [ ] `dryRun` + single `shop` returns expected HTML payload
+- [ ] Stats numbers match dashboard for same shop + `last_month`
+- [ ] Email renders correctly in Gmail (web + mobile)
+- [ ] Email renders correctly in Outlook
+- [ ] `CRON_SECRET` rejection returns 401
+- [ ] Second cron run same month skips already-sent shops
+- [ ] Merchant with no data receives valid empty-state email
+- [ ] CTA link opens correct shop in main app analytics
 
 ---
 
-*Spec complete. Awaiting user review before implementation proceeds.*
+## Optional Future Enhancement: Screenshot Fallback
+
+If HTML bar charts are not visually acceptable after QA, a secondary approach can capture chart sections from a dedicated read-only report page using Puppeteer/Playwright and embed as `<img>` in the email. This is **not part of v1** and should only be considered if HTML chart visualizations fail design review in Gmail/Outlook. The primary and recommended path remains HTML-only rendering.
+
+---
+
+## References
+
+- Analytics routes: `POST/GET /api/analytics/*` (Express backend)
+- Main app analytics proxy: `pages/api/v1/analytics/proxy.js` (unchanged)
+- Pro plan filter: `bucks_premium_pro`, `bucks_premium_pro_annual_60`, `bucks_premium_pro_annual_65`
+- Date range: `last_month` (previous calendar month, UTC)
+- Brevo pattern: `utils/mailEngine.js` (main app — reference for analytics `mailService`)
+- Cloud Scheduler auth: `Authorization: Bearer CRON_SECRET`
