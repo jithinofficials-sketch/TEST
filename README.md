@@ -37,16 +37,24 @@ Pro merchants with full analytics access must **manually log into BUCKS** to rev
   - Drives re-engagement with the analytics dashboard (email CTA → in-app analytics).
   - Surfaces `suggestions` proactively without merchants opening the app.
   - Reduces "I didn't know my store was performing well in EUR" support conversations.
+  - **(Future)** One-time non-Pro preview report creates an upgrade funnel to Pro analytics.
 - **Cost of inaction:**
   - Pro analytics remains a passive feature merchants must remember to use.
   - Lower differentiation vs competitors offering automated reporting.
   - Missed opportunity for retention and upgrade justification.
+- **Non-Pro merchants (future):**
+  - Free and non-Pro paid merchants have limited analytics (summary only) and never receive any automated performance summary.
+  - No touchpoint to demonstrate the value of upgrading to Pro analytics.
 
 ---
 
 ## 3. Proposed Solution
 
 Build a **monthly automated email report** generated and sent entirely from the **analytics Express backend**. The main Next.js app is not involved in report generation or delivery.
+
+**Scope:**
+- **v1:** Monthly recurring report for **Pro analytics merchants only**.
+- **Future (Phase 7):** One-time preview report for **non-Pro merchants** — sent once per shop to showcase analytics value and drive Pro upgrades. Reuses the same HTML pipeline with a reduced content tier.
 
 ### Approach summary
 
@@ -87,7 +95,8 @@ Build a **monthly automated email report** generated and sent entirely from the 
 - `monthlyReportService` — orchestrates fetch → render → send per shop
 - `renderMonthlyReportHtml` — email HTML template builders
 - `mailService` — Brevo send wrapper on analytics backend
-- `lastMonthlyReportSentAt` field on `users` (idempotency)
+- `lastMonthlyReportSentAt` field on `users` (idempotency for Pro monthly sends)
+- `oneTimeAnalyticsReportSentAt` field on `users` (idempotency for non-Pro one-time sends — **future**)
 
 ### Architecture diagram
 
@@ -236,8 +245,9 @@ Analytics endpoint:
 
 ```prisma
 // prisma/schema.prisma — add to users model
-lastMonthlyReportSentAt  DateTime?
-monthlyReportOptOut      Boolean?  @default(false)  // optional v2
+lastMonthlyReportSentAt       DateTime?   // Pro monthly report idempotency
+oneTimeAnalyticsReportSentAt  DateTime?   // Non-Pro one-time report idempotency (future)
+monthlyReportOptOut           Boolean?  @default(false)  // optional v2
 ```
 
 Analytics backend uses native MongoDB driver or existing DB client to read/write this field.
@@ -420,6 +430,7 @@ Optional later:
 4. **Empty month behavior?** Still send "quiet month" email, or skip merchants with zero visits?
 5. **Scheduler timeout at scale?** How many Pro merchants today? Do we need chunked Scheduler jobs?
 6. **Success metrics?** Track email open rate (Brevo), CTA clicks (UTM params), analytics page visits post-send?
+7. **Non-Pro one-time trigger (future)?** Send after N days on free plan, after first analytics activity threshold, or as a one-time campaign? *(See Phase 7)*
 
 ---
 
@@ -433,8 +444,110 @@ Optional later:
 | **Phase 4** | Cloud Scheduler + staging test | Configure Scheduler job; test with 1 shop; test in Gmail + Outlook |
 | **Phase 5** | Production rollout | Enable for all Pro merchants; monitor first run |
 | **Phase 6 (optional)** | Merchant opt-out + metrics | Settings toggle, UTM tracking, Brevo template migration |
+| **Phase 7 (future)** | One-time report for non-Pro merchants | Reduced-content preview email, upgrade CTA, send-once idempotency |
 
 Each phase ships independently. Phase 1–3 can be tested locally without Scheduler.
+
+---
+
+## Future Enhancement: One-Time Report for Non-Pro Merchants (Phase 7)
+
+After the Pro monthly report is stable, extend the same analytics backend pipeline to send a **single preview report** to non-Pro merchants. This is an upgrade funnel touchpoint — not a recurring monthly email.
+
+### Goal
+
+Give free and non-Pro paid merchants a **one-time taste** of analytics value, using data they already have access to (summary tier), and encourage upgrade to Pro for full charts, tables, and monthly reports.
+
+### How it differs from Pro monthly report
+
+| Aspect | Pro monthly report (v1) | Non-Pro one-time report (future) |
+|--------|-------------------------|----------------------------------|
+| **Frequency** | Every month (1st) | **Once per shop, ever** |
+| **Eligibility** | `bucks_premium_pro*` | Active merchants **not** on Pro analytics plans |
+| **Data fetched** | summary + trends + revenue + country + suggestions | **summary only** (matches in-app limited analytics) |
+| **Email content** | Full report (cards, charts, tables, recommendations) | Stats cards + short insight copy + **upgrade CTA** |
+| **Idempotency field** | `lastMonthlyReportSentAt` | `oneTimeAnalyticsReportSentAt` |
+| **Trigger** | Cloud Scheduler monthly cron | TBD — event-based or one-time campaign job |
+| **CTA** | "View full analytics" | "Upgrade to Pro analytics" → `/pricing?shop=...` |
+
+### Proposed non-Pro email content
+
+```
+┌─────────────────────────────────────────┐
+│  BUCKS logo + "Your Store Snapshot"     │
+├─────────────────────────────────────────┤
+│  Hi {shop_owner},                       │
+│  Here's a snapshot of how {shop} is     │
+│  performing with BUCKS                  │
+├─────────────────────────────────────────┤
+│  [Visits] [Clicks] [Sales] [Top CCY]   │  ← summary stats only
+├─────────────────────────────────────────┤
+│  "Unlock full analytics — see trends,   │
+│   revenue by currency, country          │
+│   breakdown, and smart recommendations" │
+├─────────────────────────────────────────┤
+│  [ Upgrade to Pro analytics → ]         │  ← pricing page
+└─────────────────────────────────────────┘
+```
+
+No trends charts, performance tables, or suggestions in the non-Pro email — those are Pro-only features in the app today.
+
+### Eligibility query (future)
+
+```ts
+const PRO_ANALYTICS_PLANS = [
+  "bucks_premium_pro",
+  "bucks_premium_pro_annual_60",
+  "bucks_premium_pro_annual_65",
+];
+
+const users = await db.users.find({
+  bucks_plan: { $nin: PRO_ANALYTICS_PLANS },
+  is_active: true,
+  oneTimeAnalyticsReportSentAt: null,  // never sent before
+  $or: [{ email: { $ne: "" } }, { customer_email: { $ne: "" } }],
+  // optional: minimum activity threshold
+  // e.g. totalVisits > 0 in last 30 days
+});
+```
+
+### Trigger options (to decide in Phase 7)
+
+| Option | Description |
+|--------|-------------|
+| **A — Time-based** | Send once 30 days after install if still non-Pro |
+| **B — Activity-based** | Send once when shop hits N visits or N currency clicks |
+| **C — One-time campaign** | Manual Cloud Scheduler job / admin trigger for existing non-Pro base |
+| **D — On analytics page first visit** | Queue send 24h after merchant first opens `/analytics` |
+
+Recommendation: start with **Option C** (controlled rollout) before automating A or B.
+
+### Backend changes (future, reuses v1 infrastructure)
+
+| Component | Change |
+|-----------|--------|
+| `monthlyReportService` | Generalize to `reportService` with `reportType: 'monthly_pro' \| 'one_time_preview'` |
+| `fetchMonthlyReportPayload` | Add `fetchPreviewReportPayload` — summary only |
+| `renderMonthlyReportHtml` | Add `renderPreviewReportHtml` — reduced template + upgrade CTA |
+| `POST /cron/monthly-report` | Unchanged (Pro only) |
+| `POST /cron/one-time-preview-report` | **New** secured endpoint for non-Pro one-time sends |
+| `users.oneTimeAnalyticsReportSentAt` | Set on successful send; never send again |
+
+### Edge cases (non-Pro one-time)
+
+| Case | Handling |
+|------|----------|
+| Merchant upgrades to Pro before send | Skip one-time preview; they receive Pro monthly report instead |
+| Merchant already received preview | `oneTimeAnalyticsReportSentAt` set — never resend |
+| Zero activity | Skip or send with empty-state + upgrade message (TBD) |
+| Merchant uninstalls | `is_active: false` — exclude |
+
+### Success metrics (future)
+
+- One-time email open rate
+- Upgrade CTA click-through to pricing
+- Pro plan conversion rate within 30 days of preview send
+- Compare: merchants who received preview vs control group
 
 ### Testing checklist
 
@@ -460,6 +573,7 @@ If HTML bar charts are not visually acceptable after QA, a secondary approach ca
 - Analytics routes: `POST/GET /api/analytics/*` (Express backend)
 - Main app analytics proxy: `pages/api/v1/analytics/proxy.js` (unchanged)
 - Pro plan filter: `bucks_premium_pro`, `bucks_premium_pro_annual_60`, `bucks_premium_pro_annual_65`
-- Date range: `last_month` (previous calendar month, UTC)
+- Non-Pro preview (future): all active merchants not in Pro analytics plans; `oneTimeAnalyticsReportSentAt` for send-once
+- Date range: `last_month` (previous calendar month, UTC) for Pro monthly; `last_30_days` TBD for non-Pro preview
 - Brevo pattern: `utils/mailEngine.js` (main app — reference for analytics `mailService`)
 - Cloud Scheduler auth: `Authorization: Bearer CRON_SECRET`
