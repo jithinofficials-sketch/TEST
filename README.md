@@ -1,579 +1,345 @@
-# RFC: Monthly Analytics Report for Pro Merchants
+# Monthly Analytics Report — Design Spec
 
-**Metadata:**
-
-- **Author:** BUCKS Engineering
-- **Status:** Draft
-- **Reviewers:** CPO, Product Owner, Analytics Team
-- **Type:** #feature-rfc
+**Date:** 2026-06-23  
+**Author:** BUCKS Engineering  
+**Status:** Approved  
+**RFC:** `docs/monthly-analytics-report-rfc.md`  
+**Implementation Plan:** `docs/superpowers/plans/2026-06-23-monthly-analytics-report.md`
 
 ---
 
 ## 1. Problem
 
-Pro merchants with full analytics access must **manually log into BUCKS** to review store performance. There is no automated way to deliver a periodic summary of currency conversion activity, sales by market, or actionable recommendations.
+Pro merchants must manually log into BUCKS to review performance. There is no automated periodic summary of currency conversion activity, sales by market, or actionable recommendations. This means:
 
-- **Merchant pain points:**
-  - Performance insights are only available inside the app; merchants forget to check.
-  - No monthly touchpoint reinforcing the value of the Pro analytics plan.
-  - Merchants who are busy running their store miss trends (top currencies, country performance, low-conversion markets).
-- **Current workarounds:**
-  - Merchants open `/analytics` and change the date filter to "Last month" themselves.
-  - Support cannot proactively share performance summaries.
-- **Competitor context:**
-  - Many SaaS analytics products (Klaviyo, Google Analytics email summaries, Shopify reports) send periodic email digests. Merchants expect a monthly "here's how you did" email for paid analytics tiers.
+- Merchants forget to check analytics between sessions.
+- No monthly value-reinforcement touchpoint for the Pro plan.
+- Missed trends (top currencies, country performance) go unnoticed.
 
 ---
 
-## 2. Why This Matters?
+## 2. Solution
 
-- **Why now:**
-  - Full analytics dashboard is live for Pro plan merchants (`bucks_premium_pro*`).
-  - Analytics backend (Express) already aggregates all required data via existing endpoints.
-  - Shared MongoDB gives the analytics backend access to merchant email and plan eligibility.
-  - Team already uses **Google Cloud Scheduler** for scheduled jobs — no new scheduling infra required.
-- **Benefits:**
-  - Increases perceived value of Pro analytics subscription.
-  - Drives re-engagement with the analytics dashboard (email CTA → in-app analytics).
-  - Surfaces `suggestions` proactively without merchants opening the app.
-  - Reduces "I didn't know my store was performing well in EUR" support conversations.
-  - **(Future)** One-time non-Pro preview report creates an upgrade funnel to Pro analytics.
-- **Cost of inaction:**
-  - Pro analytics remains a passive feature merchants must remember to use.
-  - Lower differentiation vs competitors offering automated reporting.
-  - Missed opportunity for retention and upgrade justification.
-- **Non-Pro merchants (future):**
-  - Free and non-Pro paid merchants have limited analytics (summary only) and never receive any automated performance summary.
-  - No touchpoint to demonstrate the value of upgrading to Pro analytics.
+A **monthly automated email report** generated and delivered entirely from the analytics Express backend. Cloud Scheduler fires a secured HTTP POST on the 1st of each month at 09:00 UTC. The backend fetches analytics data for each eligible Pro merchant, renders an email-safe HTML report, and sends it via Brevo.
+
+**Scope — v1:** Pro plan merchants only (recurring monthly).  
+**Scope — Phase 7 (future):** One-time preview report for non-Pro merchants.
 
 ---
 
-## 3. Proposed Solution
+## 3. Architecture
 
-Build a **monthly automated email report** generated and sent entirely from the **analytics Express backend**. The main Next.js app is not involved in report generation or delivery.
-
-**Scope:**
-- **v1:** Monthly recurring report for **Pro analytics merchants only**.
-- **Future (Phase 7):** One-time preview report for **non-Pro merchants** — sent once per shop to showcase analytics value and drive Pro upgrades. Reuses the same HTML pipeline with a reduced content tier.
-
-### Approach summary
-
-| Concern | Owner |
-|---------|--------|
-| Cron trigger | Google Cloud Scheduler → HTTP POST to analytics backend |
-| Eligibility (Pro plan, email, active) | Analytics backend (query shared MongoDB `users`) |
-| Analytics data | Analytics backend (internal service calls — not self-HTTP) |
-| HTML email rendering | Analytics backend (email-safe HTML) |
-| Email delivery | Analytics backend (Brevo) |
-| Deep link to full dashboard | Main app URL in CTA button only |
-
-### Why analytics backend (not main app)?
-
-- Analytics data already lives here; internal calls avoid HTTP round-trips per shop.
-- `suggestions` controller already exists on the same server.
-- Shared MongoDB provides `email`, `bucks_plan`, `shop_owner`, `currency` without cross-service calls.
-- Monthly batch job is naturally co-located with data aggregation.
-
-### Why HTML-only email (primary)?
-
-- Email clients do not support React, Polaris, or Recharts.
-- Hand-built email HTML can closely match the analytics dashboard design for stats cards, tables, and bar-style chart visualizations.
-- Reliable across Gmail, Outlook, and mobile clients.
-- No Puppeteer/headless browser dependency in production.
-
-### What existing systems are reused?
-
-- Analytics Express routes/controllers: `getSummary`, `getTrends`, `getRevenueByCurrency`, `getSalesByCountry`, `getSuggestions`
-- Shared MongoDB `users` collection (plan, email, shop domain)
-- `calculateDateRange("last_month")` logic (ported or duplicated in analytics backend)
-- Brevo API pattern (same as main app `mailEngine.js`)
-- Google Cloud Scheduler (existing team pattern)
-
-### What new systems are introduced?
-
-- `POST /api/analytics/cron/monthly-report` — secured cron endpoint on analytics backend
-- `monthlyReportService` — orchestrates fetch → render → send per shop
-- `renderMonthlyReportHtml` — email HTML template builders
-- `mailService` — Brevo send wrapper on analytics backend
-- `lastMonthlyReportSentAt` field on `users` (idempotency for Pro monthly sends)
-- `oneTimeAnalyticsReportSentAt` field on `users` (idempotency for non-Pro one-time sends — **future**)
-
-### Architecture diagram
+### 3.1 System Components
 
 ```
-┌──────────────────────────┐
-│  Google Cloud Scheduler   │
-│  Schedule: 0 9 1 * *      │
-└────────────┬─────────────┘
-             │ POST /api/analytics/cron/monthly-report
-             │ Authorization: Bearer CRON_SECRET
-             ▼
-┌──────────────────────────────────────────────────────────┐
-│  Analytics Express Backend                                │
-│                                                           │
-│  1. Verify CRON_SECRET                                    │
-│  2. Query MongoDB users (Pro plan + active + email)       │
-│  3. For each shop (batched):                              │
-│     a. Internal: getSummary, getTrends, getRevenue...     │
-│     b. Internal: getSuggestions                           │
-│     c. renderMonthlyReportHtml()                          │
-│     d. send via Brevo                                     │
-│     e. Update lastMonthlyReportSentAt                     │
-└──────────────────────────────────────────────────────────┘
-             │
-             ▼
-┌──────────────────────────┐     ┌──────────────────────────┐
-│  MongoDB (shared)         │     │  Brevo (transactional)    │
-│  users collection         │     │  merchant inbox           │
-└──────────────────────────┘     └──────────────────────────┘
+Google Cloud Scheduler (0 9 1 * *)
+    │  POST /api/analytics/cron/monthly-report
+    │  Authorization: Bearer <CRON_SECRET>
+    ▼
+Analytics Express Backend
+    ├── cronAuth middleware         — validates CRON_SECRET (timing-safe)
+    ├── monthlyReportController     — HTTP handler, parses dryRun/shop params
+    ├── monthlyReportService        — batch orchestrator (10 shops/batch, 3 retries)
+    │   ├── eligibility             — MongoDB: getEligibleProUsers / markReportSent
+    │   ├── fetchMonthlyReportPayload — 5 parallel queries (analyticsService + suggestionsService)
+    │   ├── renderMonthlyReportHtml — assembles HTML from 5 partials
+    │   └── mailService             — Brevo REST API send
+    ▼
+MongoDB (users)           Brevo (merchant inbox)
 ```
 
-### Edge cases & limitations
+### 3.2 Import Dependency Graph
 
-| Case | Handling |
-|------|----------|
-| No analytics activity in period | Send report with zeros + encouragement copy |
-| Missing email on user | Skip shop, log |
-| User not on Pro plan | Excluded by query filter |
-| User uninstalled (`is_active: false`) | Excluded by query filter |
-| Analytics query fails for one shop | Retry 3×, skip, continue batch, log error |
-| Duplicate cron trigger | `lastMonthlyReportSentAt` idempotency check |
-| Large merchant count | Process in batches; return job summary JSON |
-| Charts in email | HTML bar/table visualizations — not interactive Recharts |
-| Outlook CSS limitations | Table-based layout, inline styles only |
+```
+analyticsRoutes.ts
+    └── cronAuth (middleware/cronAuth.ts)
+    └── monthlyReportController.ts
+            └── monthlyReportService.ts
+                    ├── eligibility.ts          → prisma (utils/prisma.ts)
+                    ├── dateRange.ts            (pure, no deps)
+                    ├── monthlyReportData.ts
+                    │       ├── analyticsService.ts  → clickhouse, currencyConverter, prisma
+                    │       └── suggestionsService   (existing, unchanged)
+                    ├── renderMonthlyReportHtml.ts
+                    │       └── email/partials/* (pure string builders, no deps)
+                    └── mailService.ts          → fetch (Brevo REST)
+```
 
-### Migrations from existing
+**No circular imports.** All data flows in one direction: route → controller → service → data/render/mail.
 
-- No changes to existing analytics tracking endpoints (`/track-visit`, `/order`, etc.).
-- No changes to main app analytics proxy or dashboard UI.
-- Main app only needs `SHOPIFY_APP_URL` referenced in email CTA link (env var on analytics backend).
+### 3.3 Key Design Decisions
+
+| Decision | Choice | Rationale |
+|----------|--------|-----------|
+| Data fetch | Internal service calls (not self-HTTP) | Avoids network round-trip per shop; analytics data already on same process |
+| Email rendering | Hand-built email-safe HTML (inline styles, table layout) | No React/Polaris/Recharts in email clients; reliable across Gmail + Outlook |
+| Scheduler trigger | Google Cloud Scheduler → Bearer token | Existing team pattern; no new infra |
+| Testing API | Same endpoint with `dryRun: true` + `shop` param | No separate test endpoint needed; CRON_SECRET required even for dry runs |
+| Batching | 10 shops per batch, `Promise.allSettled` | One failing shop cannot block others; parallel within batch |
+| Retries | 3 attempts per shop | Transient ClickHouse/Brevo failures handled without full job restart |
+| Idempotency | `lastMonthlyReportSentAt` < start of current month | Duplicate cron fires (e.g. Scheduler retry) skip already-sent shops |
 
 ---
 
-## 4. End-to-End Flow
+## 4. Data Model Changes
 
-### Merchant flow (admin)
-
-1. Merchant is on Pro analytics plan (`bucks_premium_pro`, `bucks_premium_pro_annual_60`, or `bucks_premium_pro_annual_65`).
-2. On the **1st of each month**, merchant receives email: **"Your BUCKS Analytics Report — [Month Year]"**.
-3. Email contains:
-   - Greeting with shop owner name
-   - 4 stat cards (visits, currency clicks, total sales, top currency)
-   - Currency conversion trends (HTML horizontal bars, top 5)
-   - Revenue by currency breakdown (HTML table with % bars)
-   - Top sales by currency and country tables
-   - Smart recommendations (from `suggestions` API)
-   - **"View full analytics"** button → main app `/analytics?shop=...`
-4. Merchant takes no action to opt in for v1 (automatic for eligible Pro users).
-
-### Customer flow (storefront)
-
-No storefront impact. Report is merchant-facing only.
-
-### Technical flow
-
-```
-Day 1 of month, 09:00 UTC
-  → Cloud Scheduler fires POST to analytics backend
-  → Endpoint validates Bearer CRON_SECRET
-  → Query: users where bucks_plan IN PRO_ANALYTICS_PLANS
-           AND is_active = true
-           AND (email OR customer_email) IS NOT empty
-           AND lastMonthlyReportSentAt < start of current month
-  → For each shop (batch of 10):
-       startDate/endDate = previous calendar month (UTC)
-       summary    = getSummary(shop, dates)      // internal
-       trends     = getTrends(shop, dates)       // internal
-       revenue    = getRevenueByCurrency(...)    // internal
-       countries  = getSalesByCountry(...)       // internal
-       suggestions = getSuggestions(shop, ...)   // internal
-       html = renderMonthlyReportHtml(payload)
-       brevo.send({ to: email, html, subject })
-       users.update({ lastMonthlyReportSentAt: now })
-  → Return { sent, failed, skipped, duration }
-```
-
-### Authentication flow (Cloud Scheduler → API)
-
-```
-Cloud Scheduler job:
-  Method:  POST
-  URL:     https://analytics.bucks.helixo.co/api/analytics/cron/monthly-report
-  Header:  Authorization: Bearer <CRON_SECRET>
-  Body:    {} (optional: { "dryRun": true, "shop": "test.myshopify.com" })
-
-Analytics endpoint:
-  if Authorization !== Bearer CRON_SECRET → 401
-  if method !== POST → 405
-  else → run job
-```
-
-`CRON_SECRET` stored in:
-- GCP Secret Manager (Scheduler job header)
-- Analytics backend environment variable
-
-### Email content structure (HTML)
-
-```
-┌─────────────────────────────────────────┐
-│  BUCKS logo + "Your May 2026 Report"    │
-├─────────────────────────────────────────┤
-│  Hi {shop_owner},                       │
-│  Here's how {shop} performed last month │
-├─────────────────────────────────────────┤
-│  [Visits] [Clicks] [Sales] [Top CCY]   │  ← 2×2 table cards
-├─────────────────────────────────────────┤
-│  Currency Conversion Trends             │  ← HTML horizontal bars
-├─────────────────────────────────────────┤
-│  Revenue by Currency                    │  ← HTML % breakdown table
-├─────────────────────────────────────────┤
-│  Sales by Currency | Sales by Country   │  ← HTML tables (top 5)
-├─────────────────────────────────────────┤
-│  Recommendations (1–3 items)            │  ← title + description
-├─────────────────────────────────────────┤
-│  [ View full analytics → ]              │  ← CTA to main app
-└─────────────────────────────────────────┘
-```
-
----
-
-## 5. Implementation Details
-
-### Data model changes
-
-**MongoDB `users` collection** (shared, via Prisma on main app — analytics backend reads/writes same field):
+**MongoDB `users` collection** — 3 new optional fields added to `prisma/schema.prisma`:
 
 ```prisma
-// prisma/schema.prisma — add to users model
-lastMonthlyReportSentAt       DateTime?   // Pro monthly report idempotency
-oneTimeAnalyticsReportSentAt  DateTime?   // Non-Pro one-time report idempotency (future)
-monthlyReportOptOut           Boolean?  @default(false)  // optional v2
+lastMonthlyReportSentAt      DateTime?             // Pro monthly idempotency
+oneTimeAnalyticsReportSentAt DateTime?             // Non-Pro one-time (Phase 7)
+monthlyReportOptOut          Boolean? @default(false)  // Future opt-out toggle
 ```
 
-Analytics backend uses native MongoDB driver or existing DB client to read/write this field.
+MongoDB is schema-flexible — no migration file required. Existing documents without these fields return `null`, which Prisma `DateTime?` / `Boolean?` handles correctly.
 
-### Backend changes (Analytics Express)
+---
 
-#### New files
+## 5. API Contract
 
-| File | Responsibility |
-|------|----------------|
-| `services/monthlyReportService.js` | Orchestrate per-shop report: fetch → render → send |
-| `services/monthlyReportData.js` | Call internal controllers/services for all endpoints |
-| `email/renderMonthlyReportHtml.js` | Compose full HTML email |
-| `email/partials/statsCardsHtml.js` | 4 stat cards (table layout) |
-| `email/partials/conversionTrendsHtml.js` | HTML horizontal bar chart |
-| `email/partials/revenueByCurrencyHtml.js` | % breakdown table |
-| `email/partials/performanceTablesHtml.js` | Top 5 currency + country tables |
-| `email/partials/recommendationsHtml.js` | Suggestions section |
-| `services/mailService.js` | Brevo send wrapper |
-| `middleware/cronAuth.js` | Verify `CRON_SECRET` |
-| `controllers/monthlyReportController.js` | HTTP handler for cron endpoint |
+### Cron Endpoint
 
-#### New route
-
-Add to `analyticsRoutes`:
-
-```ts
-import { cronAuth } from "../middleware/cronAuth";
-import { runMonthlyReport } from "../controllers/monthlyReportController";
-
-router.post("/cron/monthly-report", cronAuth, runMonthlyReport);
 ```
+POST /api/analytics/cron/monthly-report
+Authorization: Bearer <CRON_SECRET>
+Content-Type: application/json
 
-Full path: `POST /api/analytics/cron/monthly-report`
-
-#### Internal data fetch (do NOT self-HTTP)
-
-```ts
-// monthlyReportData.ts — call controller logic directly
-import { getSummaryData } from "../controllers/analyticsFetchController";
-// OR extract shared service layer from existing controllers
-
-export async function fetchMonthlyReportPayload(shop: string) {
-  const { startDate, endDate, periodLabel } = getLastMonthRange();
-
-  const [summary, trends, revenue, countries, suggestions] = await Promise.all([
-    analyticsService.getSummary(shop, startDate, endDate),
-    analyticsService.getTrends(shop, startDate, endDate),
-    analyticsService.getRevenueByCurrency(shop, startDate, endDate),
-    analyticsService.getSalesByCountry(shop, startDate, endDate),
-    suggestionsService.getSuggestions(shop, "last_month"),
-  ]);
-
-  return { shop, periodLabel, startDate, endDate, summary, trends, revenue, countries, suggestions };
+Body (all optional):
+{
+  "dryRun": true,                        // render but do not send, do not update DB
+  "shop": "example.myshopify.com"        // process single shop only (for testing)
 }
-```
 
-Refactor existing `analyticsFetchController` functions into a shared `analyticsService` if they are currently tied to `req/res` — this is the main structural change on the analytics backend.
-
-#### Eligibility query
-
-```ts
-const PRO_ANALYTICS_PLANS = [
-  "bucks_premium_pro",
-  "bucks_premium_pro_annual_60",
-  "bucks_premium_pro_annual_65",
-];
-
-const users = await db.users.find({
-  bucks_plan: { $in: PRO_ANALYTICS_PLANS },
-  is_active: true,
-  $or: [{ email: { $ne: "" } }, { customer_email: { $ne: "" } }],
-  monthlyReportOptOut: { $ne: true },
-  $or: [
-    { lastMonthlyReportSentAt: null },
-    { lastMonthlyReportSentAt: { $lt: startOfCurrentMonth } },
-  ],
-});
-```
-
-#### Cron controller
-
-```ts
-export async function runMonthlyReport(req: Request, res: Response) {
-  const { dryRun, shop: singleShop } = req.body ?? {};
-
-  const users = singleShop
-    ? await getUserByShop(singleShop)
-    : await getEligibleProUsers();
-
-  const results = { sent: 0, failed: 0, skipped: 0, errors: [] };
-
-  for (const user of users) {
-    try {
-      const payload = await fetchMonthlyReportPayload(user.myshopify_domain);
-      const html = renderMonthlyReportHtml(payload, user);
-
-      if (dryRun) {
-        results.skipped++;
-        continue; // or save HTML to /tmp for preview
-      }
-
-      await mailService.sendMonthlyReport(user, html, payload.periodLabel);
-      await markReportSent(user.myshopify_domain);
-      results.sent++;
-    } catch (err) {
-      results.failed++;
-      results.errors.push({ shop: user.myshopify_domain, error: err.message });
-    }
-  }
-
-  return res.status(200).json(results);
+Success response 200:
+{
+  "sent": 3,
+  "failed": 0,
+  "skipped": 0,
+  "durationMs": 4821,
+  "errors": []
 }
+
+Error responses:
+  401  — missing or wrong CRON_SECRET
+  500  — CRON_SECRET env var not configured
 ```
 
-#### Environment variables (analytics backend)
+### dryRun behaviour
 
-```env
-CRON_SECRET=                          # shared with Cloud Scheduler
-BREVO_API_KEY=                        # transactional email
-SHOPIFY_APP_URL=                      # CTA link base
-MONTHLY_REPORT_FROM_EMAIL=reports@bucks.com
-MONTHLY_REPORT_FROM_NAME=BUCKS
-```
-
-### Frontend changes (main app)
-
-**None required for v1.**
-
-Optional later:
-- Settings toggle for `monthlyReportOptOut` on main app settings page
-- Analytics page banner: "Your monthly report was sent on [date]"
-
-### HTML email design spec
-
-| Element | Value |
-|---------|-------|
-| Max width | 600px |
-| Font | Inter, Arial, sans-serif |
-| Card border-radius | 12px |
-| Title text | 12px, `#303030A6` |
-| Value text | 14px bold, `#303030` |
-| CTA button | `#008060` background, white text |
-| Bar chart colors | Match `getColorForCurrency()` palette |
-| Section order | Stats → Trends → Revenue → Tables → Recommendations → CTA |
-
-### Edge cases & special handling
-
-| Scenario | Behavior |
-|----------|----------|
-| `dryRun: true` in request body | Render report, do not send email, do not update `lastMonthlyReportSentAt` |
-| `shop` in request body | Process single shop only (for testing) |
-| Zero data | Show empty-state copy matching in-app analytics |
-| Suggestions empty | Hide recommendations section |
-| Brevo failure | Log error, do not update `lastMonthlyReportSentAt`, count as failed |
-| Scheduler timeout | Design endpoint to complete within Scheduler HTTP timeout, or process in chunks with `?offset=0&limit=50` and chain Scheduler jobs |
-| Secret rotation | Update both GCP Secret Manager and analytics env; old secret invalid immediately |
-
-### Security
-
-- `POST` only on cron endpoint
-- `CRON_SECRET` verified on every request (constant-time compare)
-- No shop data exposed in cron response (only counts + shop domains in error log server-side)
-- Email contains only that merchant's own data
-- Preview/dry-run endpoint disabled in production unless `CRON_SECRET` provided
-
-### Monitoring
-
-- Log job summary: `{ sent, failed, skipped, durationMs }`
-- Alert if `failed > 0` or `sent === 0` when eligible users exist
-- Optional: Slack webhook on job completion (same pattern as main app install logs)
+- Fetches analytics data and renders HTML for each shop.
+- Does **not** call Brevo.
+- Does **not** update `lastMonthlyReportSentAt`.
+- Returns `{ sent: 0, skipped: N, failed: 0 }`.
 
 ---
 
-## 6. Open Questions
+## 6. Eligibility Query
 
-1. **Opt-out in v1?** Send automatically to all Pro users, or add Settings toggle before launch?
-2. **Send time/timezone?** 09:00 UTC on the 1st — or adjust per merchant timezone later?
-3. **Brevo template vs raw HTML?** Code-generated HTML (faster v1) vs designed Brevo template (easier marketing edits)?
-4. **Empty month behavior?** Still send "quiet month" email, or skip merchants with zero visits?
-5. **Scheduler timeout at scale?** How many Pro merchants today? Do we need chunked Scheduler jobs?
-6. **Success metrics?** Track email open rate (Brevo), CTA clicks (UTM params), analytics page visits post-send?
-7. **Non-Pro one-time trigger (future)?** Send after N days on free plan, after first analytics activity threshold, or as a one-time campaign? *(See Phase 7)*
+Pro merchants are eligible when **all** of the following are true:
 
----
-
-## Implementation Plan
-
-| Phase | Goal | Scope |
-|-------|------|-------|
-| **Phase 1** | Data layer + internal service refactor | Extract `analyticsService` from controllers; `fetchMonthlyReportPayload`; `getLastMonthRange` |
-| **Phase 2** | HTML email renderer | All partials + `renderMonthlyReportHtml`; preview via `dryRun` endpoint |
-| **Phase 3** | Send + cron | `mailService` (Brevo), `cronAuth`, `POST /cron/monthly-report`, `lastMonthlyReportSentAt` |
-| **Phase 4** | Cloud Scheduler + staging test | Configure Scheduler job; test with 1 shop; test in Gmail + Outlook |
-| **Phase 5** | Production rollout | Enable for all Pro merchants; monitor first run |
-| **Phase 6 (optional)** | Merchant opt-out + metrics | Settings toggle, UTM tracking, Brevo template migration |
-| **Phase 7 (future)** | One-time report for non-Pro merchants | Reduced-content preview email, upgrade CTA, send-once idempotency |
-
-Each phase ships independently. Phase 1–3 can be tested locally without Scheduler.
+| Condition | Field |
+|-----------|-------|
+| On a Pro analytics plan | `bucks_plan IN ['bucks_premium_pro', 'bucks_premium_pro_annual_60', 'bucks_premium_pro_annual_65']` |
+| App is installed | `is_active = true` |
+| Has not opted out | `monthlyReportOptOut != true` |
+| Has an email address | `email != ""` OR `customer_email != ""` |
+| Has not been sent this month | `lastMonthlyReportSentAt IS NULL` OR `lastMonthlyReportSentAt < start of current month (UTC)` |
 
 ---
 
-## Future Enhancement: One-Time Report for Non-Pro Merchants (Phase 7)
+## 7. Analytics Data Fetched Per Shop
 
-After the Pro monthly report is stable, extend the same analytics backend pipeline to send a **single preview report** to non-Pro merchants. This is an upgrade funnel touchpoint — not a recurring monthly email.
+All 5 queries run in parallel for the **previous full calendar month (UTC)**:
 
-### Goal
+| Data | Source | Used in email section |
+|------|--------|-----------------------|
+| `summary` | `analyticsService.getSummaryData()` | Stat cards |
+| `trends` | `analyticsService.getTrendsData()` | Conversion trends bar chart |
+| `revenue` | `analyticsService.getRevenueByCurrencyData()` | Revenue by currency table |
+| `countries` | `analyticsService.getSalesByCountryData()` | Top countries table |
+| `suggestions` | `suggestionsService.getSuggestionsForShop()` | Recommendations section |
 
-Give free and non-Pro paid merchants a **one-time taste** of analytics value, using data they already have access to (summary tier), and encourage upgrade to Pro for full charts, tables, and monthly reports.
+Date range: `startDate = YYYY-MM-01`, `endDate = YYYY-MM-<last_day>` of previous month, computed in UTC.
 
-### How it differs from Pro monthly report
+---
 
-| Aspect | Pro monthly report (v1) | Non-Pro one-time report (future) |
-|--------|-------------------------|----------------------------------|
-| **Frequency** | Every month (1st) | **Once per shop, ever** |
-| **Eligibility** | `bucks_premium_pro*` | Active merchants **not** on Pro analytics plans |
-| **Data fetched** | summary + trends + revenue + country + suggestions | **summary only** (matches in-app limited analytics) |
-| **Email content** | Full report (cards, charts, tables, recommendations) | Stats cards + short insight copy + **upgrade CTA** |
-| **Idempotency field** | `lastMonthlyReportSentAt` | `oneTimeAnalyticsReportSentAt` |
-| **Trigger** | Cloud Scheduler monthly cron | TBD — event-based or one-time campaign job |
-| **CTA** | "View full analytics" | "Upgrade to Pro analytics" → `/pricing?shop=...` |
+## 8. Email Design Spec
 
-### Proposed non-Pro email content
+### 8.1 Layout Structure
 
 ```
-┌─────────────────────────────────────────┐
-│  BUCKS logo + "Your Store Snapshot"     │
+┌─────────────────────────────────────────┐  max-width: 600px
+│  BUCKS (white on #008060)               │  Header
+│  "Your May 2026 Analytics Report"       │
 ├─────────────────────────────────────────┤
-│  Hi {shop_owner},                       │
-│  Here's a snapshot of how {shop} is     │
-│  performing with BUCKS                  │
+│  Hi {first_name},                       │  Greeting
+│  Here's how {shop_name} performed...    │
 ├─────────────────────────────────────────┤
-│  [Visits] [Clicks] [Sales] [Top CCY]   │  ← summary stats only
+│  [Total Visits] [Currency Clicks]       │  Stat Cards (2×2 table)
+│  [Total Sales]  [Top Currency]          │
 ├─────────────────────────────────────────┤
-│  "Unlock full analytics — see trends,   │
-│   revenue by currency, country          │
-│   breakdown, and smart recommendations" │
+│  Currency Conversion Trends             │  Horizontal bar chart (top 5)
+│  EUR ████████████ 1,200                 │
+│  USD ██████       600                   │
 ├─────────────────────────────────────────┤
-│  [ Upgrade to Pro analytics → ]         │  ← pricing page
+│  Revenue by Currency                    │  % bar + amount table (top 5)
+│  EUR  ██████████ 60%  3,200.00 USD      │
+├─────────────────────────────────────────┤
+│  Top Sales by Country                   │  Table (top 5)
+│  Germany     2,000.00 USD               │
+├─────────────────────────────────────────┤
+│  Smart Recommendations (0–3 items)      │  Green left-border cards
+│  ▌ Add EUR to your currencies           │
+├─────────────────────────────────────────┤
+│  [ View full analytics → ]              │  CTA button (#008060)
+├─────────────────────────────────────────┤
+│  Footer: unsubscribe note + copyright   │
 └─────────────────────────────────────────┘
 ```
 
-No trends charts, performance tables, or suggestions in the non-Pro email — those are Pro-only features in the app today.
+### 8.2 Visual Tokens
 
-### Eligibility query (future)
+| Token | Value |
+|-------|-------|
+| Max width | 600px |
+| Primary colour | `#008060` (BUCKS green) |
+| Body background | `#f4f4f4` |
+| Card background | `#f9f9f9` |
+| Card border | `1px solid #e8e8e8` |
+| Card border-radius | `12px` |
+| Section title | `16px, font-weight: 700, #303030` |
+| Stat card label | `11px, #303030A6, uppercase` |
+| Stat card value | `22px, font-weight: 700, #303030` |
+| Body text | `13–14px, #303030A6, line-height: 1.6` |
+| CTA button | `#008060` bg, white text, `15px bold`, `8px` border-radius, `14px 32px` padding |
+| Recommendation card | `#f0faf6` bg, `4px solid #008060` left border |
+| Font stack | `Arial, sans-serif` (no web fonts — email client safe) |
 
-```ts
-const PRO_ANALYTICS_PLANS = [
-  "bucks_premium_pro",
-  "bucks_premium_pro_annual_60",
-  "bucks_premium_pro_annual_65",
-];
+> **Note:** These tokens are the RFC baseline. They will be updated in Task 15 of the implementation plan once the Figma design is shared via Figma MCP.
 
-const users = await db.users.find({
-  bucks_plan: { $nin: PRO_ANALYTICS_PLANS },
-  is_active: true,
-  oneTimeAnalyticsReportSentAt: null,  // never sent before
-  $or: [{ email: { $ne: "" } }, { customer_email: { $ne: "" } }],
-  // optional: minimum activity threshold
-  // e.g. totalVisits > 0 in last 30 days
-});
+### 8.3 Email Client Compatibility Rules
+
+- **Table-based layout only** — no CSS Grid, no Flexbox.
+- **Inline styles only** — no `<style>` blocks with class selectors (Outlook strips them).
+- `bgcolor` attribute on `<table>` / `<td>` for background colours (Outlook fallback).
+- `border-radius` on containers: renders in Gmail, degrades gracefully in Outlook (square corners).
+- No external fonts (`@font-face` not supported in most clients).
+- Bar charts: HTML `<table>` width-percentage columns coloured with `bgcolor` — no `<canvas>`, no SVG.
+- All images must have `alt` text and explicit `width`/`height`.
+
+### 8.4 Empty State
+
+| Section | Empty behaviour |
+|---------|----------------|
+| Stat cards | Always rendered — shows `0` values |
+| Conversion trends | Section hidden if `trends` array is empty |
+| Revenue by currency | Section hidden if `revenue` array is empty |
+| Top countries | Section hidden if `countries` array is empty |
+| Recommendations | Section hidden if `suggestions.suggestions` is empty |
+
+---
+
+## 9. New Environment Variables
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `CRON_SECRET` | Yes | Shared with Cloud Scheduler; used for `Authorization: Bearer` header validation |
+| `BREVO_API_KEY` | Yes (for real sends) | Brevo transactional API key |
+| `SHOPIFY_APP_URL` | Yes | Base URL for email CTA links (e.g. `https://apps.shopify.com/bucks`) |
+| `MONTHLY_REPORT_FROM_EMAIL` | Yes | Sender email address (e.g. `reports@bucks.com`) |
+| `MONTHLY_REPORT_FROM_NAME` | Yes | Sender display name (e.g. `BUCKS`) |
+
+---
+
+## 10. Security
+
+- `POST`-only cron endpoint — `GET /cron/monthly-report` returns 404.
+- `CRON_SECRET` compared with `crypto.timingSafeEqual` — prevents timing attacks.
+- No shop data in HTTP response — only counts (`sent`, `failed`, `skipped`) and shop domains in server-side error logs.
+- `dryRun` mode requires the same `CRON_SECRET` — not an open preview endpoint.
+
+---
+
+## 11. Error Handling & Monitoring
+
+| Scenario | Handling |
+|----------|----------|
+| Missing email on user | Skipped at eligibility query (excluded by filter) |
+| Analytics query fails for shop | Retry 3× then log + count as `failed`; continue batch |
+| Brevo returns non-2xx | Throw error → retry → mark `failed`; `lastMonthlyReportSentAt` NOT updated |
+| Duplicate cron trigger same month | `lastMonthlyReportSentAt` check skips already-sent shops |
+| Zero analytics data for shop | Valid empty-state email sent (stat cards show 0, sections with no data hidden) |
+| `GOOGLE_SERVICE_ACCOUNT_BASE64` unset | Suggestions AI call fails silently; `suggestionsService` falls back to manual suggestions |
+| `CRON_SECRET` not set in env | Endpoint returns 500 immediately |
+
+**Job summary log** on every run:
+```
+[MonthlyReport] Job complete: { sent: 12, failed: 1, skipped: 0, durationMs: 8432 }
 ```
 
-### Trigger options (to decide in Phase 7)
+---
 
-| Option | Description |
-|--------|-------------|
-| **A — Time-based** | Send once 30 days after install if still non-Pro |
-| **B — Activity-based** | Send once when shop hits N visits or N currency clicks |
-| **C — One-time campaign** | Manual Cloud Scheduler job / admin trigger for existing non-Pro base |
-| **D — On analytics page first visit** | Queue send 24h after merchant first opens `/analytics` |
+## 12. Testing Strategy
 
-Recommendation: start with **Option C** (controlled rollout) before automating A or B.
-
-### Backend changes (future, reuses v1 infrastructure)
-
-| Component | Change |
-|-----------|--------|
-| `monthlyReportService` | Generalize to `reportService` with `reportType: 'monthly_pro' \| 'one_time_preview'` |
-| `fetchMonthlyReportPayload` | Add `fetchPreviewReportPayload` — summary only |
-| `renderMonthlyReportHtml` | Add `renderPreviewReportHtml` — reduced template + upgrade CTA |
-| `POST /cron/monthly-report` | Unchanged (Pro only) |
-| `POST /cron/one-time-preview-report` | **New** secured endpoint for non-Pro one-time sends |
-| `users.oneTimeAnalyticsReportSentAt` | Set on successful send; never send again |
-
-### Edge cases (non-Pro one-time)
-
-| Case | Handling |
-|------|----------|
-| Merchant upgrades to Pro before send | Skip one-time preview; they receive Pro monthly report instead |
-| Merchant already received preview | `oneTimeAnalyticsReportSentAt` set — never resend |
-| Zero activity | Skip or send with empty-state + upgrade message (TBD) |
-| Merchant uninstalls | `is_active: false` — exclude |
-
-### Success metrics (future)
-
-- One-time email open rate
-- Upgrade CTA click-through to pricing
-- Pro plan conversion rate within 30 days of preview send
-- Compare: merchants who received preview vs control group
-
-### Testing checklist
-
-- [ ] `dryRun` + single `shop` returns expected HTML payload
-- [ ] Stats numbers match dashboard for same shop + `last_month`
-- [ ] Email renders correctly in Gmail (web + mobile)
-- [ ] Email renders correctly in Outlook
-- [ ] `CRON_SECRET` rejection returns 401
-- [ ] Second cron run same month skips already-sent shops
-- [ ] Merchant with no data receives valid empty-state email
-- [ ] CTA link opens correct shop in main app analytics
+| Test | Type | Location |
+|------|------|----------|
+| `getLastMonthRange()` — date boundary cases | Unit | `src/services/report/dateRange.test.ts` |
+| `getEligibleProUsers()` / `getUserByShop()` / `markReportSent()` — Prisma mocked | Unit | `src/services/report/eligibility.test.ts` |
+| `renderMonthlyReportHtml()` — HTML output assertions | Unit | `src/email/renderMonthlyReportHtml.test.ts` |
+| `sendMonthlyReport()` — Brevo fetch mocked | Unit | `src/services/mail/mailService.test.ts` |
+| `cronAuth` — correct/wrong/missing secret | Unit | `src/middleware/cronAuth.test.ts` |
+| Full pipeline dryRun via curl | Integration | Manual (see plan Task 13) |
+| Gmail + Outlook rendering | Visual QA | `scripts/previewEmail.ts` → open in browser / Litmus |
 
 ---
 
-## Optional Future Enhancement: Screenshot Fallback
+## 13. File Structure (New Files Only)
 
-If HTML bar charts are not visually acceptable after QA, a secondary approach can capture chart sections from a dedicated read-only report page using Puppeteer/Playwright and embed as `<img>` in the email. This is **not part of v1** and should only be considered if HTML chart visualizations fail design review in Gmail/Outlook. The primary and recommended path remains HTML-only rendering.
+```
+src/
+├── controllers/
+│   └── monthlyReportController.ts       NEW
+├── middleware/
+│   └── cronAuth.ts                      NEW
+├── services/
+│   ├── analytics/
+│   │   └── analyticsService.ts          NEW  (extracted from controllers)
+│   ├── mail/
+│   │   └── mailService.ts               NEW
+│   └── report/
+│       ├── dateRange.ts                 NEW
+│       ├── eligibility.ts               NEW
+│       ├── monthlyReportData.ts         NEW
+│       └── monthlyReportService.ts      NEW
+└── email/
+    ├── renderMonthlyReportHtml.ts       NEW
+    └── partials/
+        ├── statsCardsHtml.ts            NEW
+        ├── conversionTrendsHtml.ts      NEW
+        ├── revenueByCurrencyHtml.ts     NEW
+        ├── performanceTablesHtml.ts     NEW
+        └── recommendationsHtml.ts      NEW
+```
 
 ---
 
-## References
+## 14. Out of Scope (v1)
 
-- Analytics routes: `POST/GET /api/analytics/*` (Express backend)
-- Main app analytics proxy: `pages/api/v1/analytics/proxy.js` (unchanged)
-- Pro plan filter: `bucks_premium_pro`, `bucks_premium_pro_annual_60`, `bucks_premium_pro_annual_65`
-- Non-Pro preview (future): all active merchants not in Pro analytics plans; `oneTimeAnalyticsReportSentAt` for send-once
-- Date range: `last_month` (previous calendar month, UTC) for Pro monthly; `last_30_days` TBD for non-Pro preview
-- Brevo pattern: `utils/mailEngine.js` (main app — reference for analytics `mailService`)
-- Cloud Scheduler auth: `Authorization: Bearer CRON_SECRET`
+- Frontend changes in the main Next.js app.
+- Merchant opt-out toggle in app settings (field added to schema for future use).
+- UTM tracking on CTA links.
+- Non-Pro one-time preview report (Phase 7 — future).
+- Cloud Scheduler configuration (infrastructure task, separate from code).
+- Slack webhook on job completion.
+
+---
+
+## 15. Future: Phase 7 — Non-Pro One-Time Report
+
+Reuses all v1 infrastructure. Additions needed:
+
+- `POST /api/analytics/cron/one-time-preview-report` endpoint
+- `fetchPreviewReportPayload()` — summary data only
+- `renderPreviewReportHtml()` — stat cards + upgrade CTA only (no charts/tables)
+- Eligibility: `bucks_plan NOT IN PRO_PLANS` + `oneTimeAnalyticsReportSentAt = null`
+- CTA: "Upgrade to Pro analytics →" → `/pricing?shop=...`
