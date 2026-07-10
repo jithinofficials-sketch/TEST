@@ -1,252 +1,260 @@
-# Active Users Retrieval
+# Admin CLS Stabilization Design
 
-## Overview
+## Context
 
-Active users retrieval is a background process that extracts currently active accounts from a datastore, optionally verifies that each account is still accessible through an external API, and writes the result to a downloadable output file such as CSV.
+Shopify admin-side CLS is measured for the embedded app experience in Shopify App Home. Shopify's Built for Shopify performance target for admin CLS is `0.1` or less at the 75th percentile.
 
-This pattern is useful for operational tasks, migrations, audits, reporting, customer outreach, and any workflow that needs an up-to-date list of valid active accounts without blocking an HTTP request.
+The current admin dashboard assembles much of its visible layout after hydration through `next/dynamic()` imports, client-only responsive state, post-load banner state updates, and effect-driven onboarding checks. These patterns can cause layout elements to appear, collapse, expand, or reflow after the first paint.
 
-## Purpose
+This design targets the known priority CLS risks only. It does not change storefront widget behavior.
 
-Applications often store an `isActive`, `status`, or subscription state locally, but local state can drift from reality. A retrieval process helps produce a reliable active-user list by combining:
+## Goals
 
-- A local database filter for likely active accounts.
-- Cursor-based pagination for large datasets.
-- Optional external validation using each account's API credentials.
-- Batched output writing to avoid high memory usage.
-- Background execution so long-running exports do not time out.
+- Reduce admin-side CLS on the embedded app dashboard.
+- Keep the current dashboard UI and merchant-facing behavior intact.
+- Make the initial server/client layout closer to the final hydrated layout.
+- Avoid broad dashboard refactors while fixing the highest-risk layout shifts.
+- Keep fixes compatible with the existing Polaris React UI in this Next.js app.
 
-This is needed when the account list may contain thousands of records, external validation is slow, or the result needs to be consumed by other operational processes.
+## Non-Goals
 
-## High-Level Flow
+- Rebuilding the dashboard with Polaris web components.
+- Changing storefront theme app extension or currency converter widget behavior.
+- Redesigning dashboard content, pricing, analytics, or onboarding flows.
+- Removing dynamic imports where stable fallbacks are sufficient.
+- Adding a full analytics/performance telemetry system in this implementation.
 
-1. Start the export from an admin endpoint, CLI command, or scheduled job.
-2. Immediately return a response if triggered through HTTP.
-3. Query active users in batches using cursor-based pagination.
-4. For each batch, process users with a controlled concurrency limit.
-5. Skip records missing required identifiers or credentials.
-6. Optionally call an external account API to confirm the account is still valid.
-7. Append valid records to a CSV or another output sink.
-8. Track success and failure counts.
-9. Allow the process to be stopped safely between batches or chunks.
-10. Expose a download endpoint or storage location for the generated file.
+## Scope
 
-## Key Implementation Details
+The implementation will address these priority items:
 
-### Background Execution
+1. Add layout-preserving loading fallbacks to dashboard dynamic imports in `pages/index.jsx`.
+2. Remove the client-only mobile layout flip in `pages/index.jsx`.
+3. Make analytics banner rendering stable on first load.
+4. Prevent `StaffAccessBar` from pushing content down after hydration.
+5. Prevent onboarding validation from changing the card's page footprint immediately after first paint.
+6. Fix invalid height styles in `components/home/feedbackCard.jsx` and `components/home/whatsNew.jsx`.
 
-For HTTP-triggered exports, return immediately and run the extraction asynchronously. This prevents client, proxy, or platform timeouts.
+## Current Risks
 
-```ts
-app.post("/admin/exports/active-users", async (_req, res) => {
-  res.status(202).json({
-    status: "processing",
-    message: "Active user export started.",
-    downloadUrl: "/admin/exports/active-users/download"
-  });
+### Dashboard Dynamic Imports
 
-  void runActiveUsersExport();
-});
-```
+`pages/index.jsx` dynamically imports large dashboard sections with no loading fallback. These components render inside a Polaris `Grid`, often as full-width `Grid.Cell` children. When chunks load after the first paint, the page inserts new cards and banners into the layout.
 
-For production systems, prefer a queue or job runner instead of an in-memory background function when jobs must survive process restarts.
+Affected dynamic components include:
 
-### Cursor-Based Pagination
+- `AnalyticsBanner`
+- `PartnerPromoBanner`
+- `OnboardingBanner`
+- `FooterComponent`
+- `AppStatus`
+- `CollaborationBanner`
+- `DashboardImageBanner`
+- `FeedbackCard`
+- `NeedAssistance`
+- `HelpSupportCards`
+- `OnboardingCompletionPopup`
+- `WhatsNew`
 
-Use cursor pagination instead of offset pagination for large tables. Cursor pagination avoids performance degradation and duplicate or skipped rows when data changes during the export.
+### Client-Only Mobile Layout
 
-```ts
-let lastId: string | undefined;
-const batchSize = 1000;
+`pages/index.jsx` initializes `isMobile` as `false`, then updates it from `window.innerWidth` in `useEffect`. On mobile, the CurrencyInfo/ExtensionCard area can first render as a row and then flip to a column after hydration.
 
-while (true) {
-  const users = await db.user.findMany({
-    where: { isActive: true },
-    select: {
-      id: true,
-      email: true,
-      accountDomain: true,
-      accessToken: true,
-      planName: true
-    },
-    orderBy: { id: "asc" },
-    take: batchSize,
-    ...(lastId ? { cursor: { id: lastId }, skip: 1 } : {})
-  });
+### Analytics Banner Late Insertion
 
-  if (users.length === 0) break;
+`pages/index.jsx` can set `analyticsWelcomeBanner` after first load through an API call and global state mutation. That can insert the analytics banner after the page has already painted.
 
-  await processUsers(users);
-  lastId = users[users.length - 1].id;
-}
-```
+### Staff Access Banner Late Insertion
 
-### Controlled Concurrency
+`components/admin/StaffAccessBar.jsx` initially renders `null`, then checks impersonation state in `useEffect`. On impersonation routes, it can mount a banner above the page after hydration and push all content down.
 
-External validation can quickly exhaust sockets, hit rate limits, or overload downstream APIs. Process users in small chunks.
+### Onboarding Post-Load Reflow
 
-```ts
-async function processWithConcurrency<T>(items: T[], limit: number, handler: (item: T) => Promise<void>) {
-  for (let i = 0; i < items.length; i += limit) {
-    const chunk = items.slice(i, i + limit);
-    await Promise.all(chunk.map(handler));
-  }
-}
-```
+`components/home/onBoardingBanner.jsx` delays validation checks by 100ms. Those checks update onboarding state, and `components/common/onBoardingCard.jsx` may collapse, expand, or hide large sections based on the result.
 
-### Optional External Validation
+### Invalid Height Styles
 
-If local active status is not sufficient, call an authoritative external API using the account's credentials. Treat failures as non-fatal and continue processing other users.
+Two components contain invalid CSS values, preventing intended layout reservation:
 
-```ts
-async function verifyAccount(domain: string, accessToken: string): Promise<boolean> {
-  const response = await fetch(`https://${domain}/admin/api/account.json`, {
-    headers: {
-      Authorization: `Bearer ${accessToken}`
-    },
-    signal: AbortSignal.timeout(5000)
-  });
+- `components/home/feedbackCard.jsx` has `height: '120px ,paddingBottom:16px'`.
+- `components/home/whatsNew.jsx` has `minHeight: mdDown ? '204' : '230px'`.
 
-  return response.ok;
-}
-```
+## Design
 
-### CSV Output
+### 1. Dashboard Dynamic Import Fallbacks
 
-Write the output incrementally instead of keeping every row in memory. Escape CSV values before writing.
+Create small dashboard fallback components in `pages/index.jsx` or a nearby component file. Each fallback will preserve the same grid footprint as the final component.
 
-```ts
-function csvValue(value: string | null | undefined): string {
-  return `"${String(value ?? "").replace(/"/g, '""')}"`;
-}
+Fallback requirements:
 
-async function appendRows(filePath: string, rows: Array<string[]>) {
-  const lines = rows.map((row) => row.map(csvValue).join(","));
-  await fs.appendFile(filePath, `${lines.join("\n")}\n`);
-}
-```
+- Use the same `Grid.Cell` `columnSpan` as the final component when the final component owns the cell.
+- Use a Polaris `Card`, `Box`, or neutral block with stable `minHeight`.
+- Avoid spinners as the only placeholder because spinners do not reserve final layout height.
+- Keep placeholders visually lightweight and non-interactive.
 
-### Stop or Cancel Support
+For dynamic components rendered inside an existing `Grid.Cell`, the fallback should reserve only the child component's expected height. For dynamic components that render their own `Grid.Cell`, the fallback should render a matching `Grid.Cell`.
 
-Use a cancellation flag, job status, or queue cancellation token. Check it between batches and before expensive external calls.
+Expected fallback sizes:
 
-```ts
-let shouldStop = false;
+- Partner promo banner: full-width cell, approximately `120px` minimum height.
+- Onboarding banner: full-width cell, approximately `360px` minimum height when setup is incomplete.
+- Analytics banner: full-width cell, approximately `140px` minimum height.
+- App status: full-width cell, approximately `220px` minimum height.
+- Need assistance: full-width cell, approximately `96px` minimum height.
+- Collaboration banner: full-width cell, approximately `120px` minimum height.
+- WhatsNew: full-width cell, approximately `230px` minimum height.
+- Help support cards: full-width cell, approximately `96px` minimum height.
+- Dashboard image banner: full-width cell, approximately `150px` minimum height.
+- Feedback card: full-width cell, approximately `120px` minimum height.
+- Footer: preserve a small footer block only if its late mount is visible in testing.
 
-app.post("/admin/exports/active-users/stop", (_req, res) => {
-  shouldStop = true;
-  res.json({ message: "Export will stop after the current batch." });
-});
+`OnboardingCompletionPopup` does not need a layout placeholder because it renders modal UI rather than occupying normal document flow.
 
-while (!shouldStop) {
-  const users = await fetchNextBatch();
-  if (users.length === 0) break;
-  await processUsers(users);
-}
-```
+### 2. CSS-Based Responsive Currency Cards
 
-## Required Configuration
+Replace the `isMobile` state used for the CurrencyInfo/ExtensionCard row with CSS.
 
-The exact configuration depends on the application, but the pattern typically needs:
+Current pattern:
 
-| Setting | Purpose |
-| --- | --- |
-| Database connection | Reads users or accounts. |
-| Active-user filter | Defines which records are eligible, such as `isActive = true`. |
-| Batch size | Controls database page size. |
-| Concurrency limit | Controls simultaneous external checks. |
-| Output path or bucket | Stores generated CSV or export file. |
-| External API version or base URL | Used only when validating accounts externally. |
-| Request timeout | Prevents hanging external validation calls. |
+- Initial render assumes desktop row.
+- `useEffect` checks `window.innerWidth`.
+- State update changes `flexDirection` to column on mobile.
 
-Example environment variables:
+New pattern:
 
-```env
-DATABASE_URL="postgresql://..."
-ACTIVE_USERS_EXPORT_PATH="./exports/active_users.csv"
-ACTIVE_USERS_BATCH_SIZE="1000"
-ACTIVE_USERS_CONCURRENCY="10"
-EXTERNAL_API_VERSION="2026-01"
-```
+- Render a stable wrapper class, for example `bucks-dashboard-status-row`.
+- Define row layout by default and column layout in a media query.
+- Remove the resize listener and `isMobile` state.
 
-## Important Considerations and Edge Cases
+This makes the first render and hydrated render structurally identical.
 
-- **Long-running jobs:** Use a queue or worker for exports that must survive restarts.
-- **Duplicate starts:** Prevent multiple exports from writing to the same file at the same time.
-- **Large datasets:** Use cursor pagination and incremental file writes.
-- **Missing credentials:** Skip records that cannot be externally verified and count them as failures or skipped rows.
-- **External API failures:** Add timeouts, retries where appropriate, and continue processing other accounts.
-- **Rate limits:** Keep concurrency low and add pauses between large batches.
-- **CSV correctness:** Escape quotes, commas, and newlines. Always write a header row.
-- **Sensitive data:** Avoid exporting access tokens or secrets. Limit CSV columns to operationally necessary fields.
-- **Partial results:** A stopped or failed export may still produce a useful partial file. Mark the job status clearly.
-- **Process-local state:** In-memory stop flags and progress counters do not work across multiple server instances.
+### 3. Stable Analytics Banner Rendering
 
-## Integrating in Another Application
+Avoid inserting the analytics banner after first paint as a result of the first-load API mutation.
 
-1. Identify the account table and active-status field.
-2. Decide whether local state is enough or if external validation is required.
-3. Create a background job or admin endpoint to start the export.
-4. Implement cursor-based database pagination.
-5. Add controlled concurrency for per-account work.
-6. Write output incrementally to a file, object storage, or database table.
-7. Track progress, successes, failures, and stop state.
-8. Expose a secure download endpoint or storage link.
-9. Protect all export endpoints with admin authentication.
+The first implementation should use this rule:
 
-## Minimal Reusable Example
+- The dashboard decides whether to render the analytics banner from initial server data for the current page load.
+- If an API call sets `analyticsWelcomeBanner` for future eligibility, it must not insert the banner during the same initial render session.
 
-```ts
-type ActiveUser = {
-  id: string;
-  email: string | null;
-  accountDomain: string | null;
-  accessToken: string | null;
-  planName: string | null;
-};
+This keeps current behavior predictable and avoids pushing dashboard content down. If product requirements require immediate display for newly eligible users, reserve the analytics banner slot from the start when onboarding is completed and the banner is not dismissed.
 
-async function runActiveUsersExport() {
-  const outputPath = "./exports/active_users.csv";
-  const batchSize = 1000;
-  const concurrency = 10;
-  let lastId: string | undefined;
+### 4. Stable Staff Access Banner Footprint
 
-  await fs.writeFile(outputPath, "Email,Account Domain,Plan\n");
+Prevent impersonation routes from gaining a new top banner after hydration without reserved space.
 
-  while (true) {
-    const users: ActiveUser[] = await db.user.findMany({
-      where: { isActive: true },
-      orderBy: { id: "asc" },
-      take: batchSize,
-      ...(lastId ? { cursor: { id: lastId }, skip: 1 } : {})
-    });
+Use a route-based placeholder strategy:
 
-    if (users.length === 0) break;
+- Detect whether the current route is an impersonation route from `router.pathname` or `router.asPath`.
+- On possible impersonation routes, render a reserved wrapper with a stable minimum height.
+- If impersonation data exists, render the banner inside the wrapper.
+- If no impersonation data exists, the wrapper can collapse only for routes that are not impersonation routes.
 
-    const rows: string[][] = [];
+This avoids shifting all page content when `StaffAccessBar` discovers impersonation state in `useEffect`.
 
-    await processWithConcurrency(users, concurrency, async (user) => {
-      if (!user.accountDomain || !user.accessToken) return;
+### 5. Stable Onboarding Card Footprint
 
-      const isValid = await verifyAccount(user.accountDomain, user.accessToken);
-      if (!isValid) return;
+Keep the onboarding card footprint stable during post-load validation.
 
-      rows.push([user.email ?? "", user.accountDomain, user.planName ?? ""]);
-    });
+Rules:
 
-    await appendRows(outputPath, rows);
-    lastId = users[users.length - 1].id;
-  }
-}
-```
+- Use the server-provided onboarding state as the initial rendered state.
+- Remove or reduce the visual impact of the 100ms delayed validation by keeping a stable wrapper `minHeight` while checks run.
+- Do not collapse or remove the onboarding area immediately after first paint because a post-load validation result says all steps are complete.
+- If all steps are complete in server data, render no onboarding area from the start.
+- If server data says onboarding is incomplete, reserve the onboarding area while validation updates internal step status.
 
-## Recommended API Endpoints
+This preserves the existing validation behavior while preventing large top-of-page height changes.
 
-```http
-POST /admin/exports/active-users
-POST /admin/exports/active-users/stop
-GET  /admin/exports/active-users/progress
-GET  /admin/exports/active-users/download
-```
+### 6. Invalid Height Fixes
 
-Use `POST` for actions that start or stop work. Use `GET` only for read-only status and download endpoints.
+Fix malformed inline styles:
+
+- In `components/home/feedbackCard.jsx`, replace the invalid `height` string with valid properties, such as `minHeight: '120px'` and `paddingBottom: '16px'`.
+- In `components/home/whatsNew.jsx`, replace `'204'` with `'204px'`.
+
+These changes are safe and directly improve layout reservation.
+
+## Data Flow
+
+### Dashboard Initial Render
+
+1. `getServerSideProps` provides initial user/settings/banner state.
+2. `pages/index.jsx` renders a stable dashboard grid from that state.
+3. Dynamic sections that are not ready render layout-preserving fallbacks.
+4. Hydration replaces fallbacks with real content of similar height.
+5. Client-only validations update content inside reserved areas instead of adding or removing major layout blocks.
+
+### Analytics Banner
+
+1. Initial data determines current-page visibility.
+2. First-load API mutation may update backend/global state for future sessions.
+3. Current-page layout does not gain a new banner unless space was already reserved.
+
+### Staff Access Banner
+
+1. Route context determines whether a reserved banner area is needed.
+2. Client-side impersonation lookup fills the reserved area if impersonation exists.
+3. Non-impersonation routes keep current no-banner behavior.
+
+## Error Handling
+
+- Dynamic import fallbacks should not introduce new network or API behavior.
+- Analytics banner API failures should preserve current error handling but must not trigger additional layout insertion.
+- Onboarding validation failures should keep the server-derived onboarding UI and avoid collapse/removal based on failed checks.
+- Staff impersonation lookup failures should leave either the reserved route-specific placeholder or no banner, depending on route type.
+
+## Testing Plan
+
+Manual verification:
+
+- Run production build locally if environment allows: `npm run build` then `npm start`.
+- Test embedded admin dashboard at desktop and mobile iframe widths.
+- Use Chrome Performance panel with Layout Shift Regions enabled.
+- Confirm dashboard does not shift when dynamic sections load.
+- Confirm mobile dashboard does not flip CurrencyInfo/ExtensionCard from row to column after hydration.
+- Confirm analytics banner does not appear after a first-load API mutation unless space was reserved.
+- Confirm impersonation routes do not push content down after `StaffAccessBar` hydrates.
+- Confirm onboarding validation updates step status without a large page-height change.
+
+Code checks:
+
+- Run the existing test suite if available: `npm test`.
+- Run a production build: `npm run build`.
+
+Optional measurement:
+
+- Use Shopify App Bridge Web Vitals API or existing `web-vitals` logging to compare CLS before and after changes.
+
+## Rollout Plan
+
+1. Implement dashboard fallback and responsive layout fixes first.
+2. Implement analytics banner stability.
+3. Implement staff banner reservation.
+4. Implement onboarding footprint stabilization.
+5. Fix invalid height styles.
+6. Build and manually verify layout shifts.
+
+## Risks
+
+- Reserved placeholders can leave small temporary blank areas if component chunks load slowly.
+- Approximate fallback heights may need tuning after visual testing.
+- Analytics banner behavior may change slightly for users who become eligible during the first page load; the banner may appear on the next load instead of immediately unless a reserved slot is used.
+- Staff banner reservation must avoid adding blank vertical space to normal merchant routes.
+- Onboarding stabilization must avoid hiding real completion progress from merchants.
+
+## Open Decisions
+
+- Use inline fallback components in `pages/index.jsx` for minimal change, unless the file becomes too noisy.
+- Prefer reserving analytics banner space only for eligible users from SSR state, not for every dashboard user.
+- Prefer route-based staff banner reservation only on `/admin/merchants/[merchant]/*` routes.
+
+## Acceptance Criteria
+
+- Dashboard dynamic imports have layout-preserving fallbacks.
+- Dashboard CurrencyInfo/ExtensionCard row uses CSS responsive layout, not client-only `isMobile` state.
+- Analytics banner cannot be newly inserted after first paint without reserved space.
+- StaffAccessBar cannot push page content down on impersonation routes after hydration.
+- Onboarding validation cannot collapse/remove a large onboarding area immediately after first paint.
+- Invalid height styles in `feedbackCard.jsx` and `whatsNew.jsx` are corrected.
+- `npm run build` completes successfully, or any build failure is documented as unrelated.
