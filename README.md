@@ -1,617 +1,285 @@
-# RFC: Monthly Analytics Report for Pro Merchants
-
-**Metadata:**
-
-- **Author:** BUCKS Engineering
-- **Status:** Draft
-- **Reviewers:** CPO, Product Owner, Analytics Team
-- **Type:** #feature-rfc
+# Comprehensive Performance & Quality Analysis
 
 ---
 
-## 1. Problem
+## 1. Already Fixed (This Session)
 
-Pro merchants with full analytics access must **manually log into BUCKS** to review store performance. There is no automated way to deliver a periodic summary of currency conversion activity, sales by market, or actionable recommendations.
-
-- **Merchant pain points:**
-  - Performance insights are only available inside the app; merchants forget to check.
-  - No monthly touchpoint reinforcing the value of the Pro analytics plan.
-  - Merchants who are busy running their store miss trends (top currencies, country performance, low-conversion markets).
-- **Current workarounds:**
-  - Merchants open `/analytics` and change the date filter to "Last month" themselves.
-  - Support cannot proactively share performance summaries.
-- **Competitor context:**
-  - Many SaaS analytics products (Klaviyo, Google Analytics email summaries, Shopify reports) send periodic email digests. Merchants expect a monthly "here's how you did" email for paid analytics tiers.
-
----
-
-## 2. Why This Matters?
-
-- **Why now:**
-  - Full analytics dashboard is live for Pro plan merchants (`bucks_premium_pro*`).
-  - Analytics backend (Express) already aggregates all required data via existing endpoints.
-  - Shared MongoDB gives the analytics backend access to merchant email and plan eligibility.
-  - Team already uses **Google Cloud Scheduler** for scheduled jobs — no new scheduling infra required.
-- **Benefits:**
-  - Increases perceived value of Pro analytics subscription.
-  - Drives re-engagement with the analytics dashboard (email CTA → in-app analytics).
-  - Surfaces `suggestions` proactively without merchants opening the app.
-  - Reduces "I didn't know my store was performing well in EUR" support conversations.
-  - **(Future)** One-time non-Pro preview report creates an upgrade funnel to Pro analytics.
-- **Cost of inaction:**
-  - Pro analytics remains a passive feature merchants must remember to use.
-  - Lower differentiation vs competitors offering automated reporting.
-  - Missed opportunity for retention and upgrade justification.
-- **Non-Pro merchants (future):**
-  - Free and non-Pro paid merchants have limited analytics (summary only) and never receive any automated performance summary.
-  - No touchpoint to demonstrate the value of upgrading to Pro analytics.
+| # | Issue | Fix | Impact |
+|---|-------|-----|--------|
+| 1 | No SSR timing visibility | `utils/debugTiming.js` — `startDebugTimer`, `timeAsync`, gated by `BUCKS_DEBUG_TIMING=1` | Debugging |
+| 2 | Currency rules data fetched fresh on every SSR (~451ms) | `utils/currencyData.js` — 1h TTL in-memory cache + stale-while-fetch | ~451ms → ~1ms on repeat |
+| 3 | Partner data queried from DB on every SSR (~353ms) | `utils/partners/getActivePartners.js` — 5min TTL cache + `invalidatePartnerCache()` | ~353ms → ~1-2ms on repeat |
+| 4 | Duplicate sequential DB calls on every SSR (6 queries per page) | `utils/ssr/getMerchantPageContext.js` — parallel `isShopAvailable` + `isSessionValid`; `loadShopData.js` — parallel `getAppDetails` + `getUserDetails` | ~91ms → ~51-67ms |
+| 5 | No shared SSR pattern for impersonated merchant pages | `utils/ssr/getImpersonatedMerchantPageContext.js` — security gate + identity split | Correctness + maintainability |
+| 6 | Dashboard SSR loading all below-fold widgets synchronously | `ssr: false` + `DashboardWidgetPlaceholder` for 7 components | Faster LCP |
+| 7 | Slow public API endpoints with no internal timing | Added timing to `appStatus`, `moneyFormat`, `themeAppEmbeds` | Debugging |
+| 8 | `useFetch.js` — forced await on non-promise | Cleaned up | Correctness |
+| 9 | `helper.js` — import/export name mismatches | Aligned names | Correctness |
+| 10 | `getEffectiveShopContext.js` — unawaited DB call | Added `await` | Correctness |
 
 ---
 
-## 3. Proposed Solution
+## 2. High Priority Issues (Impact Score: 8-10)
 
-Build a **monthly automated email report** generated and sent entirely from the **analytics Express backend**. The main Next.js app is not involved in report generation or delivery.
+### 2.1 Duplicate DB reads across SSR chain — systemic
 
-**Scope:**
-- **v1:** Monthly recurring report for **Pro analytics merchants only**.
-- **Future (Phase 7):** One-time preview report for **non-Pro merchants** — sent once per shop to showcase analytics value and drive Pro upgrades. Reuses the same HTML pipeline with a reduced content tier.
+**Severity: Critical (duplicates ~4 of 6 DB queries per request)**
 
-### Approach summary
+The SSR pipeline does the same `settings` + `users` queries twice:
+1. `getMerchantPageContext` → `isShopAvailable` → `settings.findUnique` + `users.findUnique`
+2. `loadShopData` → `getAppDetails` → `settings.findUnique` again + `getUserDetails` → `users.findUnique` again
 
-| Concern | Owner |
-|---------|--------|
-| Cron trigger | Google Cloud Scheduler → HTTP POST to analytics backend |
-| Eligibility (Pro plan, email, active) | Analytics backend (query shared MongoDB `users`) |
-| Analytics data | Analytics backend (internal service calls — not self-HTTP) |
-| HTML email rendering | Analytics backend (email-safe HTML) |
-| Email delivery | Analytics backend (Brevo) |
-| Deep link to full dashboard | Main app URL in CTA button only |
+**Fix**: Implement a request-scoped in-memory cache (e.g., `Map<shop, Promise<...>>` with auto-cleanup) so `prisma.settings.findUnique({ where: { shop } })` with the same args during one request resolves from cache.
 
-### Why analytics backend (not main app)?
+**Impact**: Eliminates ~50-100ms of duplicate DB time per SSR.
 
-- Analytics data already lives here; internal calls avoid HTTP round-trips per shop.
-- `suggestions` controller already exists on the same server.
-- Shared MongoDB provides `email`, `bucks_plan`, `shop_owner`, `currency` without cross-service calls.
-- Monthly batch job is naturally co-located with data aggregation.
+### 2.2 `POST /api/v1/public/config.js` + `appStatus.js` — no caching, widget hotpath
 
-### Why HTML-only email (primary)?
+**Severity: Critical (called on every storefront page load)**
 
-- Email clients do not support React, Polaris, or Recharts.
-- Hand-built email HTML can closely match the analytics dashboard design for stats cards, tables, and bar-style chart visualizations.
-- Reliable across Gmail, Outlook, and mobile clients.
-- No Puppeteer/headless browser dependency in production.
+These endpoints hit MongoDB on every widget page load for every store visitor. `config.js` returns ALL settings fields (~50) when the widget likely needs only 5-10.
 
-### What existing systems are reused?
+**Fix**: Add 5-60s TTL in-memory cache + `select` projection to return only needed fields.
 
-- Analytics Express routes/controllers: `getSummary`, `getTrends`, `getRevenueByCurrency`, `getSalesByCountry`, `getSuggestions`
-- Shared MongoDB `users` collection (plan, email, shop domain)
-- `calculateDateRange("last_month")` logic (ported or duplicated in analytics backend)
-- Brevo API pattern (same as main app `mailEngine.js`)
-- Google Cloud Scheduler (existing team pattern)
+### 2.3 `POST /api/v1/public/moneyFormat.js` — Shopify REST call (~1s+), no cache
 
-### What new systems are introduced?
+**Severity: Critical**
 
-- `POST /api/analytics/cron/monthly-report` — secured cron endpoint on analytics backend
-- `monthlyReportService` — orchestrates fetch → render → send per shop
-- `renderMonthlyReportHtml` — email HTML template builders
-- `mailService` — Brevo send wrapper on analytics backend
-- `lastMonthlyReportSentAt` field on `users` (idempotency for Pro monthly sends)
-- `oneTimeAnalyticsReportSentAt` field on `users` (idempotency for non-Pro one-time sends — **future**)
+Every widget page load hits the Shopify REST `shop` endpoint (~1s) for `money_format` + `money_with_currency_format`. Only 2 fields needed from a ~50-field response.
 
-### Architecture diagram
+**Fix**: Per-shop TTL cache (60s) + `select` projection client-side.
 
+### 2.4 `GET /api/v1/public/themeAppEmbeds.js` — 2 sequential Shopify REST calls (~2s+)
+
+**Severity: High**
+
+Two Shopify REST calls (`themes` + `settings_data.json` ~500KB) run **sequentially** and could run in **parallel**. Also no caching, and fetches entire `settings_data.json` just for one boolean.
+
+**Fix**: Parallelize the two REST calls + per-shop TTL cache (300s) + extract only the single boolean needed from the response.
+
+### 2.5 `sessionHandler.storeSession` — `expires` field never persisted
+
+**Severity: High (session expiry check is unreliable)**
+
+`storeSession`'s upsert (lines 14-28) does not store `session.expires`. `isSessionValid` calls `new Date(session?.expires) < new Date()` which checks a field that's always `undefined` in persisted sessions. This means sessions never appear expired from DB data alone.
+
+**Fix**: Add `expires: session.expires` to both `update` and `create` blocks of the upsert.
+
+### 2.6 `@sentry/browser` — static imports in 3 components (~80KB in critical bundle)
+
+**Severity: High**
+
+`PartnerPromoBanner.jsx`, `AnalyticsBanner/index.jsx`, and `pages/analytics/index.jsx` import Sentry eagerly. Only `onBoardingCard.jsx` does it correctly with a dynamic `import()`.
+
+**Fix**: Convert all Sentry imports to dynamic. Saves ~80KB gzipped from critical path.
+
+### 2.7 `react-query` — installed but never used
+
+**Severity: High (dead ~13KB dependency + manual fetch everywhere)**
+
+`react-query@3.39.3` exists in `package.json` and QueryClient is created in `_app.js`, but ZERO components use it. Manual `useFetch` hooks with no caching, dedup, or retry are used instead.
+
+**Fix**: Either remove it (saves bundle), or migrate analytics page + widget data fetching to React Query (saves boilerplate + adds caching).
+
+### 2.8 `POST /api/v1/user/dashboardSection.js` — NoSQL injection vulnerability
+
+**Severity: Critical (security)**
+
+```js
+data: { [section]: value }  // section comes from req.body unfiltered
 ```
-┌──────────────────────────┐
-│  Google Cloud Scheduler   │
-│  Schedule: 0 9 1 * *      │
-└────────────┬─────────────┘
-             │ POST /api/analytics/cron/monthly-report
-             │ Authorization: Bearer CRON_SECRET
-             ▼
-┌──────────────────────────────────────────────────────────┐
-│  Analytics Express Backend                                │
-│                                                           │
-│  1. Verify CRON_SECRET                                    │
-│  2. Query MongoDB users (Pro plan + active + email)       │
-│  3. For each shop (batched):                              │
-│     a. Internal: getSummary, getTrends, getRevenue...     │
-│     b. Internal: getSuggestions                           │
-│     c. renderMonthlyReportHtml()                          │
-│     d. send via Brevo                                     │
-│     e. Update lastMonthlyReportSentAt                     │
-└──────────────────────────────────────────────────────────┘
-             │
-             ▼
-┌──────────────────────────┐     ┌──────────────────────────┐
-│  MongoDB (shared)         │     │  Brevo (transactional)    │
-│  users collection         │     │  merchant inbox           │
-└──────────────────────────┘     └──────────────────────────┘
-```
+An attacker can set arbitrary user document fields.
 
-### Edge cases & limitations
+**Fix**: Whitelist allowed `section` values.
 
-| Case | Handling |
-|------|----------|
-| No analytics activity in period | Send report with zeros + encouragement copy |
-| Missing email on user | Skip shop, log |
-| User not on Pro plan | Excluded by query filter |
-| User uninstalled (`is_active: false`) | Excluded by query filter |
-| Analytics query fails for one shop | Retry 3×, skip, continue batch, log error |
-| Duplicate cron trigger | `lastMonthlyReportSentAt` idempotency check |
-| Large merchant count | Process in batches of 10 with 1s inter-batch delay; return job summary JSON |
-| Brevo daily limit hit mid-job | Abort batch loop immediately; return HTTP 500 so Cloud Scheduler retries after 1hr |
-| Charts in email | HTML bar/table visualizations — not interactive Recharts |
-| Outlook CSS limitations | Table-based layout, inline styles only |
+### 2.9 No rate limiting on any public endpoint
 
-### Migrations from existing
+**Severity: High (no protection against traffic spikes/abuse)**
 
-- No changes to existing analytics tracking endpoints (`/track-visit`, `/order`, etc.).
-- No changes to main app analytics proxy or dashboard UI.
-- Main app only needs `SHOPIFY_APP_URL` referenced in email CTA link (env var on analytics backend).
+All `/api/v1/public/*` endpoints are internet-facing with zero rate limiting.
+
+**Fix**: Add in-memory rate limiter (e.g., sliding window per IP + per shop) to the public endpoints.
 
 ---
 
-## 4. End-to-End Flow
+## 3. Medium Priority Issues (Impact Score: 5-7)
 
-### Merchant flow (admin)
+### 3.1 Admin import runs sequentially before data fetch on 6 pages
 
-1. Merchant is on Pro analytics plan (`bucks_premium_pro`, `bucks_premium_pro_annual_60`, or `bucks_premium_pro_annual_65`).
-2. On the **1st of each month**, merchant receives email: **"Your BUCKS Analytics Report — [Month Year]"**.
-3. Email contains:
-   - Greeting with shop owner name
-   - 4 stat cards (visits, currency clicks, total sales, top currency)
-   - Currency conversion trends (HTML horizontal bars, top 5)
-   - Revenue by currency breakdown (HTML table with % bars)
-   - Top sales by currency and country tables
-   - Smart recommendations (from `suggestions` API)
-   - **"View full analytics"** button → main app `/analytics?shop=...`
-4. Merchant takes no action to opt in for v1 (automatic for eligible Pro users).
-
-### Customer flow (storefront)
-
-No storefront impact. Report is merchant-facing only.
-
-### Technical flow
-
-```
-Day 1 of month, 09:00 UTC
-  → Cloud Scheduler fires POST to analytics backend
-  → Endpoint validates Bearer CRON_SECRET
-  → Query: users where bucks_plan IN PRO_ANALYTICS_PLANS
-           AND is_active = true
-           AND (email OR customer_email) IS NOT empty
-           AND lastMonthlyReportSentAt < start of current month
-  → For each shop (batch of 10, 1s delay between batches):
-       startDate/endDate = previous calendar month (UTC)
-       summary    = getSummary(shop, dates)      // internal
-       trends     = getTrends(shop, dates)       // internal
-       revenue    = getRevenueByCurrency(...)    // internal
-       countries  = getSalesByCountry(...)       // internal
-       suggestions = suggestions_cache query     // check expires_at > now, ignore rangeKey
-                     fallback: getSuggestions(shop, dates) if no valid cache
-       html = renderMonthlyReportHtml(payload)
-       brevo.send({ to: email, html, subject })
-       if brevo returns 429 → abort entire job → return HTTP 500 (Cloud Scheduler retries)
-       users.update({ lastMonthlyReportSentAt: now })
-  → Notify Slack: { sent, failed, skipped, durationMs, limitReached }
-  → Return { sent, failed, skipped, duration, limitReached }
+`pages/index.jsx`, `settings`, `pricing`, `currency-rules`, `advanced`, `partners` all do:
+```js
+const admin = await import("@/utils/admin/isSuperAdmin");
+// ... check admin sync ...
+const data = await loadShopData(shop); // runs second
 ```
 
-### Authentication flow (Cloud Scheduler → API)
+**Fix**: Wrap admin import + data fetch in `Promise.all`. Saves ~50-100ms on first load.
 
+### 3.2 Onboarding step conversion logic duplicated across 2 pages (~38 lines each)
+
+`pages/settings/index.jsx` lines 43-80 and `pages/advanced/index.jsx` lines 48-86 are near-identical `onBoardDbConversion` + `bucksEmbedAppCheck` + `moneyFormatStatus` mutations.
+
+**Fix**: Extract to `syncOnboardingProgress(userData, settings, extensionStatus, moneyFormat)`.
+
+### 3.3 Pricing redirect date inconsistency
+
+`pages/settings/index.jsx` uses `2025-03-07T03:05:00.000Z` while all other pages use `2025-03-06T03:05:00.000Z`. Likely a bug causing settings page to apply the redirect check for an extra day.
+
+**Fix**: Standardize to one date across all pages.
+
+### 3.4 Pricing redirect check duplicated across 5 pages
+
+Same `!userData?.bucks_plan && last_installed > 2025-03-06` logic copy-pasted in `index.jsx`, `settings`, `advanced`, `currency-rules`, `analytics`.
+
+**Fix**: Extract to `checkPricingRedirect(userData)`.
+
+### 3.5 `pages/partners/index.jsx` — fetch data potentially unused by component
+
+Calls `loadShopData(shop)` which fetches `settings` + `userData`, but the component only destructures `superAdmin`/`canImpersonate` from `initialData`.
+
+**Fix**: Verify data usage. If unused, skip the DB query entirely.
+
+### 3.6 `themeAppEmbeds.js` line 54 — typo `trialStartDat` instead of `trialStartDate`
+
+**Fix**: Fix the typo so the field serializes correctly.
+
+### 3.7 `pages/index.jsx` — not using `getMerchantPageContext`
+
+The dashboard (highest-traffic page) has ~100 lines of inline SSR logic duplicating exactly what `getMerchantPageContext` provides.
+
+**Fix**: Migrate to `getMerchantPageContext` and add partner banner fetches in a parallel batch.
+
+### 3.8 `helper.js` — `filterDbData` mutates caller's object
+
+```js
+keysToRemove.forEach(key => delete data[key]);  // mutates input!
+// then builds filtered copy via .filter()  // renders the delete loop pointless
 ```
-Cloud Scheduler job:
-  Method:  POST
-  URL:     https://analytics.bucks.helixo.co/api/analytics/cron/monthly-report
-  Header:  Authorization: Bearer <CRON_SECRET>
-  Body:    {} (optional: { "dryRun": true, "shop": "test.myshopify.com" })
 
-Analytics endpoint:
-  if Authorization !== Bearer CRON_SECRET → 401
-  if method !== POST → 405
-  else → run job
-```
+**Fix**: Remove the mutation loop — only the `.filter()` is needed.
 
-`CRON_SECRET` stored in:
-- GCP Secret Manager (Scheduler job header)
-- Analytics backend environment variable
+### 3.9 `getEffectiveShopContext.js` — two sequential `users` queries instead of one
 
-### Email content structure (HTML)
+`getUserDetails(merchant)` (excludes `accessToken`) → then `prisma.users.findUnique({ accessToken: true })` as a separate query.
 
-```
-┌─────────────────────────────────────────┐
-│  BUCKS logo + "Your May 2026 Report"    │
-├─────────────────────────────────────────┤
-│  Hi {shop_owner},                       │
-│  Here's how {shop} performed last month │
-├─────────────────────────────────────────┤
-│  [Visits] [Clicks] [Sales] [Top CCY]   │  ← 2×2 table cards
-├─────────────────────────────────────────┤
-│  Currency Conversion Trends             │  ← HTML horizontal bars
-├─────────────────────────────────────────┤
-│  Revenue by Currency                    │  ← HTML % breakdown table
-├─────────────────────────────────────────┤
-│  Sales by Currency | Sales by Country   │  ← HTML tables (top 5)
-├─────────────────────────────────────────┤
-│  Recommendations (1–3 items)            │  ← title + description
-├─────────────────────────────────────────┤
-│  [ View full analytics → ]              │  ← CTA to main app
-└─────────────────────────────────────────┘
-```
+**Fix**: Merge into a single query that includes `accessToken`, then strip before returning.
+
+### 3.10 `pages/admin/partners/index.jsx` and `[id].jsx` — no timing instrumentation
+
+The only pages completely missing debug timing.
+
+**Fix**: Add `startDebugTimer` + `timeAsync`.
+
+### 3.11 Recharts (~50KB) — analytics charts dynamically imported (good) but charts themselves re-render unnecessarily
+
+`ConversionTrendsChart.jsx` and `RevenueByCurrencyChart.jsx` have no `React.memo`. They re-render on every parent update even with the same `data` prop.
+
+**Fix**: Add `React.memo` to both chart components.
+
+### 3.12 `TourGuide` — statically imported on analytics page, used conditionally
+
+`import TourGuide` at top of `pages/analytics/index.jsx`, but only rendered when `runTour && !suggestionsLoading` (most users see it once or never).
+
+**Fix**: Dynamically import with `dynamic(() => import(...))`.
+
+### 3.13 `_app.js` line 30 — orphan `console.log(test)`
+
+**Fix**: Remove the debug log.
+
+### 3.14 `deleteSession` uses `deleteMany` on unique field
+
+`sessionHandler.js` line 75: `deleteMany({ where: { id } })` — `id` is likely unique. Should use `delete`.
+
+### 3.15 `isSuperAdmin.js` — env vars re-parsed on every function call
+
+`parseShopList(process.env.SUPER_ADMIN_DOMAINS)` called every time `isSuperAdmin`, `getImpersonatorStores`, or `isImpersonator` is invoked. Env vars are static at runtime.
+
+**Fix**: Parse once at module load.
 
 ---
 
-## 5. Implementation Details
+## 4. Low Priority Issues (Impact Score: 3-4)
 
-### Data model changes
+### 4.1 Inconsistent error response shapes
 
-**MongoDB `users` collection** (shared, via Prisma on main app — analytics backend reads/writes same field):
+Some endpoints return `{ error, message }` JSON, others return plain text `res.status(400).send("message")`, some return empty `res.status(400).send()`. Inconsistent across billing, user, and settings endpoints.
 
-```prisma
-// prisma/schema.prisma — add to users model
-lastMonthlyReportSentAt       DateTime?   // Pro monthly report idempotency
-oneTimeAnalyticsReportSentAt  DateTime?   // Non-Pro one-time report idempotency (future)
-monthlyReportOptOut           Boolean?  @default(false)  // optional v2
+### 4.2 `checkBucksExtension` in `helper.js` makes HTTP call to own server
+
+```js
+httpProvider("GET", '/api/v1/public/themeAppEmbeds', fetch)
 ```
+This is an internal round-trip (adds latency + serialization overhead). Instead, inline the logic.
 
-Analytics backend uses native MongoDB driver or existing DB client to read/write this field.
+### 4.3 `crisp-sdk-web` imported eagerly in `closePopover.jsx`
 
-### Backend changes (Analytics Express)
+Rarely used (click feedback handler) but imported at the top level. Dynamic import would be cleaner.
 
-#### New files
+### 4.4 `canvas-confetti` eagerly imported in `PricingCard.jsx`
 
-| File | Responsibility |
-|------|----------------|
-| `services/monthlyReportService.js` | Orchestrate per-shop report: fetch → render → send |
-| `services/monthlyReportData.js` | Call internal controllers/services for all endpoints |
-| `email/renderMonthlyReportHtml.js` | Compose full HTML email |
-| `email/partials/statsCardsHtml.js` | 4 stat cards (table layout) |
-| `email/partials/conversionTrendsHtml.js` | HTML horizontal bar chart |
-| `email/partials/revenueByCurrencyHtml.js` | % breakdown table |
-| `email/partials/performanceTablesHtml.js` | Top 5 currency + country tables |
-| `email/partials/recommendationsHtml.js` | Suggestions section |
-| `services/mailService.js` | Brevo send wrapper |
-| `middleware/cronAuth.js` | Verify `CRON_SECRET` |
-| `controllers/monthlyReportController.js` | HTTP handler for cron endpoint |
+Only needed when user applies a coupon. Dynamic import saves ~8KB.
 
-#### New route
+### 4.5 `react-iframe` imported in preview component
 
-Add to `analyticsRoutes`:
+`react-iframe` (~15KB) is a heavy wrapper for a native `<iframe>`. The component also has an unnecessary re-render issue (see below).
 
-```ts
-import { cronAuth } from "../middleware/cronAuth";
-import { runMonthlyReport } from "../controllers/monthlyReportController";
+### 4.6 `preview-iframe` — `useEffect` triggers on unrelated store updates
 
-router.post("/cron/monthly-report", cronAuth, runMonthlyReport);
-```
+`[userSettings, userDataGlobal]` dependencies — `userDataGlobal` is a Zustand store that changes reference on any unrelated update, causing iframe `postMessage` to fire unnecessarily.
 
-Full path: `POST /api/analytics/cron/monthly-report`
+**Fix**: Use a stable reference or compare specific fields.
 
-#### Internal data fetch (do NOT self-HTTP)
+### 4.7 `SelectCurrencies.jsx` — large array filtering on every keystroke
 
-```ts
-// monthlyReportData.ts — call controller logic directly
-import { getSummaryData } from "../controllers/analyticsFetchController";
-// OR extract shared service layer from existing controllers
+130-item currency list re-filtered via `RegExp` on every keystroke. Consider debouncing or memoizing.
 
-export async function fetchMonthlyReportPayload(shop: string) {
-  const { startDate, endDate, periodLabel } = getLastMonthRange();
+### 4.8 `CollapsibleCard.jsx` — 18 `useState` hooks, complex lifecycle
 
-  const [summary, trends, revenue, countries, suggestions] = await Promise.all([
-    analyticsService.getSummary(shop, startDate, endDate),
-    analyticsService.getTrends(shop, startDate, endDate),
-    analyticsService.getRevenueByCurrency(shop, startDate, endDate),
-    analyticsService.getSalesByCountry(shop, startDate, endDate),
-    suggestionsService.getSuggestions(shop, "last_month"),
-  ]);
+Unusually high state count for a single component. Susceptible to stale closures.
 
-  return { shop, periodLabel, startDate, endDate, summary, trends, revenue, countries, suggestions };
-}
-```
+### 4.9 Webhook routes missing HMAC validation
 
-Refactor existing `analyticsFetchController` functions into a shared `analyticsService` if they are currently tied to `req/res` — this is the main structural change on the analytics backend.
-
-#### Eligibility query
-
-```ts
-const PRO_ANALYTICS_PLANS = [
-  "bucks_premium_pro",
-  "bucks_premium_pro_annual_60",
-  "bucks_premium_pro_annual_65",
-];
-
-const users = await db.users.find({
-  bucks_plan: { $in: PRO_ANALYTICS_PLANS },
-  is_active: true,
-  $or: [{ email: { $ne: "" } }, { customer_email: { $ne: "" } }],
-  monthlyReportOptOut: { $ne: true },
-  $or: [
-    { lastMonthlyReportSentAt: null },
-    { lastMonthlyReportSentAt: { $lt: startOfCurrentMonth } },
-  ],
-});
-```
-
-#### Cron controller
-
-```ts
-export async function runMonthlyReport(req: Request, res: Response) {
-  const { dryRun, shop: singleShop } = req.body ?? {};
-
-  const users = singleShop
-    ? await getUserByShop(singleShop)
-    : await getEligibleProUsers();
-
-  const results = { sent: 0, failed: 0, skipped: 0, errors: [] };
-
-  for (const user of users) {
-    try {
-      const payload = await fetchMonthlyReportPayload(user.myshopify_domain);
-      const html = renderMonthlyReportHtml(payload, user);
-
-      if (dryRun) {
-        results.skipped++;
-        continue; // or save HTML to /tmp for preview
-      }
-
-      await mailService.sendMonthlyReport(user, html, payload.periodLabel);
-      await markReportSent(user.myshopify_domain);
-      results.sent++;
-    } catch (err) {
-      results.failed++;
-      results.errors.push({ shop: user.myshopify_domain, error: err.message });
-    }
-  }
-
-  return res.status(200).json(results);
-}
-```
-
-#### Environment variables (analytics backend)
-
-```env
-CRON_SECRET=                          # shared with Cloud Scheduler
-BREVO_API_KEY=                        # transactional email
-SHOPIFY_APP_URL=                      # CTA link base
-MONTHLY_REPORT_FROM_EMAIL=reports@bucks.com
-MONTHLY_REPORT_FROM_NAME=BUCKS
-SLACK_WEBHOOK_URL=                    # Slack incoming webhook for job completion notifications
-```
-
-### Frontend changes (main app)
-
-**None required for v1.**
-
-Optional later:
-- Settings toggle for `monthlyReportOptOut` on main app settings page
-- Analytics page banner: "Your monthly report was sent on [date]"
-
-### HTML email design spec
-
-| Element | Value |
-|---------|-------|
-| Max width | 600px |
-| Font | Inter, Arial, sans-serif |
-| Card border-radius | 12px |
-| Title text | 12px, `#303030A6` |
-| Value text | 14px bold, `#303030` |
-| CTA button | `#008060` background, white text |
-| Bar chart colors | Match `getColorForCurrency()` palette |
-| Section order | Stats → Trends → Revenue → Tables → Recommendations → CTA |
-
-### Edge cases & special handling
-
-| Scenario | Behavior |
-|----------|----------|
-| `dryRun: true` in request body | Render report, do not send email, do not update `lastMonthlyReportSentAt` |
-| `shop` in request body | Process single shop only (for testing) |
-| Zero data | Show empty-state copy matching in-app analytics |
-| Suggestions empty | Hide recommendations section |
-| Brevo 429 / daily limit | Throw `BREVO_RATE_LIMIT` prefixed error; abort batch loop immediately; return HTTP 500 to Cloud Scheduler for retry |
-| Brevo failure (non-limit) | Log error, do not update `lastMonthlyReportSentAt`, retry 3× with exponential backoff (1s, 2s), count as failed |
-| Scheduler timeout | Design endpoint to complete within Scheduler HTTP timeout, or process in chunks with `?offset=0&limit=50` and chain Scheduler jobs |
-| Secret rotation | Update both GCP Secret Manager and analytics env; old secret invalid immediately |
-
-### Security
-
-- `POST` only on cron endpoint
-- `CRON_SECRET` verified on every request (constant-time compare)
-- No shop data exposed in cron response (only counts + shop domains in error log server-side)
-- Email contains only that merchant's own data
-- Preview/dry-run endpoint disabled in production unless `CRON_SECRET` provided
-
-### Monitoring
-
-- Log job summary: `{ sent, failed, skipped, durationMs, limitReached }`
-- Alert if `failed > 0` or `sent === 0` when eligible users exist
-- **Slack notification on job completion** (same `fetch` + blocks pattern as main app `logInstallToSlack`): post to `SLACK_WEBHOOK_URL` with sent/failed/skipped counts, duration, `limitReached` flag, and list of failed shops. Fire-and-forget — Slack failure must never affect the HTTP response to Cloud Scheduler.
+`pages/api/webhooks.js` and `[...webhookTopic].js` lack the `verifyHmac` middleware that the `v1/hooks/*` routes have.
 
 ---
 
-## 6. Known Improvements — Next Iteration
+## 5. Quick Wins (Low Effort, Measurable Impact)
 
-### GraphQL shop status filter (eligibility hardening)
-
-**Problem:** The current eligibility query filters by `is_active: true` in MongoDB, but this field is set by the main app based on install/uninstall events. It does **not** reflect the actual Shopify store status — a store can be frozen, paused, closed, or under Shopify's review without `is_active` being updated in our DB.
-
-**Impact:** Emails sent to closed/frozen stores are wasted sends and may bounce, harming sender domain reputation.
-
-**Proposed fix (next iteration):**  
-After fetching eligible users from MongoDB, add a secondary filter step using the **Shopify Admin GraphQL API** (`shop` query or `Shop` object) to verify the store's current status before sending. Stores with status `FROZEN`, `PAUSED`, or `CLOSED` should be excluded.
-
-```graphql
-query {
-  shop {
-    myshopifyDomain
-    plan {
-      displayName
-    }
-  }
-}
-```
-
-This requires one GraphQL call per shop using the stored `accessToken`. To avoid N requests serially, batch these in parallel alongside the analytics data fetch within the existing `Promise.all` in `fetchMonthlyReportPayload`.
-
-**Why deferred:**  
-- Adds N Shopify API calls to the cron job (rate limit risk)
-- Requires access token validity checks
-- Current `is_active` filter already excludes explicitly uninstalled shops  
-- Can be added as a non-breaking pre-filter step in a future release without changing the core email pipeline
+| Rank | Task | Files | Est. Time | Impact |
+|------|------|-------|-----------|--------|
+| 1 | Fix `expires` field not persisted in `storeSession` | `utils/sessionHandler.js` | 5 min | Session expiry correctness |
+| 2 | Add rate limiting to public endpoints | `middleware/rateLimit.js` + public routes | 30 min | Abuse prevention |
+| 3 | Fix NoSQL injection in `dashboardSection.js` | `pages/api/v1/user/dashboardSection.js` | 5 min | Security |
+| 4 | Add 60s TTL cache to widget hotpath endpoints | `config.js`, `appStatus.js` | 30 min | Reduces DB load 10-100x |
+| 5 | Parallelize admin imports on 6 pages | `pages/settings`, `pricing`, `currency-rules`, `advanced`, `partners`, `index` | 20 min | Saves ~50ms per SSR |
+| 6 | Fix pricing date inconsistency | `pages/settings/index.jsx` | 2 min | Correctness |
+| 7 | Merge duplicate `users` queries in `getEffectiveShopContext` | `utils/admin/getEffectiveShopContext.js` | 10 min | Saves 1 DB round-trip |
+| 8 | Remove debug `console.log(test)` | `utils/sessionHandler.js` | 1 min | Cleanup |
+| 9 | Fix `filterDbData` object mutation | `utils/helper.js` | 5 min | Correctness |
+| 10 | Convert Sentry imports to dynamic | `PartnerPromoBanner.jsx`, `AnalyticsBanner/index.jsx` | 15 min | Saves ~80KB bundle |
+| 11 | Dynamically import TourGuide | `pages/analytics/index.jsx` | 5 min | Saves ~30KB bundle |
+| 12 | Add timing to `admin/partners` pages | `admin/partners/index.jsx`, `[id].jsx` | 10 min | Debugging |
+| 13 | Memoize env var parsing in `isSuperAdmin.js` | `utils/admin/isSuperAdmin.js` | 5 min | Micro-optimization |
+| 14 | Fix `trialStartDat` typo | `pages/currency-rules/index.jsx` | 2 min | Correctness |
 
 ---
 
-## 7. Open Questions
+## 6. Architecture Recommendations (Medium-Long Term)
 
-1. **Opt-out in v1?** Send automatically to all Pro users, or add Settings toggle before launch?
-2. **Send time/timezone?** 09:00 UTC on the 1st — or adjust per merchant timezone later?
-3. **Brevo template vs raw HTML?** Code-generated HTML (faster v1) vs designed Brevo template (easier marketing edits)?
-4. **Empty month behavior?** Still send "quiet month" email, or skip merchants with zero visits?
-5. **Scheduler timeout at scale?** How many Pro merchants today? Do we need chunked Scheduler jobs?
-6. **Success metrics?** Track email open rate (Brevo), CTA clicks (UTM params), analytics page visits post-send?
-7. **Non-Pro one-time trigger (future)?** Send after N days on free plan, after first analytics activity threshold, or as a one-time campaign? *(See Phase 7)*
+### 6.1 Implement request-scoped DB cache
+Use `AsyncLocalStorage` + `Map<string, Promise>` to memoize `prisma.settings.findUnique({ where: { shop } })`, `prisma.users.findUnique(...)`, and `loadSessionWithShop(shop)` for the duration of a single SSR request. This eliminates ~4 duplicate DB queries per page load.
 
----
+### 6.2 Adopt React Query for client-side data fetching
+Replace manual `useFetch` + ad-hoc `useEffect` fetch patterns (especially on analytics page and widget hotpath API calls) with `react-query` — it's already installed. Gains: auto-caching, deduplication, retry, background refetch.
 
-## Implementation Plan
+### 6.3 Add React.memo strategically
+Zero components use `React.memo`. Adding it to chart components, `PricingCard`, `StatsCards`, and `PerformanceTables` would reduce unnecessary re-renders across navigation.
 
-| Phase | Goal | Scope |
-|-------|------|-------|
-| **Phase 1** | Data layer + internal service refactor | Extract `analyticsService` from controllers; `fetchMonthlyReportPayload`; `getLastMonthRange` |
-| **Phase 2** | HTML email renderer | All partials + `renderMonthlyReportHtml`; preview via `dryRun` endpoint |
-| **Phase 3** | Send + cron | `mailService` (Brevo), `cronAuth`, `POST /cron/monthly-report`, `lastMonthlyReportSentAt` |
-| **Phase 4** | Cloud Scheduler + staging test | Configure Scheduler job; test with 1 shop; test in Gmail + Outlook |
-| **Phase 5** | Production rollout | Enable for all Pro merchants; monitor first run |
-| **Phase 6 (optional)** | Merchant opt-out + metrics | Settings toggle, UTM tracking, Brevo template migration |
-| **Phase 7 (future)** | One-time report for non-Pro merchants | Reduced-content preview email, upgrade CTA, send-once idempotency |
+### 6.4 Consolidate partner banner queries
+`pages/index.jsx` makes 3 separate `getActivePartners` DB queries for different categories. Accept an array of categories to combine into 1 query.
 
-Each phase ships independently. Phase 1–3 can be tested locally without Scheduler.
+### 6.5 Standardize API error response format
+All API endpoints should return `{ error: boolean, message: string }` JSON consistently. Currently billing endpoints use text, user endpoints use empty 400s, public endpoints use JSON — a mix of 3 patterns.
 
----
-
-## Future Enhancement: One-Time Report for Non-Pro Merchants (Phase 7)
-
-After the Pro monthly report is stable, extend the same analytics backend pipeline to send a **single preview report** to non-Pro merchants. This is an upgrade funnel touchpoint — not a recurring monthly email.
-
-### Goal
-
-Give free and non-Pro paid merchants a **one-time taste** of analytics value, using data they already have access to (summary tier), and encourage upgrade to Pro for full charts, tables, and monthly reports.
-
-### How it differs from Pro monthly report
-
-| Aspect | Pro monthly report (v1) | Non-Pro one-time report (future) |
-|--------|-------------------------|----------------------------------|
-| **Frequency** | Every month (1st) | **Once per shop, ever** |
-| **Eligibility** | `bucks_premium_pro*` | Active merchants **not** on Pro analytics plans |
-| **Data fetched** | summary + trends + revenue + country + suggestions | **summary only** (matches in-app limited analytics) |
-| **Email content** | Full report (cards, charts, tables, recommendations) | Stats cards + short insight copy + **upgrade CTA** |
-| **Idempotency field** | `lastMonthlyReportSentAt` | `oneTimeAnalyticsReportSentAt` |
-| **Trigger** | Cloud Scheduler monthly cron | TBD — event-based or one-time campaign job |
-| **CTA** | "View full analytics" | "Upgrade to Pro analytics" → `/pricing?shop=...` |
-
-### Proposed non-Pro email content
-
-```
-┌─────────────────────────────────────────┐
-│  BUCKS logo + "Your Store Snapshot"     │
-├─────────────────────────────────────────┤
-│  Hi {shop_owner},                       │
-│  Here's a snapshot of how {shop} is     │
-│  performing with BUCKS                  │
-├─────────────────────────────────────────┤
-│  [Visits] [Clicks] [Sales] [Top CCY]   │  ← summary stats only
-├─────────────────────────────────────────┤
-│  "Unlock full analytics — see trends,   │
-│   revenue by currency, country          │
-│   breakdown, and smart recommendations" │
-├─────────────────────────────────────────┤
-│  [ Upgrade to Pro analytics → ]         │  ← pricing page
-└─────────────────────────────────────────┘
-```
-
-No trends charts, performance tables, or suggestions in the non-Pro email — those are Pro-only features in the app today.
-
-### Eligibility query (future)
-
-```ts
-const PRO_ANALYTICS_PLANS = [
-  "bucks_premium_pro",
-  "bucks_premium_pro_annual_60",
-  "bucks_premium_pro_annual_65",
-];
-
-const users = await db.users.find({
-  bucks_plan: { $nin: PRO_ANALYTICS_PLANS },
-  is_active: true,
-  oneTimeAnalyticsReportSentAt: null,  // never sent before
-  $or: [{ email: { $ne: "" } }, { customer_email: { $ne: "" } }],
-  // optional: minimum activity threshold
-  // e.g. totalVisits > 0 in last 30 days
-});
-```
-
-### Trigger options (to decide in Phase 7)
-
-| Option | Description |
-|--------|-------------|
-| **A — Time-based** | Send once 30 days after install if still non-Pro |
-| **B — Activity-based** | Send once when shop hits N visits or N currency clicks |
-| **C — One-time campaign** | Manual Cloud Scheduler job / admin trigger for existing non-Pro base |
-| **D — On analytics page first visit** | Queue send 24h after merchant first opens `/analytics` |
-
-Recommendation: start with **Option C** (controlled rollout) before automating A or B.
-
-### Backend changes (future, reuses v1 infrastructure)
-
-| Component | Change |
-|-----------|--------|
-| `monthlyReportService` | Generalize to `reportService` with `reportType: 'monthly_pro' \| 'one_time_preview'` |
-| `fetchMonthlyReportPayload` | Add `fetchPreviewReportPayload` — summary only |
-| `renderMonthlyReportHtml` | Add `renderPreviewReportHtml` — reduced template + upgrade CTA |
-| `POST /cron/monthly-report` | Unchanged (Pro only) |
-| `POST /cron/one-time-preview-report` | **New** secured endpoint for non-Pro one-time sends |
-| `users.oneTimeAnalyticsReportSentAt` | Set on successful send; never send again |
-
-### Edge cases (non-Pro one-time)
-
-| Case | Handling |
-|------|----------|
-| Merchant upgrades to Pro before send | Skip one-time preview; they receive Pro monthly report instead |
-| Merchant already received preview | `oneTimeAnalyticsReportSentAt` set — never resend |
-| Zero activity | Skip or send with empty-state + upgrade message (TBD) |
-| Merchant uninstalls | `is_active: false` — exclude |
-
-### Success metrics (future)
-
-- One-time email open rate
-- Upgrade CTA click-through to pricing
-- Pro plan conversion rate within 30 days of preview send
-- Compare: merchants who received preview vs control group
-
-### Testing checklist
-
-- [ ] `dryRun` + single `shop` returns expected HTML payload
-- [ ] Stats numbers match dashboard for same shop + `last_month`
-- [ ] Email renders correctly in Gmail (web + mobile)
-- [ ] Email renders correctly in Outlook
-- [ ] `CRON_SECRET` rejection returns 401
-- [ ] Second cron run same month skips already-sent shops
-- [ ] Merchant with no data receives valid empty-state email
-- [ ] CTA link opens correct shop in main app analytics
-
----
-
-## Optional Future Enhancement: Screenshot Fallback
-
-If HTML bar charts are not visually acceptable after QA, a secondary approach can capture chart sections from a dedicated read-only report page using Puppeteer/Playwright and embed as `<img>` in the email. This is **not part of v1** and should only be considered if HTML chart visualizations fail design review in Gmail/Outlook. The primary and recommended path remains HTML-only rendering.
-
----
-
-## References
-
-- Analytics routes: `POST/GET /api/analytics/*` (Express backend)
-- Main app analytics proxy: `pages/api/v1/analytics/proxy.js` (unchanged)
-- Pro plan filter: `bucks_premium_pro`, `bucks_premium_pro_annual_60`, `bucks_premium_pro_annual_65`
-- Non-Pro preview (future): all active merchants not in Pro analytics plans; `oneTimeAnalyticsReportSentAt` for send-once
-- Date range: `last_month` (previous calendar month, UTC) for Pro monthly; `last_30_days` TBD for non-Pro preview
-- Brevo pattern: `utils/mailEngine.js` (main app — reference for analytics `mailService`)
-- Cloud Scheduler auth: `Authorization: Bearer CRON_SECRET`
+### 6.6 Add HMAC verification to legacy webhook routes
+`pages/api/webhooks.js` and `[...webhookTopic].js` are missing `verifyHmac` middleware present in `v1/hooks/*`.
