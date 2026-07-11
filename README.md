@@ -1,339 +1,374 @@
-# Active Users Retrieval
+# Webhook Update System
 
 ## Overview
 
-Active users retrieval is a background process that extracts accounts marked active in a datastore, verifies that each account still exists and is reachable through the platform API, and writes the confirmed real active accounts to a downloadable output file such as CSV.
+A webhook update system bulk-updates webhook subscription callback URLs across many tenant accounts. It reads target accounts from a source such as CSV or a database, looks up each account's API credentials, finds existing webhook subscriptions by topic, updates callback URLs when needed, and records the result for audit and retry purposes.
 
-This pattern is useful for operational tasks, migrations, audits, reporting, customer outreach, and any workflow that needs an up-to-date list of valid active accounts without blocking an HTTP request.
+This pattern is useful when an application changes webhook infrastructure, migrates domains, standardizes callback routes, or needs to repair webhook subscriptions across installed accounts.
 
 ## Purpose
 
-Applications often store an `isActive`, `status`, or subscription state locally, but local state can drift from reality. For example, an account may still be marked active in the database even if the underlying shop or tenant was closed, deleted, expired, transferred, or is no longer accessible with the stored credentials.
+Webhook URLs often need to change when infrastructure changes. Updating them manually account-by-account is slow and error-prone. A bulk update system provides a safe, repeatable workflow that:
 
-The main purpose of this implementation is to treat database-active users as candidates, then confirm real active users by calling the authoritative platform API. A retrieval process helps produce a reliable active-user list by combining:
-
-- A local database filter for likely active accounts.
-- Cursor-based pagination for large datasets.
-- External validation using each account's API credentials.
-- Batched output writing to avoid high memory usage.
-- Background execution so long-running exports do not time out.
-- Detailed progress logs for operational visibility during long runs.
-
-This is needed when the account list may contain thousands of records, local active status cannot be fully trusted, external validation is slow, or the result needs to be consumed by other operational processes.
+- Processes many accounts without blocking a request.
+- Updates only existing webhook subscriptions.
+- Skips subscriptions that already point to the correct URL.
+- Controls API concurrency and rate-limit pressure.
+- Tracks progress and per-topic outcomes.
+- Supports stopping the migration safely.
+- Produces an audit file for completed, skipped, and failed updates.
 
 ## High-Level Flow
 
-1. Start the export from an admin endpoint, CLI command, or scheduled job.
-2. Immediately return a response if triggered through HTTP.
-3. Query active users in batches using cursor-based pagination.
-4. For each batch, process users with a controlled concurrency limit.
-5. Skip records missing required identifiers or credentials.
-6. Call an external account API to confirm the account is a real, reachable active account.
-7. Append valid records to a CSV or another output sink.
-8. Track success and failure counts.
-9. Log each major step, batch, success, failure, pause, and final summary.
-10. Allow the process to be stopped safely between batches or chunks.
-11. Expose a download endpoint or storage location for the generated file.
+1. Define a mapping of webhook topics to their new callback URLs.
+2. Start a background update job from an admin endpoint, CLI command, or scheduled worker.
+3. Read account identifiers from CSV, database query, or queue input.
+4. Load active accounts and API credentials from the datastore.
+5. Optionally filter accounts by install date, plan, region, or migration eligibility.
+6. Process accounts in batches with a fixed concurrency limit.
+7. For each account and topic, query the external platform for existing webhook subscriptions.
+8. Skip missing subscriptions or subscriptions already using the target URL.
+9. Update outdated subscriptions through the platform API.
+10. Record `updated`, `skipped`, or `failed` for each account-topic pair.
+11. Expose progress, stop, and audit-download endpoints.
 
 ## Key Implementation Details
 
-### Background Execution
+### Topic-to-URL Mapping
 
-For HTTP-triggered exports, return immediately and run the extraction asynchronously. This prevents client, proxy, or platform timeouts.
+Keep webhook topics and callback URLs in configuration, not embedded directly in business logic.
 
 ```ts
-app.post("/admin/exports/active-users", async (_req, res) => {
-  res.status(202).json({
-    status: "processing",
-    message: "Active user export started.",
-    downloadUrl: "/admin/exports/active-users/download"
-  });
+const WEBHOOK_TARGETS: Record<string, string> = {
+  ACCOUNT_UPDATED: "https://hooks.example.com/webhooks/account-updated",
+  SUBSCRIPTION_UPDATED: "https://hooks.example.com/webhooks/subscription-updated",
+  APP_UNINSTALLED: "https://hooks.example.com/webhooks/app-uninstalled"
+};
+```
 
-  void runActiveUsersExport();
+For multi-environment deployments, load these values from environment variables or a configuration service.
+
+### Background Runner
+
+Return immediately when starting from HTTP, then run the update asynchronously.
+
+```ts
+app.post("/admin/webhooks/update", async (req, res) => {
+  const limit = Number(req.query.limit ?? 100);
+
+  if (webhookUpdateState.isRunning) {
+    return res.status(409).json({ error: "Webhook update already running." });
+  }
+
+  webhookUpdateState.start(limit);
+  void runWebhookUpdate({ limit });
+
+  res.status(202).json({
+    status: "running",
+    progressUrl: "/admin/webhooks/update/progress",
+    stopUrl: "/admin/webhooks/update/stop"
+  });
 });
 ```
 
-For production systems, prefer a queue or job runner instead of an in-memory background function when jobs must survive process restarts.
+For production-critical migrations, prefer a durable job queue over in-memory state.
 
-### Cursor-Based Pagination
+### Input Source
 
-Use cursor pagination instead of offset pagination for large tables. Cursor pagination avoids performance degradation and duplicate or skipped rows when data changes during the export.
-
-```ts
-let lastId: string | undefined;
-const batchSize = 1000;
-
-while (true) {
-  const users = await db.user.findMany({
-    where: { isActive: true },
-    select: {
-      id: true,
-      email: true,
-      accountDomain: true,
-      accessToken: true,
-      planName: true
-    },
-    orderBy: { id: "asc" },
-    take: batchSize,
-    ...(lastId ? { cursor: { id: lastId }, skip: 1 } : {})
-  });
-
-  if (users.length === 0) break;
-
-  await processUsers(users);
-  lastId = users[users.length - 1].id;
-}
-```
-
-### Controlled Concurrency
-
-External validation can quickly exhaust sockets, hit rate limits, or overload downstream APIs. Process users in small chunks.
+The update job can read accounts from CSV, a database, or a queue. CSV is convenient when the target set comes from a previous export.
 
 ```ts
-async function processWithConcurrency<T>(items: T[], limit: number, handler: (item: T) => Promise<void>) {
-  for (let i = 0; i < items.length; i += limit) {
-    const chunk = items.slice(i, i + limit);
-    await Promise.all(chunk.map(handler));
+async function* readAccountDomains(filePath: string): AsyncGenerator<string> {
+  const stream = fs.createReadStream(filePath);
+  const lines = readline.createInterface({ input: stream, crlfDelay: Infinity });
+
+  for await (const line of lines) {
+    const value = line.trim();
+    if (!value || value.toLowerCase() === "account domain") continue;
+    yield value;
   }
 }
 ```
 
-### External Validation Against the Platform API
+### Credential Lookup and Eligibility Filtering
 
-The database should be treated as the source of candidate accounts, not the final proof of active accounts. Confirm each candidate by calling an authoritative platform endpoint with the stored account domain and access token.
-
-For Shopify-style platforms, a common validation endpoint is the shop resource:
+Use the input source only as a list of account identifiers. Fetch credentials from the database at processing time and filter to eligible accounts.
 
 ```ts
-async function verifyShop(domain: string, accessToken: string, apiVersion: string): Promise<boolean> {
-  const response = await fetch(`https://${domain}/admin/api/${apiVersion}/shop.json`, {
-    headers: {
-      "X-Shopify-Access-Token": accessToken,
-      Connection: "close"
+async function loadEligibleAccounts(domains: string[], cutoffDate: Date) {
+  return db.account.findMany({
+    where: {
+      domain: { in: domains },
+      isActive: true,
+      installedAt: { lt: cutoffDate }
     },
-    signal: AbortSignal.timeout(5000)
+    select: {
+      domain: true,
+      accessToken: true
+    }
   });
-
-  if (!response.ok) return false;
-
-  const body = await response.json();
-  return Boolean(body.shop?.id);
 }
 ```
 
-Only write the account to the final export when the API returns a valid shop payload, such as a `shop.id`. Failed validation usually means the account is not a real active user for operational purposes, even if the local database still marks it active.
+Eligibility filters are optional, but they are useful when only older installations or specific cohorts need migration.
 
-If the platform uses GraphQL instead of REST, use an equivalent lightweight query that confirms the account exists and the token can access it:
+### Webhook Lookup and Update
+
+The exact API depends on the platform. The reusable pattern is:
+
+1. Find webhook subscriptions by topic.
+2. Read the current callback URL.
+3. Skip if the current URL already matches the target URL.
+4. Update the subscription by ID.
+5. Capture API validation errors.
+
+Example GraphQL-style lookup:
 
 ```ts
-const query = `
-  query CurrentAccount {
-    shop {
-      id
-      name
-      myshopifyDomain
+const findWebhookQuery = `
+  query FindWebhooks($topic: WebhookTopic!) {
+    webhookSubscriptions(first: 10, topics: [$topic]) {
+      edges {
+        node {
+          id
+          topic
+          endpoint {
+            __typename
+            ... on WebhookHttpEndpoint {
+              callbackUrl
+            }
+          }
+        }
+      }
     }
   }
 `;
 ```
 
-Use whichever platform API is authoritative for the account's current existence and accessibility.
-
-### Progress Logging and Visibility
-
-Long-running exports should emit clear progress logs so operators can understand what is happening without inspecting the output file manually. Log the total candidate count, each database batch, external validation successes and failures, pauses for rate limits, stop requests, and final totals.
+Example GraphQL-style update:
 
 ```ts
-logger.info("Counting active account candidates...");
-logger.info({ totalCandidates }, "Active account candidates found.");
-logger.info({ batchNumber }, "Fetching database batch.");
-logger.info({ domain }, "External validation succeeded.");
-logger.warn({ domain, reason: error.message }, "External validation failed.");
-logger.info({ successCount, failureCount }, "Active users export finished.");
+const updateWebhookMutation = `
+  mutation UpdateWebhook($id: ID!, $webhookSubscription: WebhookSubscriptionInput!) {
+    webhookSubscriptionUpdate(id: $id, webhookSubscription: $webhookSubscription) {
+      userErrors {
+        field
+        message
+      }
+    }
+  }
+`;
 ```
 
-For better visibility, expose these values through a progress endpoint or job dashboard in addition to logs:
+Reusable update function:
+
+```ts
+async function updateWebhookTopic(client: ApiClient, topic: string, targetUrl: string) {
+  const result = await client.request(findWebhookQuery, { topic });
+  const subscriptions = result.webhookSubscriptions?.edges ?? [];
+
+  if (subscriptions.length === 0) {
+    return { status: "skipped", reason: "subscription_not_found" };
+  }
+
+  const subscription = subscriptions[0].node;
+  const currentUrl = subscription.endpoint?.callbackUrl;
+
+  if (currentUrl === targetUrl) {
+    return { status: "skipped", reason: "already_current" };
+  }
+
+  const updateResult = await client.request(updateWebhookMutation, {
+    id: subscription.id,
+    webhookSubscription: { callbackUrl: targetUrl }
+  });
+
+  const userErrors = updateResult.webhookSubscriptionUpdate?.userErrors ?? [];
+  if (userErrors.length > 0) {
+    return { status: "failed", reason: JSON.stringify(userErrors) };
+  }
+
+  return { status: "updated" };
+}
+```
+
+### HTTP Client Reliability
+
+For large migrations, configure the HTTP client intentionally:
+
+- Reuse connections with keep-alive where supported.
+- Set request timeouts.
+- Retry transient network errors.
+- Retry rate-limit responses with backoff.
+- Limit concurrent sockets or concurrent requests.
+
+```ts
+const agent = new https.Agent({
+  keepAlive: true,
+  maxSockets: 50
+});
+```
+
+### Progress Tracking
+
+Track progress in a shared state object, database row, cache key, or job record.
+
+```ts
+type WebhookUpdateProgress = {
+  status: "idle" | "running" | "stopped" | "finished" | "error";
+  totalRows: number;
+  processedRows: number;
+  successfulAccounts: number;
+  failedAccounts: number;
+  errors: string[];
+  startedAt: Date | null;
+  endedAt: Date | null;
+};
+```
+
+Example progress response:
 
 ```json
 {
   "status": "running",
-  "totalCandidates": 50000,
-  "processedCandidates": 12000,
-  "verifiedActiveUsers": 10850,
-  "failedValidations": 1150
+  "progress": "42%",
+  "stats": {
+    "totalRows": 1000,
+    "processedRows": 420,
+    "successfulAccounts": 400,
+    "failedAccounts": 20
+  },
+  "errors": []
 }
 ```
 
-### CSV Output
+### Audit Output
 
-Write the output incrementally instead of keeping every row in memory. Escape CSV values before writing.
+Write one row per account-topic attempt. This makes retries and investigation easier.
 
-```ts
-function csvValue(value: string | null | undefined): string {
-  return `"${String(value ?? "").replace(/"/g, '""')}"`;
-}
-
-async function appendRows(filePath: string, rows: Array<string[]>) {
-  const lines = rows.map((row) => row.map(csvValue).join(","));
-  await fs.appendFile(filePath, `${lines.join("\n")}\n`);
-}
-```
-
-### Download Functionality
-
-Once the export file is ready, expose it through a download endpoint or a signed storage URL. The simplest pattern is to serve the generated CSV from a secure admin route.
-
-```ts
-app.get("/admin/exports/active-users/download", (_req, res) => {
-  const filePath = path.join(process.cwd(), "exports", "active_users.csv");
-
-  if (!existsSync(filePath)) {
-    return res.status(404).json({
-      error: "Export file not found. Start the export and wait for it to finish."
-    });
-  }
-
-  return res.download(filePath, "active_users.csv");
-});
-```
-
-If the file lives in object storage instead of local disk, return a pre-signed download link or stream the file through a controller. In both cases, protect the endpoint with admin-only authorization.
-
-Useful behaviors to document for consumers of the export:
-
-- Show a `processing` state until the file exists.
-- Return `404` when the export has not completed yet.
-- Return a CSV filename that clearly identifies the contents.
-- Allow repeated downloads of the same completed export.
-
-### Stop or Cancel Support
-
-Use a cancellation flag, job status, or queue cancellation token. Check it between batches and before expensive external calls.
-
-```ts
-let shouldStop = false;
-
-app.post("/admin/exports/active-users/stop", (_req, res) => {
-  shouldStop = true;
-  res.json({ message: "Export will stop after the current batch." });
-});
-
-while (!shouldStop) {
-  const users = await fetchNextBatch();
-  if (users.length === 0) break;
-  await processUsers(users);
-}
+```csv
+account,topic,status,timestamp,reason
+example.myplatform.com,ACCOUNT_UPDATED,updated,2026-07-11T10:00:00.000Z,
+example.myplatform.com,APP_UNINSTALLED,skipped,2026-07-11T10:00:01.000Z,already_current
+example.myplatform.com,SUBSCRIPTION_UPDATED,failed,2026-07-11T10:00:02.000Z,rate_limited
 ```
 
 ## Required Configuration
 
-The exact configuration depends on the application, but the pattern typically needs:
-
 | Setting | Purpose |
 | --- | --- |
-| Database connection | Reads users or accounts. |
-| Active-user filter | Defines which records are eligible, such as `isActive = true`. |
-| Batch size | Controls database page size. |
-| Concurrency limit | Controls simultaneous external checks. |
-| Output path or bucket | Stores generated CSV or export file. |
-| External API version or base URL | Used to confirm whether candidate accounts are real active accounts. |
-| Request timeout | Prevents hanging external validation calls. |
-| Logging destination | Stores progress logs for visibility and troubleshooting. |
+| API version or base URL | Selects the external platform API endpoint. |
+| Webhook topic map | Defines each topic and desired callback URL. |
+| Input source path or query | Identifies accounts to process. |
+| Database connection | Loads account credentials and eligibility fields. |
+| Batch size | Controls how many input accounts are processed per batch. |
+| Concurrency limit | Controls simultaneous account updates. |
+| Request timeout | Prevents individual API calls from hanging. |
+| Retry count and backoff | Handles rate limits and transient network failures. |
+| Audit output path | Stores migration results. |
 
 Example environment variables:
 
 ```env
-DATABASE_URL="postgresql://..."
-ACTIVE_USERS_EXPORT_PATH="./exports/active_users.csv"
-ACTIVE_USERS_BATCH_SIZE="1000"
-ACTIVE_USERS_CONCURRENCY="10"
+WEBHOOK_UPDATE_BATCH_SIZE="25"
+WEBHOOK_UPDATE_LIMIT="1000"
+WEBHOOK_UPDATE_INPUT_PATH="./exports/active_accounts.csv"
+WEBHOOK_UPDATE_AUDIT_PATH="./exports/webhook_update_audit.csv"
 EXTERNAL_API_VERSION="2026-01"
+WEBHOOK_ACCOUNT_UPDATED_URL="https://hooks.example.com/webhooks/account-updated"
+WEBHOOK_SUBSCRIPTION_UPDATED_URL="https://hooks.example.com/webhooks/subscription-updated"
+WEBHOOK_APP_UNINSTALLED_URL="https://hooks.example.com/webhooks/app-uninstalled"
 ```
 
 ## Important Considerations and Edge Cases
 
-- **Long-running jobs:** Use a queue or worker for exports that must survive restarts.
-- **Duplicate starts:** Prevent multiple exports from writing to the same file at the same time.
-- **Large datasets:** Use cursor pagination and incremental file writes.
-- **Missing credentials:** Skip records that cannot be externally verified and count them as failures or skipped rows.
-- **False active records:** Local active status may include closed, deleted, expired, or unreachable accounts. Always validate against the authoritative platform API before exporting final active users.
-- **External API failures:** Add timeouts, retries where appropriate, and continue processing other accounts.
-- **Rate limits:** Keep concurrency low and add pauses between large batches.
-- **Visibility:** Add structured logs and progress counters so operators can see current batch, processed count, success count, failure count, and stop state.
-- **CSV correctness:** Escape quotes, commas, and newlines. Always write a header row.
-- **Sensitive data:** Avoid exporting access tokens or secrets. Limit CSV columns to operationally necessary fields.
-- **Partial results:** A stopped or failed export may still produce a useful partial file. Mark the job status clearly.
-- **Download timing:** Do not expose the file for download until the export has written the header and all completed rows. If the file is still being written, report a processing state instead.
-- **Process-local state:** In-memory stop flags and progress counters do not work across multiple server instances.
+- **Idempotency:** Always skip webhook subscriptions that already use the desired callback URL.
+- **Missing subscriptions:** Decide whether missing webhooks should be skipped, created, or reported as failures. The safest migration behavior is usually to skip unless creation is explicitly required.
+- **Multiple subscriptions per topic:** Define whether to update the first match, all matches, or only HTTP endpoint subscriptions.
+- **Non-HTTP endpoints:** Some platforms support event bus or pub/sub endpoints. Verify the endpoint type before reading or changing callback URLs.
+- **Rate limits:** Use low concurrency, retry `429` responses with backoff, and add pauses between batches.
+- **Network instability:** Use timeouts, retries, and keep-alive connections for large runs.
+- **Credential drift:** Access tokens may be expired or revoked. Count these as failures and continue.
+- **Partial migrations:** Persist audit results so the job can be resumed or retried safely.
+- **Process restarts:** In-memory progress is lost on restart. Store progress externally for critical migrations.
+- **Security:** Protect start, stop, progress, and download endpoints with admin-only authorization.
+- **Dry runs:** Consider a dry-run mode that reports intended changes without updating subscriptions.
 
 ## Integrating in Another Application
 
-1. Identify the account table and active-status field.
-2. Treat local active state as a candidate filter and choose the authoritative API call that proves the account is real and reachable.
-3. Create a background job or admin endpoint to start the export.
-4. Implement cursor-based database pagination.
-5. Add controlled concurrency for per-account work.
-6. Validate each candidate with the external platform API before writing it to the export.
-7. Write output incrementally to a file, object storage, or database table.
-8. Track and log progress, successes, failures, and stop state.
-9. Expose a secure download endpoint or storage link that serves the final CSV or export artifact.
-10. Protect all export endpoints with admin authentication.
+1. Define the webhook topics and target callback URLs.
+2. Choose the input source: database query, CSV export, queue, or static list.
+3. Implement account credential lookup from your datastore.
+4. Add eligibility filters if only a subset should be migrated.
+5. Implement platform-specific webhook lookup and update calls.
+6. Add batching, concurrency limits, timeouts, and retries.
+7. Track progress and expose it through an admin-safe interface.
+8. Write audit rows for every account-topic operation.
+9. Add stop/cancel support that exits safely between batches.
+10. Run a limited pilot before increasing the processing limit.
 
 ## Minimal Reusable Example
 
 ```ts
-type ActiveUser = {
-  id: string;
-  email: string | null;
-  accountDomain: string | null;
-  accessToken: string | null;
-  planName: string | null;
-};
+async function runWebhookUpdate(options: { limit: number; cutoffDate: Date }) {
+  const batchSize = 25;
+  let batch: string[] = [];
+  let readCount = 0;
 
-async function runActiveUsersExport() {
-  const outputPath = "./exports/active_users.csv";
-  const batchSize = 1000;
-  const concurrency = 10;
-  let lastId: string | undefined;
+  for await (const domain of readAccountDomains("./exports/active_accounts.csv")) {
+    if (readCount >= options.limit || webhookUpdateState.shouldStop) break;
 
-  await fs.writeFile(outputPath, "Email,Account Domain,Plan\n");
+    batch.push(domain);
+    readCount++;
 
-  while (true) {
-    const users: ActiveUser[] = await db.user.findMany({
-      where: { isActive: true },
-      orderBy: { id: "asc" },
-      take: batchSize,
-      ...(lastId ? { cursor: { id: lastId }, skip: 1 } : {})
-    });
-
-    if (users.length === 0) break;
-
-    const rows: string[][] = [];
-
-    await processWithConcurrency(users, concurrency, async (user) => {
-      if (!user.accountDomain || !user.accessToken) return;
-
-      const isValid = await verifyShop(user.accountDomain, user.accessToken, "2026-01");
-      if (!isValid) return;
-
-      rows.push([user.email ?? "", user.accountDomain, user.planName ?? ""]);
-    });
-
-    await appendRows(outputPath, rows);
-    lastId = users[users.length - 1].id;
+    if (batch.length >= batchSize) {
+      await processWebhookBatch(batch, options.cutoffDate);
+      batch = [];
+      await delay(2000);
+    }
   }
+
+  if (batch.length > 0 && !webhookUpdateState.shouldStop) {
+    await processWebhookBatch(batch, options.cutoffDate);
+  }
+}
+
+async function processWebhookBatch(domains: string[], cutoffDate: Date) {
+  const accounts = await loadEligibleAccounts(domains, cutoffDate);
+
+  await Promise.all(accounts.map(async (account) => {
+    const client = createApiClient(account.domain, account.accessToken);
+
+    for (const [topic, targetUrl] of Object.entries(WEBHOOK_TARGETS)) {
+      const result = await updateWebhookTopic(client, topic, targetUrl);
+      await appendAuditRow({
+        account: account.domain,
+        topic,
+        status: result.status,
+        reason: result.reason ?? "",
+        timestamp: new Date().toISOString()
+      });
+    }
+  }));
 }
 ```
 
 ## Recommended API Endpoints
 
 ```http
-POST /admin/exports/active-users
-POST /admin/exports/active-users/stop
-GET  /admin/exports/active-users/progress
-GET  /admin/exports/active-users/download
+POST /admin/webhooks/update
+POST /admin/webhooks/update/stop
+GET  /admin/webhooks/update/progress
+GET  /admin/webhooks/update/audit.csv
 ```
 
-Use `POST` for actions that start or stop work. Use `GET` only for read-only status and download endpoints.
+Use `POST` for operations that start or stop a migration. Use `GET` for read-only progress and audit downloads.
 
-For direct file downloads, return the generated file with the correct download filename. For remote storage, return a temporary signed URL that expires after a short period.
+## Rollout Strategy
+
+1. Run a dry run for a small sample and inspect the planned changes.
+2. Run the update with a low limit, such as 10 or 25 accounts.
+3. Check audit output and platform logs.
+4. Increase the limit gradually.
+5. Re-run failed accounts after fixing credential, rate-limit, or platform issues.
+6. Keep the audit file for rollback analysis and compliance records.
