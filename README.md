@@ -179,6 +179,33 @@ async function appendRows(filePath: string, rows: Array<string[]>) {
 }
 ```
 
+### Download Functionality
+
+Once the export file is ready, expose it through a download endpoint or a signed storage URL. The simplest pattern is to serve the generated CSV from a secure admin route.
+
+```ts
+app.get("/admin/exports/active-users/download", (_req, res) => {
+  const filePath = path.join(process.cwd(), "exports", "active_users.csv");
+
+  if (!existsSync(filePath)) {
+    return res.status(404).json({
+      error: "Export file not found. Start the export and wait for it to finish."
+    });
+  }
+
+  return res.download(filePath, "active_users.csv");
+});
+```
+
+If the file lives in object storage instead of local disk, return a pre-signed download link or stream the file through a controller. In both cases, protect the endpoint with admin-only authorization.
+
+Useful behaviors to document for consumers of the export:
+
+- Show a `processing` state until the file exists.
+- Return `404` when the export has not completed yet.
+- Return a CSV filename that clearly identifies the contents.
+- Allow repeated downloads of the same completed export.
+
 ### Stop or Cancel Support
 
 Use a cancellation flag, job status, or queue cancellation token. Check it between batches and before expensive external calls.
@@ -236,6 +263,7 @@ EXTERNAL_API_VERSION="2026-01"
 - **CSV correctness:** Escape quotes, commas, and newlines. Always write a header row.
 - **Sensitive data:** Avoid exporting access tokens or secrets. Limit CSV columns to operationally necessary fields.
 - **Partial results:** A stopped or failed export may still produce a useful partial file. Mark the job status clearly.
+- **Download timing:** Do not expose the file for download until the export has written the header and all completed rows. If the file is still being written, report a processing state instead.
 - **Process-local state:** In-memory stop flags and progress counters do not work across multiple server instances.
 
 ## Integrating in Another Application
@@ -248,7 +276,7 @@ EXTERNAL_API_VERSION="2026-01"
 6. Validate each candidate with the external platform API before writing it to the export.
 7. Write output incrementally to a file, object storage, or database table.
 8. Track and log progress, successes, failures, and stop state.
-9. Expose a secure download endpoint or storage link.
+9. Expose a secure download endpoint or storage link that serves the final CSV or export artifact.
 10. Protect all export endpoints with admin authentication.
 
 ## Minimal Reusable Example
@@ -307,3 +335,5 @@ GET  /admin/exports/active-users/download
 ```
 
 Use `POST` for actions that start or stop work. Use `GET` only for read-only status and download endpoints.
+
+For direct file downloads, return the generated file with the correct download filename. For remote storage, return a temporary signed URL that expires after a short period.
