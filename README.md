@@ -1,374 +1,276 @@
-# Webhook Update System
+# Onboarding Completion Modal Design Spec
 
-## Overview
+**Date:** 2026-07-24
+**Status:** Draft for review
+**Scope:** Fix when the onboarding completion modal appears, persists through refresh, and stops after dismissal.
 
-A webhook update system bulk-updates webhook subscription callback URLs across many tenant accounts. It reads target accounts from a source such as CSV or a database, looks up each account's API credentials, finds existing webhook subscriptions by topic, updates callback URLs when needed, and records the result for audit and retry purposes.
+## Problem
 
-This pattern is useful when an application changes webhook infrastructure, migrates domains, standardizes callback routes, or needs to repair webhook subscriptions across installed accounts.
+The onboarding completion modal can show at the wrong time and can show again after it was already shown once.
 
-## Purpose
+There are two root causes:
 
-Webhook URLs often need to change when infrastructure changes. Updating them manually account-by-account is slow and error-prone. A bulk update system provides a safe, repeatable workflow that:
+1. `banners.onboardingBanner` has unclear meaning. The app currently treats `true` as "show the modal on page load", but closing the modal writes `false`, which makes an already-dismissed modal look the same as a modal that was never shown.
+2. Onboarding step completion can be calculated from stale persisted data instead of the current live status. For example, `moneyFormat` can be disabled in Shopify, but old DB/global state can still contain `moneyFormat: true`. Completing another step can then make the app think all three steps are complete.
 
-- Processes many accounts without blocking a request.
-- Updates only existing webhook subscriptions.
-- Skips subscriptions that already point to the correct URL.
-- Controls API concurrency and rate-limit pressure.
-- Tracks progress and per-topic outcomes.
-- Supports stopping the migration safely.
-- Produces an audit file for completed, skipped, and failed updates.
+## Goals
 
-## High-Level Flow
+- Show the completion modal only when onboarding changes from incomplete to complete.
+- Treat onboarding as complete only when all three named steps are currently true:
+  - `moneyFormat === true`
+  - `themeExtension === true`
+  - `appEnabled === true`
+- Do not show the modal to existing users who already have `onboardingCompleted: true`.
+- If the modal is open and the user refreshes the page, show it again until the user dismisses it.
+- Once the modal is dismissed, do not show it again for that install.
+- After uninstall/reinstall, allow the modal to show again after onboarding is completed.
+- Keep the fix minimal and avoid a Prisma schema change.
 
-1. Define a mapping of webhook topics to their new callback URLs.
-2. Start a background update job from an admin endpoint, CLI command, or scheduled worker.
-3. Read account identifiers from CSV, database query, or queue input.
-4. Load active accounts and API credentials from the datastore.
-5. Optionally filter accounts by install date, plan, region, or migration eligibility.
-6. Process accounts in batches with a fixed concurrency limit.
-7. For each account and topic, query the external platform for existing webhook subscriptions.
-8. Skip missing subscriptions or subscriptions already using the target URL.
-9. Update outdated subscriptions through the platform API.
-10. Record `updated`, `skipped`, or `failed` for each account-topic pair.
-11. Expose progress, stop, and audit-download endpoints.
+## Non-Goals
 
-## Key Implementation Details
+- Do not add a new database field unless the current flags cannot satisfy the behavior.
+- Do not migrate historical banner values.
+- Do not redesign the modal UI.
+- Do not change onboarding step labels, copy, or layout.
 
-### Topic-to-URL Mapping
+## Decisions
 
-Keep webhook topics and callback URLs in configuration, not embedded directly in business logic.
+### Existing Completed Users
 
-```ts
-const WEBHOOK_TARGETS: Record<string, string> = {
-  ACCOUNT_UPDATED: "https://hooks.example.com/webhooks/account-updated",
-  SUBSCRIPTION_UPDATED: "https://hooks.example.com/webhooks/subscription-updated",
-  APP_UNINSTALLED: "https://hooks.example.com/webhooks/app-uninstalled"
+Users who already have `onboardingCompleted: true` must not see the completion modal, even if `banners.onboardingBanner` is `false`.
+
+Reason: historical data cannot reliably distinguish "modal never shown" from "modal already dismissed", because both can be represented by `false` today.
+
+### Modal Pending State
+
+Use `banners.onboardingBanner` as a pending modal flag:
+
+- `true`: completion modal is pending and should open on page load.
+- `false` or missing: completion modal is not pending.
+
+This works because `onboardingCompleted` becomes the one-time guard. A modal can only be scheduled while the user was previously incomplete.
+
+### Dismissal
+
+Closing the modal must set `banners.onboardingBanner` to `false`.
+
+This includes both modal exits:
+
+- normal close
+- "No, I need help"
+
+After either action, the modal must not show again until reinstall.
+
+### Reinstall
+
+The uninstall webhook must reset:
+
+- `onboardingCompleted: false`
+- `onboardingProgress.step.appEnabled: false`
+- `banners.onboardingBanner: false`
+
+This allows a reinstalled user to complete onboarding again and see the modal again.
+
+## Current Files Involved
+
+- `pages/index.jsx`
+  - Owns dashboard page state.
+  - Opens the completion modal on page load when the modal is pending.
+  - Passes `setShowCompletionPopup` into onboarding components.
+- `components/home/OnboardingCompletionPopup.jsx`
+  - Renders the modal.
+  - Handles close and "No, I need help" actions.
+  - Must persist dismissal by setting `banners.onboardingBanner` to `false`.
+- `components/home/onBoardingBanner.jsx`
+  - Runs live checks for money format, theme extension, and app status.
+  - Maintains `onBoardingObj`, the current frontend view of the three step states.
+- `components/common/onBoardingCard.jsx`
+  - Saves onboarding progress after user actions.
+  - Currently uses stale global/DB state as the save base.
+  - Must use current live step state as the save base.
+- `pages/api/v1/user/onboarding.js`
+  - Merges incoming onboarding step data into DB.
+  - Sets `onboardingCompleted: true` when all three named steps are true.
+- `pages/api/v1/banner/dismiss.js`
+  - Updates banner flags.
+  - Existing behavior is sufficient.
+- `utils/webhooks/app_uninstalled.js`
+  - Resets install-specific onboarding state on uninstall.
+
+## Proposed Behavior
+
+### First-Time Completion
+
+1. User starts with `onboardingCompleted: false`.
+2. User completes onboarding steps in any order.
+3. After each confirmed action, the app saves all three current step statuses to DB.
+4. When the action causes all three statuses to become true, the app:
+   - sets `onboardingCompleted: true` through `/api/v1/user/onboarding`
+   - sets `banners.onboardingBanner: true` through `/api/v1/banner/dismiss`
+   - opens the completion modal
+5. If the user refreshes before closing, the dashboard sees `onboardingBanner: true` and opens the modal again.
+6. When the user closes the modal or clicks "No, I need help", the app sets `onboardingBanner: false`.
+7. Future refreshes do not open the modal.
+
+### Existing Completed User
+
+1. User already has `onboardingCompleted: true`.
+2. Dashboard must not schedule a new modal for that user.
+3. If this user later toggles onboarding-related settings, the modal still must not show because the user was already completed before this fix.
+
+### Reinstalled User
+
+1. User uninstalls the app.
+2. Uninstall webhook resets `onboardingCompleted: false`, app step state, and `onboardingBanner: false`.
+3. User reinstalls the app.
+4. Once all three live statuses become true again, the modal can show once.
+
+## Completion Calculation
+
+All completion checks must use named keys:
+
+```js
+const isOnboardingComplete = (step = {}) =>
+  step.moneyFormat === true &&
+  step.themeExtension === true &&
+  step.appEnabled === true;
+```
+
+Avoid count-based checks:
+
+```js
+Object.values(step).filter(value => value === true).length === 3
+```
+
+Count-based checks are unsafe because they can pass with stale or unexpected keys.
+
+## Save Payload Rule
+
+When saving onboarding progress, use the current live state as the source of truth, not stale DB/global state.
+
+The payload should start from `onBoardingObj`:
+
+```js
+const payload = {
+  moneyFormat: onBoardingObj?.moneyFormat === true,
+  themeExtension: onBoardingObj?.themeExtension === true,
+  appEnabled: onBoardingObj?.appEnabled === true,
 };
 ```
 
-For multi-environment deployments, load these values from environment variables or a configuration service.
+Then apply the confirmed action:
 
-### Background Runner
-
-Return immediately when starting from HTTP, then run the update asynchronously.
-
-```ts
-app.post("/admin/webhooks/update", async (req, res) => {
-  const limit = Number(req.query.limit ?? 100);
-
-  if (webhookUpdateState.isRunning) {
-    return res.status(409).json({ error: "Webhook update already running." });
-  }
-
-  webhookUpdateState.start(limit);
-  void runWebhookUpdate({ limit });
-
-  res.status(202).json({
-    status: "running",
-    progressUrl: "/admin/webhooks/update/progress",
-    stopUrl: "/admin/webhooks/update/stop"
-  });
-});
-```
-
-For production-critical migrations, prefer a durable job queue over in-memory state.
-
-### Input Source
-
-The update job can read accounts from CSV, a database, or a queue. CSV is convenient when the target set comes from a previous export.
-
-```ts
-async function* readAccountDomains(filePath: string): AsyncGenerator<string> {
-  const stream = fs.createReadStream(filePath);
-  const lines = readline.createInterface({ input: stream, crlfDelay: Infinity });
-
-  for await (const line of lines) {
-    const value = line.trim();
-    if (!value || value.toLowerCase() === "account domain") continue;
-    yield value;
-  }
+```js
+if (value === 1) {
+  payload.moneyFormat = true;
+} else if (value === 2) {
+  payload.themeExtension = true;
+} else if (value === 3) {
+  payload.appEnabled = true;
 }
 ```
 
-### Credential Lookup and Eligibility Filtering
+This ensures false statuses are saved too. For example, if money format is currently disabled and app status is completed, the saved payload remains:
 
-Use the input source only as a list of account identifiers. Fetch credentials from the database at processing time and filter to eligible accounts.
-
-```ts
-async function loadEligibleAccounts(domains: string[], cutoffDate: Date) {
-  return db.account.findMany({
-    where: {
-      domain: { in: domains },
-      isActive: true,
-      installedAt: { lt: cutoffDate }
-    },
-    select: {
-      domain: true,
-      accessToken: true
-    }
-  });
-}
-```
-
-Eligibility filters are optional, but they are useful when only older installations or specific cohorts need migration.
-
-### Webhook Lookup and Update
-
-The exact API depends on the platform. The reusable pattern is:
-
-1. Find webhook subscriptions by topic.
-2. Read the current callback URL.
-3. Skip if the current URL already matches the target URL.
-4. Update the subscription by ID.
-5. Capture API validation errors.
-
-Example GraphQL-style lookup:
-
-```ts
-const findWebhookQuery = `
-  query FindWebhooks($topic: WebhookTopic!) {
-    webhookSubscriptions(first: 10, topics: [$topic]) {
-      edges {
-        node {
-          id
-          topic
-          endpoint {
-            __typename
-            ... on WebhookHttpEndpoint {
-              callbackUrl
-            }
-          }
-        }
-      }
-    }
-  }
-`;
-```
-
-Example GraphQL-style update:
-
-```ts
-const updateWebhookMutation = `
-  mutation UpdateWebhook($id: ID!, $webhookSubscription: WebhookSubscriptionInput!) {
-    webhookSubscriptionUpdate(id: $id, webhookSubscription: $webhookSubscription) {
-      userErrors {
-        field
-        message
-      }
-    }
-  }
-`;
-```
-
-Reusable update function:
-
-```ts
-async function updateWebhookTopic(client: ApiClient, topic: string, targetUrl: string) {
-  const result = await client.request(findWebhookQuery, { topic });
-  const subscriptions = result.webhookSubscriptions?.edges ?? [];
-
-  if (subscriptions.length === 0) {
-    return { status: "skipped", reason: "subscription_not_found" };
-  }
-
-  const subscription = subscriptions[0].node;
-  const currentUrl = subscription.endpoint?.callbackUrl;
-
-  if (currentUrl === targetUrl) {
-    return { status: "skipped", reason: "already_current" };
-  }
-
-  const updateResult = await client.request(updateWebhookMutation, {
-    id: subscription.id,
-    webhookSubscription: { callbackUrl: targetUrl }
-  });
-
-  const userErrors = updateResult.webhookSubscriptionUpdate?.userErrors ?? [];
-  if (userErrors.length > 0) {
-    return { status: "failed", reason: JSON.stringify(userErrors) };
-  }
-
-  return { status: "updated" };
-}
-```
-
-### HTTP Client Reliability
-
-For large migrations, configure the HTTP client intentionally:
-
-- Reuse connections with keep-alive where supported.
-- Set request timeouts.
-- Retry transient network errors.
-- Retry rate-limit responses with backoff.
-- Limit concurrent sockets or concurrent requests.
-
-```ts
-const agent = new https.Agent({
-  keepAlive: true,
-  maxSockets: 50
-});
-```
-
-### Progress Tracking
-
-Track progress in a shared state object, database row, cache key, or job record.
-
-```ts
-type WebhookUpdateProgress = {
-  status: "idle" | "running" | "stopped" | "finished" | "error";
-  totalRows: number;
-  processedRows: number;
-  successfulAccounts: number;
-  failedAccounts: number;
-  errors: string[];
-  startedAt: Date | null;
-  endedAt: Date | null;
-};
-```
-
-Example progress response:
-
-```json
+```js
 {
-  "status": "running",
-  "progress": "42%",
-  "stats": {
-    "totalRows": 1000,
-    "processedRows": 420,
-    "successfulAccounts": 400,
-    "failedAccounts": 20
-  },
-  "errors": []
+  moneyFormat: false,
+  themeExtension: true,
+  appEnabled: true
 }
 ```
 
-### Audit Output
+The modal will not show in that state.
 
-Write one row per account-topic attempt. This makes retries and investigation easier.
+## Modal Scheduling Rule
 
-```csv
-account,topic,status,timestamp,reason
-example.myplatform.com,ACCOUNT_UPDATED,updated,2026-07-11T10:00:00.000Z,
-example.myplatform.com,APP_UNINSTALLED,skipped,2026-07-11T10:00:01.000Z,already_current
-example.myplatform.com,SUBSCRIPTION_UPDATED,failed,2026-07-11T10:00:02.000Z,rate_limited
+The completion modal can be scheduled only when all conditions are true:
+
+```js
+completed === true &&
+wasAlreadyCompleted !== true &&
+popupAlreadyPending !== true
 ```
 
-## Required Configuration
+Where:
 
-| Setting | Purpose |
-| --- | --- |
-| API version or base URL | Selects the external platform API endpoint. |
-| Webhook topic map | Defines each topic and desired callback URL. |
-| Input source path or query | Identifies accounts to process. |
-| Database connection | Loads account credentials and eligibility fields. |
-| Batch size | Controls how many input accounts are processed per batch. |
-| Concurrency limit | Controls simultaneous account updates. |
-| Request timeout | Prevents individual API calls from hanging. |
-| Retry count and backoff | Handles rate limits and transient network failures. |
-| Audit output path | Stores migration results. |
+- `completed` means all three named onboarding steps are true after the current save.
+- `wasAlreadyCompleted` is read before saving the current action from `userDataGlobal?.onboardingCompleted ?? userData?.onboardingCompleted`.
+- `popupAlreadyPending` is read from `userDataGlobal?.banners?.onboardingBanner ?? userData?.banners?.onboardingBanner`.
 
-Example environment variables:
+If the conditions pass:
 
-```env
-WEBHOOK_UPDATE_BATCH_SIZE="25"
-WEBHOOK_UPDATE_LIMIT="1000"
-WEBHOOK_UPDATE_INPUT_PATH="./exports/active_accounts.csv"
-WEBHOOK_UPDATE_AUDIT_PATH="./exports/webhook_update_audit.csv"
-EXTERNAL_API_VERSION="2026-01"
-WEBHOOK_ACCOUNT_UPDATED_URL="https://hooks.example.com/webhooks/account-updated"
-WEBHOOK_SUBSCRIPTION_UPDATED_URL="https://hooks.example.com/webhooks/subscription-updated"
-WEBHOOK_APP_UNINSTALLED_URL="https://hooks.example.com/webhooks/app-uninstalled"
+1. Call `/api/v1/banner/dismiss` with `{ bannerType: "onboardingBanner", value: true }`.
+2. Update global user state so `banners.onboardingBanner` is true.
+3. Open the modal.
+4. Fire confetti.
+
+## Page-Load Rule
+
+`pages/index.jsx` should open the modal on page load only when:
+
+```js
+user?.onboardingCompleted === true &&
+user?.banners?.onboardingBanner === true
 ```
 
-## Important Considerations and Edge Cases
+This supports refresh while the modal is pending. It does not create a new modal for existing completed users because only the completion transition should set the pending flag.
 
-- **Idempotency:** Always skip webhook subscriptions that already use the desired callback URL.
-- **Missing subscriptions:** Decide whether missing webhooks should be skipped, created, or reported as failures. The safest migration behavior is usually to skip unless creation is explicitly required.
-- **Multiple subscriptions per topic:** Define whether to update the first match, all matches, or only HTTP endpoint subscriptions.
-- **Non-HTTP endpoints:** Some platforms support event bus or pub/sub endpoints. Verify the endpoint type before reading or changing callback URLs.
-- **Rate limits:** Use low concurrency, retry `429` responses with backoff, and add pauses between batches.
-- **Network instability:** Use timeouts, retries, and keep-alive connections for large runs.
-- **Credential drift:** Access tokens may be expired or revoked. Count these as failures and continue.
-- **Partial migrations:** Persist audit results so the job can be resumed or retried safely.
-- **Process restarts:** In-memory progress is lost on restart. Store progress externally for critical migrations.
-- **Security:** Protect start, stop, progress, and download endpoints with admin-only authorization.
-- **Dry runs:** Consider a dry-run mode that reports intended changes without updating subscriptions.
+## Dismiss Rule
 
-## Integrating in Another Application
+`OnboardingCompletionPopup` should dismiss by writing:
 
-1. Define the webhook topics and target callback URLs.
-2. Choose the input source: database query, CSV export, queue, or static list.
-3. Implement account credential lookup from your datastore.
-4. Add eligibility filters if only a subset should be migrated.
-5. Implement platform-specific webhook lookup and update calls.
-6. Add batching, concurrency limits, timeouts, and retries.
-7. Track progress and expose it through an admin-safe interface.
-8. Write audit rows for every account-topic operation.
-9. Add stop/cancel support that exits safely between batches.
-10. Run a limited pilot before increasing the processing limit.
-
-## Minimal Reusable Example
-
-```ts
-async function runWebhookUpdate(options: { limit: number; cutoffDate: Date }) {
-  const batchSize = 25;
-  let batch: string[] = [];
-  let readCount = 0;
-
-  for await (const domain of readAccountDomains("./exports/active_accounts.csv")) {
-    if (readCount >= options.limit || webhookUpdateState.shouldStop) break;
-
-    batch.push(domain);
-    readCount++;
-
-    if (batch.length >= batchSize) {
-      await processWebhookBatch(batch, options.cutoffDate);
-      batch = [];
-      await delay(2000);
-    }
-  }
-
-  if (batch.length > 0 && !webhookUpdateState.shouldStop) {
-    await processWebhookBatch(batch, options.cutoffDate);
-  }
-}
-
-async function processWebhookBatch(domains: string[], cutoffDate: Date) {
-  const accounts = await loadEligibleAccounts(domains, cutoffDate);
-
-  await Promise.all(accounts.map(async (account) => {
-    const client = createApiClient(account.domain, account.accessToken);
-
-    for (const [topic, targetUrl] of Object.entries(WEBHOOK_TARGETS)) {
-      const result = await updateWebhookTopic(client, topic, targetUrl);
-      await appendAuditRow({
-        account: account.domain,
-        topic,
-        status: result.status,
-        reason: result.reason ?? "",
-        timestamp: new Date().toISOString()
-      });
-    }
-  }));
-}
+```js
+{ bannerType: "onboardingBanner", value: false }
 ```
 
-## Recommended API Endpoints
+This applies to both:
 
-```http
-POST /admin/webhooks/update
-POST /admin/webhooks/update/stop
-GET  /admin/webhooks/update/progress
-GET  /admin/webhooks/update/audit.csv
-```
+- close button / modal close
+- "No, I need help"
 
-Use `POST` for operations that start or stop a migration. Use `GET` for read-only progress and audit downloads.
+After the API call, close the modal locally.
 
-## Rollout Strategy
+If the dismissal API fails, still close the modal locally but log the error. A failed API call may cause the modal to reappear on refresh, which is acceptable because the DB did not confirm dismissal.
 
-1. Run a dry run for a small sample and inspect the planned changes.
-2. Run the update with a low limit, such as 10 or 25 accounts.
-3. Check audit output and platform logs.
-4. Increase the limit gradually.
-5. Re-run failed accounts after fixing credential, rate-limit, or platform issues.
-6. Keep the audit file for rollback analysis and compliance records.
+## Error Handling
+
+- If `/api/v1/user/onboarding` fails, do not show the modal.
+- If setting `onboardingBanner: true` fails, do not show the modal because refresh persistence would not be guaranteed.
+- If dismissal fails, close locally and log the error.
+- Existing Sentry/PostHog tracking can remain unchanged.
+
+## Testing Plan
+
+Manual checks are required because these flows depend on Shopify live state and DB state:
+
+1. Fresh user completes steps in order: money format, theme extension, app enabled. Modal shows once.
+2. Fresh user completes steps out of order. Modal shows when the final missing step becomes true.
+3. Money format is disabled while old DB state has `moneyFormat: true`; user completes app status. Modal does not show.
+4. Modal is open; user refreshes. Modal opens again.
+5. User closes modal. Refresh does not open it again.
+6. User clicks "No, I need help". Refresh does not open it again.
+7. Existing user with `onboardingCompleted: true` and `onboardingBanner: false` does not see modal.
+8. Existing user with `onboardingCompleted: true` and historical `onboardingBanner: true` opens pending modal on refresh, then dismissal clears it.
+9. User uninstalls and reinstalls; after all three steps are complete again, modal can show once.
+
+Automated tests should cover pure logic where practical:
+
+- named-key completion helper returns true only when all three expected keys are true.
+- modal scheduling blocks users who were already completed.
+- modal scheduling allows a previously incomplete user who just completed all three steps.
+
+## Risks
+
+- Historical users with `onboardingCompleted: true` and `onboardingBanner: true` may see the modal once on page load. This is consistent with the pending-modal interpretation, but if this historical state is common and unwanted, the page-load rule can also require a new transition marker. That would require a new DB field or migration.
+- If live checks fail due to Shopify API errors, onboarding should stay incomplete rather than showing the modal.
+- Some existing code mutates `userDataGlobal` directly in settings-related pages. This spec avoids changing those broader patterns to keep the fix minimal.
+
+## Acceptance Criteria
+
+- The completion modal appears exactly once per install after the user completes all three live onboarding steps.
+- The modal does not appear when any of the three live steps is false.
+- Existing users with `onboardingCompleted: true` and dismissed modal state do not see the modal again.
+- Refresh keeps the modal open while `onboardingBanner: true`.
+- Closing the modal or clicking "No, I need help" sets `onboardingBanner: false` and prevents future display.
+- Reinstall resets enough state for the modal to show again after onboarding is completed.
