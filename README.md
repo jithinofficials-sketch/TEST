@@ -172,6 +172,22 @@ Each catalog entry owns:
 
 The frontend `planDetails` can keep its current UI fields, but those fields are display-only.
 
+## Pricing parity guardrails
+
+This fix must not change the merchant-visible pricing logic. The server catalog exists to protect billing, not to redesign pricing.
+
+Keep these current behaviors:
+
+- Legacy monthly amount remains `BASE_PRICE`, currency `USD`, interval `MONTHLY_INTERVAL`, plan `bucks_premium`, plan type `monthly`.
+- Legacy annual compare price remains `COMPARE_PRICE * 12`, interval `ANNUAL_INTERVAL`, and discount percent still comes from `calculateDiscountPricing()` with the same user and partner inputs.
+- Legacy annual partner discount still uses `partnerData.discountPercent` when present.
+- Legacy annual user discount branches remain the same: new users get `ANNUAL_PLAN_NEW_USER_DISCOUNT`, users with `subscription_id` or current `bucks_premium` get `ANNUAL_PLAN_EXISTING_PLUS_DISCOUNT`, and true free users get `ANNUAL_PLAN_EXISTING_FREE_DISCOUNT`.
+- Pro annual standard amount remains `NEW_PRO_ANNUAL_PRICE`; partner Pro annual amount remains `NEW_PRO_ANNUAL_PRICE_PARTNER`; full compare price remains `NEW_PRO_ANNUAL_FULL_PRICE`.
+- Partner Pro annual override keeps the existing exception for merchants currently on `bucks_premium_65`.
+- Pro monthly coupon still validates with the existing `validateCoupon()` helper against Bucks plan ID `bucks_premium_pro`.
+
+Do not change `calculateDiscountPricing()` as part of this security fix. It is shared with the pricing page display. Server billing should validate catalog amounts before calling it rather than changing the shared helper's behavior.
+
 ## Partner Pro annual contract
 
 Partner merchants currently get a server-side Pro annual override in `pages/api/v1/billing/initSubscription.js`: standard Pro annual can become partner Pro annual when `partnerData` exists, except for merchants already on the legacy partner annual plan `bucks_premium_65`.
@@ -191,10 +207,12 @@ Trial days must be resolved server side. The browser must not send trial days.
 Rules:
 
 - Existing premium merchant with an active `trialEndDate` keeps the remaining days.
-- Free merchant with `trialLeft > 0` keeps that preserved trial balance.
+- Merchant with `trialLeft > 0` keeps that preserved trial balance.
 - Merchant with no `subscription_id` receives partner trial days or `DEFAULT_TRIAL_DAYS`.
 - Merchant that already subscribed and has no remaining trial gets `0`.
 - Trial days must be an integer from `0` to `90`.
+
+The server-side resolver must mirror the current frontend flow from `pages/pricing/index.jsx`: check active premium trial first, then preserved `trialLeft`, then brand-new merchant default or partner trial, otherwise `0`.
 
 ## Billing state
 
