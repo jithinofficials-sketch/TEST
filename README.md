@@ -2,7 +2,7 @@
 
 ## Goal
 
-Fix the pricing and billing security issues without removing any existing plan. The merchant can still choose legacy monthly, legacy annual, Plus, Pro monthly, Pro annual, and partner Pro annual plans. The browser can choose only the plan ID and optional coupon code. The server owns the price, interval, trial, discount, and entitlement data.
+Fix the pricing and billing security issues without removing any existing plan. The merchant can still choose legacy monthly, legacy annual, Plus, Pro monthly, Pro annual, and partner Pro annual plans. The browser can choose only the plan ID and optional coupon code. The server owns the price, interval, trial, discount, entitlement data, and callback state.
 
 ## Current flow
 
@@ -109,7 +109,7 @@ await prisma.users.update({
 });
 ```
 
-The fix is to store a one-time billing state at initiation. The return URL carries only `state`. The callback consumes the state atomically and writes entitlements from the stored state, not from query params.
+The fix is to store a one-time billing state at initiation. The return URL carries only `shop` and `state`. The callback verifies that Shopify activated the expected subscription, consumes the state atomically, and writes entitlements from the stored state, not from query params.
 
 ### #281 Client-controlled subscription price, interval, and trial duration reach Shopify
 
@@ -135,15 +135,15 @@ This helper accepts a mixed object that can contain browser data. The fix is to 
 5. The endpoint fetches user and partner data from the database.
 6. The endpoint validates partner-only access, coupon eligibility, discount eligibility, and trial eligibility.
 7. The endpoint builds trusted subscription details from server-owned fields.
-8. The endpoint creates a random billing state and passes it into the Shopify return URL.
+8. The endpoint creates a random billing state and passes `shop` and `state` into the Shopify return URL.
 9. Shopify receives price, currency, interval, name, and trial days from trusted details only.
 10. After Shopify returns an app subscription ID and confirmation URL, the endpoint stores the pending billing state with the expected subscription ID and commercial terms.
 11. The merchant approves billing in Shopify.
-12. Shopify redirects to `/api/v1/billing/checkSubscriptionStatus?state=<token>`.
-13. The callback loads and atomically consumes the pending state.
-14. The callback loads the offline session for the stored shop, checks Shopify charge status, and confirms the subscription is active.
-15. The callback writes `bucks_plan`, `plan_type`, accepted price, trial dates, and subscription ID from stored state.
-16. The callback syncs metafields from stored state and redirects the merchant back to pricing.
+12. Shopify redirects to `/api/v1/billing/checkSubscriptionStatus?shop=<shop>&state=<token>` and includes its billing identifier.
+13. The callback loads the merchant by `shop` and checks `users.acces_checking.pendingBillingStates[state]`.
+14. The callback verifies Shopify activated the exact expected subscription from pending state. It must not accept any active charge for the shop.
+15. The callback atomically writes `bucks_plan`, `plan_type`, accepted price, trial dates, subscription ID, and the consumed state marker in one DB update.
+16. The callback syncs metafields from stored state as a retryable side effect and redirects the merchant back to pricing.
 
 ## Backend plan catalog
 
@@ -172,6 +172,18 @@ Each catalog entry owns:
 
 The frontend `planDetails` can keep its current UI fields, but those fields are display-only.
 
+## Partner Pro annual contract
+
+Partner merchants currently get a server-side Pro annual override in `pages/api/v1/billing/initSubscription.js`: standard Pro annual can become partner Pro annual when `partnerData` exists, except for merchants already on the legacy partner annual plan `bucks_premium_65`.
+
+Keep that runtime behavior. The frontend can keep sending `planId: "pro-annual"` when the merchant clicks the displayed Pro annual card. `initSubscription.js` must canonicalize that to `pro-annual-partner` when `partnerData` exists and `userRecord.bucks_plan !== "bucks_premium_65"`. This keeps Shopify approval aligned with the displayed partner price.
+
+## Coupon contract
+
+The browser sends the coupon code only. It does not decide the discounted amount. The server validates coupons against the resolved catalog plan.
+
+`validateCoupon()` currently expects the Bucks plan ID `bucks_premium_pro`, not the catalog ID `pro-monthly`. Keep that behavior for the minimal fix: call `validateCoupon(plan.bucksPlan, couponCode, validCoupon)`. Only plans with `couponEligible: true` can receive a coupon override.
+
 ## Trial policy
 
 Trial days must be resolved server side. The browser must not send trial days.
@@ -186,46 +198,58 @@ Rules:
 
 ## Billing state
 
-Add a Prisma model for pending billing state.
+Use the existing `users.acces_checking` JSON field instead of adding a new Prisma model. Store pending billing attempts by state under `users.acces_checking.pendingBillingStates`. This allows multiple Shopify approval tabs to complete independently without overwriting each other.
 
-```prisma
-model billing_states {
-  id             String    @map("_id") @id @default(auto()) @db.ObjectId
-  state          String    @unique
-  shop           String
-  subscriptionId String?
-  planId         String
-  bucksPlan      String
-  planType       String
-  name           String
-  amount         Float
-  currencyCode   String
-  interval       String
-  trialDays      Int
-  status         String    @default("pending")
-  expiresAt      DateTime
-  consumedAt     DateTime?
-  createdAt      DateTime  @default(now())
-
-  @@index([shop, status])
-  @@index([expiresAt])
+```js
+{
+  pendingBillingStates: {
+    [state]: {
+      state,
+      subscriptionId,
+      planId,
+      bucksPlan,
+      planType,
+      name,
+      amount,
+      currencyCode,
+      interval,
+      trialDays,
+      status: "pending",
+      expiresAtMs,
+      createdAtMs,
+    }
+  }
 }
 ```
 
-The state expires after 30 minutes. The callback consumes it with `updateMany` using `state`, `status: "pending"`, `consumedAt: null`, and `expiresAt > now`. If no row is updated, the callback fails.
+Use numeric timestamps because `acces_checking` is a Prisma `Json?` field. Store `createdAtMs`, `expiresAtMs`, and `consumedAtMs` as numbers and compare with `Date.now()` in raw Mongo queries.
+
+The initiation route must persist each new state with an atomic `prisma.$runCommandRaw()` `$set` at `acces_checking.pendingBillingStates.<state>`. It must not read, merge, and replace the whole `acces_checking` JSON object, because concurrent billing attempts can otherwise overwrite each other.
+
+The state expires after 30 minutes. The callback applies entitlements and consumes the state in one `prisma.$runCommandRaw()` update so a mid-callback failure cannot strand a paid merchant with a consumed state and no local plan. The raw update must match `myshopify_domain`, `acces_checking.pendingBillingStates.<state>.state`, `acces_checking.pendingBillingStates.<state>.status: "pending"`, and `acces_checking.pendingBillingStates.<state>.expiresAtMs > Date.now()`. It must `$set` both the entitlement fields and `status: "consumed"` plus `consumedAtMs`. If exactly one record is not modified, the callback fails.
+
+`state` is generated with `crypto.randomUUID()`. The callback must validate the UUID format before using it in a dynamic Mongo path. A UUID contains no `.` or `$`, so it is safe for the dynamic key path after validation.
+
+Do not prune stale entries by replacing the whole parent JSON during billing initiation. Cleanup should run as a separate safe maintenance step, or use targeted `$unset` paths for known expired state keys. The hot billing initiation path only adds the new state with atomic `$set`.
 
 ## Shopify verification
 
-The existing callback uses the REST recurring application charge endpoint. Keep this for the minimal fix because the current flow already depends on it.
+The callback must verify the specific expected subscription, not just any active charge for the shop.
 
 The callback must still verify:
 
 - Shopify response exists.
 - Charge status is `active`.
-- The active charge belongs to the stored shop session.
+- The active billing record belongs to the stored shop session.
+- The active billing record matches `pendingBillingStates[state].subscriptionId`.
 - The local entitlement update uses stored state values, not query values.
+- Entitlements and state consumption happen in the same atomic DB update.
 
-If Shopify returns an ID that differs from the stored subscription ID format, the callback should still store the subscription ID from the initiation response. The old callback already converts REST charge IDs into GraphQL IDs, so this fix should avoid making the ID format stricter than the current Shopify return behavior until we verify all callback shapes in production.
+If keeping the existing REST charge lookup, compare `gid://shopify/AppSubscription/${charge_id}` with `pendingBillingStates[state].subscriptionId` when Shopify provides `charge_id`. If the formats do not match or Shopify does not return the expected ID, fail closed and log the mismatch. A later improvement can switch this verification to an Admin GraphQL app subscription query, but the minimal fix cannot fall back to "any active charge".
+
+The `shop` query param is only a lookup hint to find the user and offline Shopify session. It is never entitlement truth. The pending state and Shopify verification decide whether local entitlements change.
+
+`saveAppMetafields()` runs only after the local entitlement update succeeds. Metafield sync failure must be logged and treated as retryable repair work. It must not roll back paid entitlements or make the consumed callback replayable.
 
 ## Out of scope
 
@@ -250,6 +274,13 @@ Add regression tests for:
 - Callback ignores query `bucks_plan`, `plan_type`, and `trialDays`.
 - Callback cannot consume the same state twice.
 - Callback does not update entitlements when Shopify status is not active.
+- Callback fails when the active Shopify charge does not match the pending subscription ID.
+- Callback fails when the pending state is expired.
+- Callback atomically sets entitlements and consumes the pending state in one update.
+- Metafield sync failure after entitlement update does not roll back or allow callback replay.
+- Starting billing attempt A, then billing attempt B, then approving A still resolves A from its own pending state.
+- Partner data plus submitted `pro-annual` creates partner annual trusted details unless the merchant is already on `bucks_premium_65`.
+- Pro monthly coupon applies through `validateCoupon(plan.bucksPlan, couponCode, validCoupon)`; non-coupon plans ignore or reject coupon overrides.
 
 ## Commit message
 
