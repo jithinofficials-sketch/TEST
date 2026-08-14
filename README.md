@@ -1,309 +1,198 @@
-# Secure Billing Flow Design
+# Auth Session Hardening Design
 
 ## Goal
 
-Fix the pricing and billing security issues without removing any existing plan. The merchant can still choose legacy monthly, legacy annual, Plus, Pro monthly, Pro annual, and partner Pro annual plans. The browser can choose only the plan ID and optional coupon code. The server owns the price, interval, trial, discount, entitlement data, and callback state.
+Fix the reported auth bypass and missing-auth issues by binding merchant SSR access to the verified Shopify request session, not to `context.query.shop` or a stored offline session. Keep the public storefront validation endpoint read-only so unauthenticated storefront traffic cannot trigger Shopify Admin API mutations.
 
-## Current flow
+## Audience
 
-1. The merchant opens `pages/pricing/index.jsx`.
-2. `getServerSideProps()` loads merchant data with `loadShopData(shop)` and fetches partner data from `userData.partner_referral`.
-3. The pricing page imports `planDetails` from `utils/common/constants/constants.js`.
-4. The page decides which cards to show from `currentPlan`, `currentPlanType`, and `isLegacyUser`.
-5. `computePlanProps()` calculates display values such as annual discount, compare price, badge, savings text, and trial text.
-6. `PricingCard` receives the full frontend plan object through the `plan` prop.
-7. When the merchant clicks upgrade, `PricingCard` calls `upgradePlanHandler({ ...plan, couponCode })`.
-8. `upgradePlanHandler()` calculates trial days in the browser and sends `JSON.stringify({ ...plan, trialDays })` to `/api/v1/billing/initSubscription`.
-9. `initSubscription.js` authenticates the merchant with `fetchSession()`, fetches user and partner data, and reads `req.body` as `subscriptionDetailsFromBody`.
-10. New plans get a server-side amount map, but the code spreads the request body back into `finalDetails` and keeps client-controlled `interval`, `plan_type`, `name`, and `trialDays`.
-11. Legacy plans keep the request body. Legacy monthly sends request price directly to Shopify. Legacy annual calculates discount from request `price.comparePrice`.
-12. `createAppSubscription.js` builds the Shopify `appSubscriptionCreate` mutation from `subscriptionDetailsFromBody` and puts `shop`, `trialDays`, `plan_type`, and `bucks_plan` into the return URL.
-13. After Shopify approval, Shopify redirects to `pages/api/v1/billing/checkSubscriptionStatus.js`.
-14. `checkSubscriptionStatus.js` reads `shop`, `charge_id`, `trialDays`, `plan_type`, and `bucks_plan` from query params, checks that the Shopify charge is active, and writes those query values to `users`.
-15. The callback syncs metafields with the new `bucks_plan`, `plan_type`, and `subscription_id`.
+- Merchant/admin: embedded app SSR pages must only serialize data for the authenticated merchant shop.
+- Staff/admin: full-admin pages must only serialize admin data after the authenticated staff shop is verified with `isSuperAdmin(session.shop)`.
+- Shopper/storefront: widget validation can remain public, but it must not perform privileged side effects.
 
-## Problems by issue
+## Current behavior
 
-### #279 Annual subscription price is calculated from attacker-controlled base amount
+1. `utils/middleware/isSessionValid.js` reads `context.query.shop`.
+2. It calls `sessionHandler.loadSessionWithShop(shop)`.
+3. It treats the presence of that stored offline session as proof that the HTTP requester is authenticated.
+4. Several SSR pages load merchant data from `context.query.shop` before, or without, verifying the request-bound Shopify session.
+5. Admin partner pages authorize from an allowlisted `?shop=` value instead of the requester session.
+6. `pages/api/v1/settings/validateUser/index.js` is public but loads the offline session for `shop` and calls `saveAppMetafields()`.
 
-The vulnerable path is `pages/api/v1/billing/initSubscription.js` legacy annual flow.
+## Issue relevance
 
-```js
-const baseAmount = discountedSubscriptionDetails.price.comparePrice;
+### #283 Any stored merchant session is treated as authentication for the requester
 
-const { finalAmount, discountPercent } =
-  calculateDiscountPricing(baseAmount, userRecord, partnerData);
+Relevant. `utils/middleware/isSessionValid.js` uses `loadSessionWithShop(context.query.shop)`. A stored offline session proves the app has an offline token for that shop; it does not prove the current requester owns that shop session.
+
+This is the root helper flaw. Any page using this helper inherits the bypass unless the helper is changed to use `fetchSession({ req, res })` and compare the authenticated `session.shop` with any requested shop.
+
+### #277 Attacker-controlled shop parameter exposes dashboard data
+
+Relevant. `pages/index.jsx` calls `isShopAvailable(context)` and `isSessionValid(context)` using the same attacker-controlled `context.query.shop`. `isShopAvailable()` loads the merchant record and settings before a trusted tenant identity is established. If session validation fails, the page only sets a client-side redirect flag and can still serialize data in `initialData`.
+
+The dashboard must authenticate first, use `session.shop` as the tenant key, and return a server-side redirect or safe empty props on auth failure.
+
+### #276 Public validation request triggers authenticated Shopify metafield mutation
+
+Relevant. `pages/api/v1/settings/validateUser/index.js` is explicitly documented as public storefront validation, but it loads an offline session and calls `saveAppMetafields(shop, session.accessToken, metaData)` before checking the MD5 `param`.
+
+The endpoint must remain public and read-only. Metafield sync belongs in authenticated settings write flows and billing/status flows, where it already exists.
+
+### #265 Advanced page exposes cross-shop merchant data
+
+Relevant. `pages/advanced/index.jsx` reads `context.query.shop` and calls `loadShopData(shop)` directly. It does not call `isSessionValid`, `isShopAvailable`, `getMerchantPageContext`, or another request-bound auth guard before serializing `settings` and `userData`.
+
+The page must use the same authenticated merchant page context as other merchant SSR pages.
+
+### #264 Partners dashboard trusts allowlisted shop query without authenticating requester
+
+Relevant. `pages/admin/partners/index.jsx` calls `isSuperAdmin(requestedShop)` where `requestedShop` is from the query string. It then validates that same shop through the flawed `isSessionValid` helper. A known allowlisted admin shop domain can therefore expose partner records and admin user data.
+
+Full-admin pages must authenticate the incoming request first and apply `isSuperAdmin()` only to `session.shop`.
+
+### #263 Admin partner edit page authenticates requested shop instead of requesting user
+
+Relevant. `pages/admin/partners/[id].jsx` has the same flaw as #264, then loads a route-selected partner record by `id`.
+
+The same full-admin SSR guard should protect both admin partner pages.
+
+## Related vulnerable patterns
+
+These are not in the pasted issue list but use the same unsafe pattern and should be included in the fix.
+
+- `pages/settings/index.jsx`: loads `loadShopData(context.query.shop)` directly.
+- `pages/pricing/index.jsx`: loads `loadShopData(context.query.shop)` directly.
+- `pages/partners/index.jsx`: loads `loadShopData(context.query.shop)` directly.
+- `pages/currency-rules/index.jsx`: loads `loadShopData(context.query.shop)` directly.
+- `utils/ssr/getMerchantPageContext.js`: currently depends on the flawed `isSessionValid()` implementation.
+- `pages/admin/merchants/index.jsx`: uses `fetchSession()`, but falls back to `sessionHandler.loadSessionWithShop(shop)` if request session lookup fails. That fallback recreates the bypass and must be removed.
+
+## Trust model
+
+`context.query.shop` is navigation context only. It can help decide where to redirect, but it must never decide tenant identity or authorization.
+
+The tenant key for merchant pages is:
+
+```text
+fetchSession({ req, res }).shop
 ```
 
-`discountedSubscriptionDetails` comes from `req.body`. A merchant can replace `price.comparePrice` before the request reaches the API. The server then calculates the annual discount from the fake compare price.
+The authorization key for full-admin pages is:
 
-The fix is to resolve the legacy annual plan from a backend catalog and pass the catalog compare price into discount calculation.
-
-```js
-const plan = getBillingPlan(req.body?.planId);
-const discountPricing = plan.discountEligible
-  ? calculateDiscountPricing(plan.comparePrice, userRecord, partnerData)
-  : null;
+```text
+isSuperAdmin(fetchSession({ req, res }).shop)
 ```
 
-### #270 New plan prices can be paired with attacker-controlled billing intervals
+Stored offline sessions loaded with `loadSessionWithShop(shop)` are allowed only after authorization has already established the effective shop. They are valid for server-to-Shopify operations, not for authenticating HTTP requesters.
 
-The vulnerable path is `pages/api/v1/billing/initSubscription.js` new-plan branch.
+## Target architecture
 
-```js
-const finalDetails = {
-  ...subscriptionDetailsFromBody,
-  price: planPrice,
-  bucks_plan: planId,
-};
+### Request session validation
+
+Add a small shared auth utility that performs request-bound validation:
+
+- calls `fetchSession({ req, res })`;
+- rejects missing sessions;
+- rejects expired sessions when `session.expires` exists;
+- normalizes shop domains with trim + lowercase;
+- optionally compares authenticated `session.shop` to a requested `shop`;
+- returns a structured result containing `session`, `shop`, and failure `reason`.
+
+`isSessionValid(context)` becomes a compatibility wrapper around this utility. It must never import or call `sessionHandler.loadSessionWithShop()`.
+
+### Merchant SSR context
+
+`utils/ssr/getMerchantPageContext.js` should authenticate first:
+
+1. Validate request session with the optional query-shop match.
+2. If invalid, return a redirect context with no `user`, `userData`, or `settings`.
+3. Use authenticated `session.shop` as the only shop value.
+4. Load merchant availability and settings through `isShopAvailable()` using the authenticated shop.
+5. Return `superAdmin` and `canImpersonate` from authenticated shop, not query shop.
+
+Pages should not independently call `loadShopData(context.query.shop)` unless they are already inside a verified impersonation flow such as `getImpersonatedMerchantPageContext()`.
+
+### Full-admin SSR context
+
+Add `utils/admin/getAdminPageContext.js` for full-admin pages:
+
+1. Validate request session with no dependency on `context.query.shop`.
+2. Reject unauthenticated requesters.
+3. Reject authenticated shops that fail `isSuperAdmin(session.shop)`.
+4. Return `{ forbidden, shop, superAdmin, canImpersonate }`.
+
+Use this helper in:
+
+- `pages/admin/partners/index.jsx`
+- `pages/admin/partners/[id].jsx`
+
+Also update `pages/admin/merchants/index.jsx` to remove the unsafe `loadSessionWithShop()` fallback.
+
+### Public storefront validation
+
+`pages/api/v1/settings/validateUser/index.js` remains public because the widget calls it from storefronts. It should only:
+
+1. accept `GET`;
+2. require `shop`;
+3. read `settings` and `users` records;
+4. return `{ status: "true" }` only when `md5(userData.bucks_plan) === param`;
+5. return `{ status: "false" }` otherwise.
+
+It must not load a stored session and must not call `saveAppMetafields()`.
+
+## Page behavior after fix
+
+Merchant pages with missing or mismatched request sessions should use server-side redirects, not client-only redirect flags that serialize sensitive props first.
+
+Recommended redirect target:
+
+```text
+/exitframe?shop=<authenticated-or-requested-shop>
 ```
 
-The server replaces only `price`. It keeps `interval`, `plan_type`, `name`, and `trialDays` from the browser. `createAppSubscription.js` sends `subscriptionDetailsFromBody.interval` to Shopify.
+If the code needs to preserve existing auth behavior for unavailable shops, redirect to the existing auth route without including merchant data in props.
 
-The fix is to never spread the request body into subscription details. Build the object from catalog fields only.
+## Testing strategy
 
-```js
-const trustedDetails = buildTrustedSubscriptionDetails({
-  plan,
-  userRecord,
-  partnerData,
-  couponOverride,
-  discountPricing,
-  trialDays,
-});
+Add focused Vitest coverage before implementation.
+
+- `tests/utils/auth/requestSession.test.js`: request session success, missing session, expired session, query-shop mismatch, normalized match.
+- `tests/utils/middleware/isSessionValid.test.js`: wrapper calls request-bound flow and rejects mismatches without using offline sessions.
+- `tests/utils/ssr/getMerchantPageContext.test.js`: no merchant data loaded when session validation fails; authenticated shop is used instead of query shop.
+- `tests/utils/admin/getAdminPageContext.test.js`: full-admin access derives from `session.shop`; query-shop allowlist does not grant access.
+- `tests/api/settingsValidateUser.test.js`: endpoint does not call `saveAppMetafields()` or `loadSessionWithShop()` and returns the expected MD5 validation status.
+
+Run targeted tests first, then run the full suite:
+
+```bash
+yarn test tests/utils/auth/requestSession.test.js
+yarn test tests/utils/middleware/isSessionValid.test.js
+yarn test tests/utils/ssr/getMerchantPageContext.test.js
+yarn test tests/utils/admin/getAdminPageContext.test.js
+yarn test tests/api/settingsValidateUser.test.js
+yarn test
 ```
-
-### #269 Legacy subscription prices are calculated from client-controlled amounts
-
-The vulnerable path is the legacy branch in `pages/api/v1/billing/initSubscription.js`.
-
-```js
-let discountedSubscriptionDetails = { ...subscriptionDetailsFromBody };
-```
-
-Monthly legacy billing does not canonicalize `price.amount`, `price.currencyCode`, or `interval`. Annual legacy billing also uses request `price.comparePrice`.
-
-The fix is to route legacy and new plans through the same server catalog. Legacy plans stay available, but their billing terms come from the catalog.
-
-### #268 Billing callback trusts attacker-controlled entitlement data
-
-The vulnerable path is `pages/api/v1/billing/checkSubscriptionStatus.js`.
-
-```js
-const { charge_id, shop, trialDays = 0, plan_type = "monthly", bucks_plan = "bucks_premium" } = req.query;
-```
-
-The callback later writes those query values into the merchant record.
-
-```js
-await prisma.users.update({
-  where: { myshopify_domain: shop },
-  data: {
-    bucks_plan,
-    plan_type,
-    trialEndDate: new Date(now.getTime() + trialDays * 24 * 60 * 60 * 1000),
-    trialLeft: +trialDays,
-    trialDays: +trialDays,
-    subscription_id,
-  },
-});
-```
-
-The fix is to store a one-time billing state at initiation. The return URL carries only `shop` and `state`. The callback verifies that Shopify activated the expected subscription, consumes the state atomically, and writes entitlements from the stored state, not from query params.
-
-### #281 Client-controlled subscription price, interval, and trial duration reach Shopify
-
-The vulnerable path is `utils/graphQl/createAppSubscription.js`.
-
-```js
-price: {
-  amount: finalAmount,
-  currencyCode: subscriptionDetailsFromBody.price.currencyCode,
-},
-interval: subscriptionDetailsFromBody.interval,
-trialDays: trialDays,
-```
-
-This helper accepts a mixed object that can contain browser data. The fix is to make it a thin Shopify wrapper that receives trusted server-built details and a one-time billing state.
-
-## Target flow
-
-1. The pricing page still renders from `planDetails` for display.
-2. When the merchant clicks upgrade, the browser sends only `{ planId, couponCode }`.
-3. `initSubscription.js` authenticates with `fetchSession()`.
-4. The endpoint looks up the plan ID in a backend catalog.
-5. The endpoint fetches user and partner data from the database.
-6. The endpoint validates partner-only access, coupon eligibility, discount eligibility, and trial eligibility.
-7. The endpoint builds trusted subscription details from server-owned fields.
-8. The endpoint creates a random billing state and passes `shop` and `state` into the Shopify return URL.
-9. Shopify receives price, currency, interval, name, and trial days from trusted details only.
-10. After Shopify returns an app subscription ID and confirmation URL, the endpoint stores the pending billing state with the expected subscription ID and commercial terms.
-11. The merchant approves billing in Shopify.
-12. Shopify redirects to `/api/v1/billing/checkSubscriptionStatus?shop=<shop>&state=<token>` and includes its billing identifier.
-13. The callback loads the merchant by `shop` and checks `users.acces_checking.pendingBillingStates[state]`.
-14. The callback verifies Shopify activated the exact expected subscription from pending state. It must not accept any active charge for the shop.
-15. The callback atomically writes `bucks_plan`, `plan_type`, accepted price, trial dates, subscription ID, and the consumed state marker in one DB update.
-16. The callback syncs metafields from stored state as a retryable side effect and redirects the merchant back to pricing.
-
-## Backend plan catalog
-
-Add `utils/billing/billingPlanCatalog.js`. It should include all current plans:
-
-- `legacy-monthly`
-- `legacy-annual`
-- `plus`
-- `pro-monthly`
-- `pro-annual`
-- `pro-annual-partner`
-
-Each catalog entry owns:
-
-- `id`
-- `name`
-- `bucksPlan`
-- `planType`
-- `amount`
-- `comparePrice`
-- `currencyCode`
-- `interval`
-- `discountEligible`
-- `couponEligible`
-- `partnerOnly`
-
-The frontend `planDetails` can keep its current UI fields, but those fields are display-only.
-
-## Pricing parity guardrails
-
-This fix must not change the merchant-visible pricing logic. The server catalog exists to protect billing, not to redesign pricing.
-
-Keep these current behaviors:
-
-- Legacy monthly amount remains `BASE_PRICE`, currency `USD`, interval `MONTHLY_INTERVAL`, plan `bucks_premium`, plan type `monthly`.
-- Legacy annual compare price remains `COMPARE_PRICE * 12`, interval `ANNUAL_INTERVAL`, and discount percent still comes from `calculateDiscountPricing()` with the same user and partner inputs.
-- Legacy annual partner discount still uses `partnerData.discountPercent` when present.
-- Legacy annual user discount branches remain the same: new users get `ANNUAL_PLAN_NEW_USER_DISCOUNT`, users with `subscription_id` or current `bucks_premium` get `ANNUAL_PLAN_EXISTING_PLUS_DISCOUNT`, and true free users get `ANNUAL_PLAN_EXISTING_FREE_DISCOUNT`.
-- Pro annual standard amount remains `NEW_PRO_ANNUAL_PRICE`; partner Pro annual amount remains `NEW_PRO_ANNUAL_PRICE_PARTNER`; full compare price remains `NEW_PRO_ANNUAL_FULL_PRICE`.
-- Partner Pro annual override keeps the existing exception for merchants currently on `bucks_premium_65`.
-- Pro monthly coupon still validates with the existing `validateCoupon()` helper against Bucks plan ID `bucks_premium_pro`.
-
-Do not change `calculateDiscountPricing()` as part of this security fix. It is shared with the pricing page display. Server billing should validate catalog amounts before calling it rather than changing the shared helper's behavior.
-
-## Partner Pro annual contract
-
-Partner merchants currently get a server-side Pro annual override in `pages/api/v1/billing/initSubscription.js`: standard Pro annual can become partner Pro annual when `partnerData` exists, except for merchants already on the legacy partner annual plan `bucks_premium_65`.
-
-Keep that runtime behavior. The frontend can keep sending `planId: "pro-annual"` when the merchant clicks the displayed Pro annual card. `initSubscription.js` must canonicalize that to `pro-annual-partner` when `partnerData` exists and `userRecord.bucks_plan !== "bucks_premium_65"`. This keeps Shopify approval aligned with the displayed partner price.
-
-## Coupon contract
-
-The browser sends the coupon code only. It does not decide the discounted amount. The server validates coupons against the resolved catalog plan.
-
-`validateCoupon()` currently expects the Bucks plan ID `bucks_premium_pro`, not the catalog ID `pro-monthly`. Keep that behavior for the minimal fix: call `validateCoupon(plan.bucksPlan, couponCode, validCoupon)`. Only plans with `couponEligible: true` can receive a coupon override.
-
-## Trial policy
-
-Trial days must be resolved server side. The browser must not send trial days.
-
-Rules:
-
-- Existing premium merchant with an active `trialEndDate` keeps the remaining days.
-- Merchant with `trialLeft > 0` keeps that preserved trial balance.
-- Merchant with no `subscription_id` receives partner trial days or `DEFAULT_TRIAL_DAYS`.
-- Merchant that already subscribed and has no remaining trial gets `0`.
-- Trial days must be an integer from `0` to `90`.
-
-The server-side resolver must mirror the current frontend flow from `pages/pricing/index.jsx`: check active premium trial first, then preserved `trialLeft`, then brand-new merchant default or partner trial, otherwise `0`.
-
-## Billing state
-
-Use the existing `users.acces_checking` JSON field instead of adding a new Prisma model. Store pending billing attempts by state under `users.acces_checking.pendingBillingStates`. This allows multiple Shopify approval tabs to complete independently without overwriting each other.
-
-```js
-{
-  pendingBillingStates: {
-    [state]: {
-      state,
-      subscriptionId,
-      planId,
-      bucksPlan,
-      planType,
-      name,
-      amount,
-      currencyCode,
-      interval,
-      trialDays,
-      status: "pending",
-      expiresAtMs,
-      createdAtMs,
-    }
-  }
-}
-```
-
-Use numeric timestamps because `acces_checking` is a Prisma `Json?` field. Store `createdAtMs`, `expiresAtMs`, and `consumedAtMs` as numbers and compare with `Date.now()` in raw Mongo queries.
-
-The initiation route must persist each new state with an atomic `prisma.$runCommandRaw()` `$set` at `acces_checking.pendingBillingStates.<state>`. It must not read, merge, and replace the whole `acces_checking` JSON object, because concurrent billing attempts can otherwise overwrite each other.
-
-The state expires after 30 minutes. The callback applies entitlements and consumes the state in one `prisma.$runCommandRaw()` update so a mid-callback failure cannot strand a paid merchant with a consumed state and no local plan. The raw update must match `myshopify_domain`, `acces_checking.pendingBillingStates.<state>.state`, `acces_checking.pendingBillingStates.<state>.status: "pending"`, and `acces_checking.pendingBillingStates.<state>.expiresAtMs > Date.now()`. It must `$set` both the entitlement fields and `status: "consumed"` plus `consumedAtMs`. If exactly one record is not modified, the callback fails.
-
-`state` is generated with `crypto.randomUUID()`. The callback must validate the UUID format before using it in a dynamic Mongo path. A UUID contains no `.` or `$`, so it is safe for the dynamic key path after validation.
-
-Do not prune stale entries by replacing the whole parent JSON during billing initiation. Cleanup should run as a separate safe maintenance step, or use targeted `$unset` paths for known expired state keys. The hot billing initiation path only adds the new state with atomic `$set`.
-
-## Shopify verification
-
-The callback must verify the specific expected subscription, not just any active charge for the shop.
-
-The callback must still verify:
-
-- Shopify response exists.
-- Charge status is `active`.
-- The active billing record belongs to the stored shop session.
-- The active billing record matches `pendingBillingStates[state].subscriptionId`.
-- The local entitlement update uses stored state values, not query values.
-- Entitlements and state consumption happen in the same atomic DB update.
-
-If keeping the existing REST charge lookup, compare `gid://shopify/AppSubscription/${charge_id}` with `pendingBillingStates[state].subscriptionId` when Shopify provides `charge_id`. If the formats do not match or Shopify does not return the expected ID, fail closed and log the mismatch. A later improvement can switch this verification to an Admin GraphQL app subscription query, but the minimal fix cannot fall back to "any active charge".
-
-The `shop` query param is only a lookup hint to find the user and offline Shopify session. It is never entitlement truth. The pending state and Shopify verification decide whether local entitlements change.
-
-`saveAppMetafields()` runs only after the local entitlement update succeeds. Metafield sync failure must be logged and treated as retryable repair work. It must not roll back paid entitlements or make the consumed callback replayable.
 
 ## Out of scope
 
-- Removing legacy plans.
-- Redesigning pricing cards.
-- Changing public pricing copy.
-- Implementing the `APP_SUBSCRIPTIONS_UPDATE` webhook.
-- Migrating all billing verification from REST to Admin GraphQL.
-- Changing cancellation behavior except where it depends on the corrected `subscription_id`.
-
-## Test coverage
-
-Add regression tests for:
-
-- Unknown plan ID is rejected.
-- Legacy monthly ignores submitted price, currency, interval, and trial days.
-- Legacy annual ignores submitted compare price.
-- New monthly cannot be created with annual interval.
-- Partner-only annual plan rejects non-partner shops.
-- Coupon applies only to Pro monthly.
-- Trial days are computed from DB state.
-- Callback ignores query `bucks_plan`, `plan_type`, and `trialDays`.
-- Callback cannot consume the same state twice.
-- Callback does not update entitlements when Shopify status is not active.
-- Callback fails when the active Shopify charge does not match the pending subscription ID.
-- Callback fails when the pending state is expired.
-- Callback atomically sets entitlements and consumes the pending state in one update.
-- Metafield sync failure after entitlement update does not roll back or allow callback replay.
-- Starting billing attempt A, then billing attempt B, then approving A still resolves A from its own pending state.
-- Partner data plus submitted `pro-annual` creates partner annual trusted details unless the merchant is already on `bucks_premium_65`.
-- Pro monthly coupon applies through `validateCoupon(plan.bucksPlan, couponCode, validCoupon)`; non-coupon plans ignore or reject coupon overrides.
+- Redesigning merchant UI or navigation.
+- Changing impersonated merchant route contracts under `pages/admin/merchants/[merchant]/*`, except removing unsafe auth fallback from the merchant panel landing page.
+- Adding rate limiting to `validateUser`. It is useful defense-in-depth, but the critical fix is removing public side effects.
+- Changing Shopify metafield payload shape.
 
 ## Commit message
 
-Use this commit message for the fix:
+Use this commit message after the implementation and tests pass:
 
 ```text
-fix(billing): derive subscription terms from server catalog
+fix(auth): bind merchant SSR pages to verified Shopify sessions
+```
+
+If the implementation is split into multiple commits, use:
+
+```text
+fix(auth): validate SSR sessions from requests
+fix(admin): derive partner dashboard access from staff sessions
+fix(settings): keep storefront validation endpoint read-only
 ```
