@@ -148,11 +148,36 @@ Add a small shared auth utility that performs request-bound validation:
 4. Load merchant availability and settings through `isShopAvailable()` using the authenticated shop.
 5. Return `superAdmin` and `canImpersonate` from authenticated shop, not query shop.
 
+Every normal merchant SSR page must use the same authenticated source before loading merchant, settings, partner, pricing, or banner data. Required conversions:
+
+- `pages/index.jsx`
+- `pages/settings/index.jsx`
+- `pages/advanced/index.jsx`
+- `pages/pricing/index.jsx`
+- `pages/partners/index.jsx`
+- `pages/currency-rules/index.jsx`
+
+`pages/analytics/index.jsx` and `pages/integrations/index.jsx` already call `getMerchantPageContext(context)`. They are fixed through the helper once the helper authenticates before loading availability data.
+
 Pages should not independently call `loadShopData(context.query.shop)` unless they are already inside a verified impersonation flow such as `getImpersonatedMerchantPageContext()`.
+
+`isShopAvailable()` must not accidentally preserve the raw-query contract. Choose one implementation contract and test it:
+
+- Preferred: add `isShopAvailableForShop(shop)` and make it accept only an already-authenticated shop string.
+- Acceptable: keep `isShopAvailable(context)`, but `getMerchantPageContext()` must construct a new internal context whose `query.shop` is overwritten with authenticated `session.shop` after request validation.
+
+Tests must assert that Prisma reads use authenticated `session.shop`, not incoming `context.query.shop`.
 
 ### Full-admin SSR context
 
-Add `utils/admin/getAdminPageContext.js` for full-admin pages:
+Add role-specific admin SSR guards:
+
+- `getAdminPageContext(context)`: for full-admin pages that require `SUPER_ADMIN_DOMAINS`.
+- `getImpersonatorAdminPageContext(context)`: for the merchant panel landing page that allows both `SUPER_ADMIN_DOMAINS` and `STAFF_STORES` through `isImpersonator()`.
+
+Both guards must derive staff identity from `fetchSession({ req, res }).shop` before checking roles. Do not use `getAuthorizedAdminShop({ shop: requestedShop })` for SSR authorization.
+
+For full-admin pages, `getAdminPageContext(context)` should:
 
 1. Validate request session with no dependency on `context.query.shop`.
 2. Reject unauthenticated requesters.
@@ -164,7 +189,17 @@ Use this helper in:
 - `pages/admin/partners/index.jsx`
 - `pages/admin/partners/[id].jsx`
 
-Also update `pages/admin/merchants/index.jsx` to remove the unsafe `loadSessionWithShop()` fallback.
+For the merchant panel landing page, `getImpersonatorAdminPageContext(context)` should:
+
+1. Validate request session with no dependency on `context.query.shop`.
+2. Reject unauthenticated requesters.
+3. Reject authenticated shops that fail `isImpersonator(session.shop)`.
+4. Return `{ forbidden, shop, superAdmin, canImpersonate }`, where `superAdmin` still reflects `isSuperAdmin(session.shop)`.
+
+Use this helper in `pages/admin/merchants/index.jsx` and remove both unsafe patterns there:
+
+- `getAuthorizedAdminShop({ shop: requestedShop })` as SSR authorization.
+- fallback to `sessionHandler.loadSessionWithShop(shop)` when request-session lookup fails.
 
 ### Public storefront validation
 
@@ -178,17 +213,19 @@ Also update `pages/admin/merchants/index.jsx` to remove the unsafe `loadSessionW
 
 It must not load a stored session and must not call `saveAppMetafields()`.
 
+Response contract must preserve storefront widget behavior from `widgets/src/apps/widgets/buckscc/validateUserPlan.js`, where AJAX `error` rejects the promise. For `GET` with a syntactically valid `shop`, return HTTP 200 with `{ status: "true" | "false" }` even when settings or user records are missing. Use 400 only for malformed requests, such as missing/blank `shop`, and 405 for method mismatch.
+
 ## Page behavior after fix
 
 Merchant pages with missing or mismatched request sessions should use server-side redirects, not client-only redirect flags that serialize sensitive props first.
 
-Recommended redirect target:
+Recommended redirect target must match the existing catch-all route `pages/exitframe/[...shop].js`:
 
 ```text
-/exitframe?shop=<authenticated-or-requested-shop>
+/exitframe/<encoded-shop>
 ```
 
-If the code needs to preserve existing auth behavior for unavailable shops, redirect to the existing auth route without including merchant data in props.
+Use `encodeURIComponent(shop)` when constructing this path. Do not use `/exitframe?shop=<shop>` unless a top-level `/exitframe` route is added and tested. If the code needs to preserve existing auth behavior for unavailable shops, redirect to the existing auth route without including merchant data in props.
 
 ## Testing strategy
 
@@ -197,8 +234,9 @@ Add focused Vitest coverage before implementation.
 - `tests/utils/auth/requestSession.test.js`: request session success, missing session, expired session, query-shop mismatch, normalized match.
 - `tests/utils/middleware/isSessionValid.test.js`: wrapper calls request-bound flow and rejects mismatches without using offline sessions.
 - `tests/utils/ssr/getMerchantPageContext.test.js`: no merchant data loaded when session validation fails; authenticated shop is used instead of query shop.
-- `tests/utils/admin/getAdminPageContext.test.js`: full-admin access derives from `session.shop`; query-shop allowlist does not grant access.
-- `tests/api/settingsValidateUser.test.js`: endpoint does not call `saveAppMetafields()` or `loadSessionWithShop()` and returns the expected MD5 validation status.
+- `tests/utils/admin/getAdminPageContext.test.js`: full-admin access derives from `session.shop`; query-shop allowlist does not grant access; merchant-panel impersonator access derives from `session.shop` and allows `STAFF_STORES` through `isImpersonator()`.
+- `tests/pages/merchantSsrAuth.test.js`: each normal merchant SSR entrypoint rejects or ignores mismatched query shop and never loads data for the attacker-selected shop.
+- `tests/api/settingsValidateUser.test.js`: endpoint does not call `saveAppMetafields()` or `loadSessionWithShop()` and returns the expected MD5 validation status, including 200 `{ status: "false" }` for missing settings/user data.
 
 Run targeted tests first, then run the full suite:
 
@@ -207,6 +245,7 @@ yarn test tests/utils/auth/requestSession.test.js
 yarn test tests/utils/middleware/isSessionValid.test.js
 yarn test tests/utils/ssr/getMerchantPageContext.test.js
 yarn test tests/utils/admin/getAdminPageContext.test.js
+yarn test tests/pages/merchantSsrAuth.test.js
 yarn test tests/api/settingsValidateUser.test.js
 yarn test
 ```
