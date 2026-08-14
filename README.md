@@ -1,276 +1,340 @@
-# Auth Session Hardening Design
+# Auth Session Hardening Notes
 
-## Goal
+## Problem
 
-Fix the reported auth bypass and missing-auth issues by binding merchant SSR access to the verified Shopify request session, not to `context.query.shop` or a stored offline session. Keep the public storefront validation endpoint read-only so unauthenticated storefront traffic cannot trigger Shopify Admin API mutations.
+Normal merchant SSR pages currently use the URL query shop as the tenant key.
 
-## Audience
+Example shape:
 
-- Merchant/admin: embedded app SSR pages must only serialize data for the authenticated merchant shop.
-- Staff/admin: full-admin pages must only serialize admin data after the authenticated staff shop is verified with `isSuperAdmin(session.shop)`.
-- Shopper/storefront: widget validation can remain public, but it must not perform privileged side effects.
-
-## Current behavior
-
-1. `utils/middleware/isSessionValid.js` reads `context.query.shop`.
-2. It calls `sessionHandler.loadSessionWithShop(shop)`.
-3. It treats the presence of that stored offline session as proof that the HTTP requester is authenticated.
-4. Several SSR pages load merchant data from `context.query.shop` before, or without, verifying the request-bound Shopify session.
-5. Admin partner pages authorize from an allowlisted `?shop=` value instead of the requester session.
-6. `pages/api/v1/settings/validateUser/index.js` is public but loads the offline session for `shop` and calls `saveAppMetafields()`.
-
-## Issue relevance
-
-### #283 Any stored merchant session is treated as authentication for the requester
-
-Relevant. `utils/middleware/isSessionValid.js` uses `loadSessionWithShop(context.query.shop)`. A stored offline session proves the app has an offline token for that shop; it does not prove the current requester owns that shop session.
-
-This is the root helper flaw. Any page using this helper inherits the bypass unless the helper is changed to use `fetchSession({ req, res })` and compare the authenticated `session.shop` with any requested shop.
-
-### #277 Attacker-controlled shop parameter exposes dashboard data
-
-Relevant. `pages/index.jsx` calls `isShopAvailable(context)` and `isSessionValid(context)` using the same attacker-controlled `context.query.shop`. `isShopAvailable()` loads the merchant record and settings before a trusted tenant identity is established. If session validation fails, the page only sets a client-side redirect flag and can still serialize data in `initialData`.
-
-The dashboard must authenticate first, use `session.shop` as the tenant key, and return a server-side redirect or safe empty props on auth failure.
-
-### #276 Public validation request triggers authenticated Shopify metafield mutation
-
-Relevant. `pages/api/v1/settings/validateUser/index.js` is explicitly documented as public storefront validation, but it loads an offline session and calls `saveAppMetafields(shop, session.accessToken, metaData)` before checking the MD5 `param`.
-
-The endpoint must remain public and read-only. Metafield sync belongs in authenticated settings write flows and billing/status flows, where it already exists.
-
-### #265 Advanced page exposes cross-shop merchant data
-
-Relevant. `pages/advanced/index.jsx` reads `context.query.shop` and calls `loadShopData(shop)` directly. It does not call `isSessionValid`, `isShopAvailable`, `getMerchantPageContext`, or another request-bound auth guard before serializing `settings` and `userData`.
-
-The page must use the same authenticated merchant page context as other merchant SSR pages.
-
-### #264 Partners dashboard trusts allowlisted shop query without authenticating requester
-
-Relevant. `pages/admin/partners/index.jsx` calls `isSuperAdmin(requestedShop)` where `requestedShop` is from the query string. It then validates that same shop through the flawed `isSessionValid` helper. A known allowlisted admin shop domain can therefore expose partner records and admin user data.
-
-Full-admin pages must authenticate the incoming request first and apply `isSuperAdmin()` only to `session.shop`.
-
-### #263 Admin partner edit page authenticates requested shop instead of requesting user
-
-Relevant. `pages/admin/partners/[id].jsx` has the same flaw as #264, then loads a route-selected partner record by `id`.
-
-The same full-admin SSR guard should protect both admin partner pages.
-
-## Related-area audit
-
-I searched SSR pages and session helpers for these patterns:
-
-```bash
-rg "getServerSideProps|loadShopData\(|getMerchantPageContext\(|getImpersonatedMerchantPageContext\(|loadSessionWithShop\(|fetchSession\(|context\.query\?\.shop|context\.query\.shop|isSessionValid\(" pages utils
+```js
+const shop = context.query.shop;
+const data = await loadShopData(shop);
 ```
 
-### Must fix with this root cause
+Then SSR serializes merchant data to the browser:
 
-These areas either serialize merchant/admin data from `context.query.shop`, authorize an admin page from query-string shop, or inherit the broken `isSessionValid()` behavior. They should be changed in the same implementation because the root cause is the same.
+```js
+return {
+  props: {
+    initialData: {
+      userData,
+      settings,
+    },
+  },
+};
+```
 
-- `pages/settings/index.jsx`: loads `loadShopData(context.query.shop)` directly.
-- `pages/pricing/index.jsx`: loads `loadShopData(context.query.shop)` directly.
-- `pages/partners/index.jsx`: loads `loadShopData(context.query.shop)` directly.
-- `pages/currency-rules/index.jsx`: loads `loadShopData(context.query.shop)` directly.
-- `pages/analytics/index.jsx`: uses `getMerchantPageContext()`, so it is affected until that helper authenticates before loading data.
-- `pages/integrations/index.jsx`: uses `getMerchantPageContext()`, so it is affected until that helper authenticates before loading data.
-- `utils/ssr/getMerchantPageContext.js`: currently depends on the flawed `isSessionValid()` implementation.
-- `pages/admin/merchants/index.jsx`: uses `fetchSession()`, but falls back to `sessionHandler.loadSessionWithShop(shop)` if request session lookup fails. That fallback recreates the bypass and must be removed.
+`context.query.shop` is browser-controlled. If someone changes the URL to another installed shop, SSR can load data for that shop when the app has a stored offline session or DB records for it.
 
-### Related but already uses a dedicated impersonation guard
-
-These pages use `getImpersonatedMerchantPageContext()`, which calls `getEffectiveShopContext()`. That helper verifies the staff request session with `fetchSession({ req, res })`, checks `isImpersonator(staffShop)`, checks the active impersonation session, then loads merchant data. They should not be changed for this issue unless testing shows the impersonation helper itself is broken.
-
-- `pages/admin/merchants/[merchant]/index.jsx`
-- `pages/admin/merchants/[merchant]/settings.jsx`
-- `pages/admin/merchants/[merchant]/advanced.jsx`
-- `pages/admin/merchants/[merchant]/pricing.jsx`
-- `pages/admin/merchants/[merchant]/partners.jsx`
-- `pages/admin/merchants/[merchant]/integrations.jsx`
-- `pages/admin/merchants/[merchant]/analytics.jsx`
-- `pages/admin/merchants/[merchant]/currency-rules.jsx`
-
-### Related but not the same root-cause fix
-
-These files call `loadSessionWithShop(shop)`, but not as SSR requester authentication. They should be documented and regression-tested where relevant, not blindly changed in this auth-hardening patch.
-
-- `pages/api/v1/user/latest.js`: under `withImpersonation()`, it loads the merchant offline session only after the staff session and impersonation session are validated. This is an authorized server-to-Shopify operation and should remain.
-- `pages/api/v1/billing/checkSubscriptionStatus.js`: Shopify billing callback uses the shop offline session to verify the charge. It has separate billing-state security concerns, but it is not the same requester-auth bypass covered by these issues.
-- `utils/helper.js` `checkMoneyFormat(shop)`: helper loads the offline session for a shop-domain server operation. It is not used in the audited SSR paths; no direct change for this issue.
-- `utils/extensionCheck.js`: helper loads the offline session for extension/theme status checks. It is not used in the audited SSR paths; no direct change for this issue.
-- `pages/api/v1/public/moneyFormat.js`: public onboarding helper loads a shop offline session and reads Shopify shop money formats. This is a public endpoint with authenticated Admin API read side effects, but it is not in the pasted issues and does not serialize another merchant's app DB data through SSR. Track separately unless the current security batch is explicitly expanded to public endpoint API-capacity hardening.
-
-### Safe redirect-only query usage
-
-- `pages/admin/merchants/list.jsx`: reads `context.query.shop` only to redirect to `/admin/merchants?shop=...`. It does not load merchant data or authorize access. No change needed for this issue.
-
-## Trust model
-
-`context.query.shop` is navigation context only. It can help decide where to redirect, but it must never decide tenant identity or authorization.
-
-The tenant key for merchant pages is:
+The stored offline session proves only this:
 
 ```text
-fetchSession({ req, res }).shop
+The app has an installed token for that shop.
 ```
 
-The authorization key for full-admin pages is:
+It does not prove this:
 
 ```text
-isSuperAdmin(fetchSession({ req, res }).shop)
+The current browser requester belongs to that shop.
 ```
 
-Stored offline sessions loaded with `loadSessionWithShop(shop)` are allowed only after authorization has already established the effective shop. They are valid for server-to-Shopify operations, not for authenticating HTTP requesters.
+That is the merchant SSR security issue.
 
-## Target architecture
+## Why The Strict SSR Fix Broke Install
 
-### Request session validation
+The first attempted hardening was to use Shopify's request-bound session during merchant SSR:
 
-Add a small shared auth utility that performs request-bound validation:
+```js
+const session = await fetchSession({ req, res });
+const shop = session.shop;
+```
 
-- calls `fetchSession({ req, res })`;
-- rejects missing sessions;
-- rejects expired sessions when `session.expires` exists;
-- normalizes shop domains with trim + lowercase;
-- optionally compares authenticated `session.shop` to a requested `shop`;
-- returns a structured result containing `session`, `shop`, and failure `reason`.
+This is the right trust source because `session.shop` comes from the authenticated Shopify request, not from the URL.
 
-`isSessionValid(context)` becomes a compatibility wrapper around this utility. It must never import or call `sessionHandler.loadSessionWithShop()`.
-
-### Merchant SSR context
-
-`utils/ssr/getMerchantPageContext.js` should authenticate first:
-
-1. Validate request session with the optional query-shop match.
-2. If invalid, return a redirect context with no `user`, `userData`, or `settings`.
-3. Use authenticated `session.shop` as the only shop value.
-4. Load merchant availability and settings through `isShopAvailable()` using the authenticated shop.
-5. Return `superAdmin` and `canImpersonate` from authenticated shop, not query shop.
-
-Every normal merchant SSR page must use the same authenticated source before loading merchant, settings, partner, pricing, or banner data. Required conversions:
-
-- `pages/index.jsx`
-- `pages/settings/index.jsx`
-- `pages/advanced/index.jsx`
-- `pages/pricing/index.jsx`
-- `pages/partners/index.jsx`
-- `pages/currency-rules/index.jsx`
-
-`pages/analytics/index.jsx` and `pages/integrations/index.jsx` already call `getMerchantPageContext(context)`. They are fixed through the helper once the helper authenticates before loading availability data.
-
-Pages should not independently call `loadShopData(context.query.shop)` unless they are already inside a verified impersonation flow such as `getImpersonatedMerchantPageContext()`.
-
-`isShopAvailable()` must not accidentally preserve the raw-query contract. Choose one implementation contract and test it:
-
-- Preferred: add `isShopAvailableForShop(shop)` and make it accept only an already-authenticated shop string.
-- Acceptable: keep `isShopAvailable(context)`, but `getMerchantPageContext()` must construct a new internal context whose `query.shop` is overwritten with authenticated `session.shop` after request validation.
-
-Tests must assert that Prisma reads use authenticated `session.shop`, not incoming `context.query.shop`.
-
-### Full-admin SSR context
-
-Add role-specific admin SSR guards:
-
-- `getAdminPageContext(context)`: for full-admin pages that require `SUPER_ADMIN_DOMAINS`.
-- `getImpersonatorAdminPageContext(context)`: for the merchant panel landing page that allows both `SUPER_ADMIN_DOMAINS` and `STAFF_STORES` through `isImpersonator()`.
-
-Both guards must derive staff identity from `fetchSession({ req, res }).shop` before checking roles. Do not use `getAuthorizedAdminShop({ shop: requestedShop })` for SSR authorization.
-
-For full-admin pages, `getAdminPageContext(context)` should:
-
-1. Validate request session with no dependency on `context.query.shop`.
-2. Reject unauthenticated requesters.
-3. Reject authenticated shops that fail `isSuperAdmin(session.shop)`.
-4. Return `{ forbidden, shop, superAdmin, canImpersonate }`.
-
-Use this helper in:
-
-- `pages/admin/partners/index.jsx`
-- `pages/admin/partners/[id].jsx`
-
-For the merchant panel landing page, `getImpersonatorAdminPageContext(context)` should:
-
-1. Validate request session with no dependency on `context.query.shop`.
-2. Reject unauthenticated requesters.
-3. Reject authenticated shops that fail `isImpersonator(session.shop)`.
-4. Return `{ forbidden, shop, superAdmin, canImpersonate }`, where `superAdmin` still reflects `isSuperAdmin(session.shop)`.
-
-Use this helper in `pages/admin/merchants/index.jsx` and remove both unsafe patterns there:
-
-- `getAuthorizedAdminShop({ shop: requestedShop })` as SSR authorization.
-- fallback to `sessionHandler.loadSessionWithShop(shop)` when request-session lookup fails.
-
-### Public storefront validation
-
-`pages/api/v1/settings/validateUser/index.js` remains public because the widget calls it from storefronts. It should only:
-
-1. accept `GET`;
-2. require `shop`;
-3. read `settings` and `users` records;
-4. return `{ status: "true" }` only when `md5(userData.bucks_plan) === param`;
-5. return `{ status: "false" }` otherwise.
-
-It must not load a stored session and must not call `saveAppMetafields()`.
-
-Response contract must preserve storefront widget behavior from `widgets/src/apps/widgets/buckscc/validateUserPlan.js`, where AJAX `error` rejects the promise. For `GET` with a syntactically valid `shop`, return HTTP 200 with `{ status: "true" | "false" }` even when settings or user records are missing. Use 400 only for malformed requests, such as missing/blank `shop`, and 405 for method mismatch.
-
-## Page behavior after fix
-
-Merchant pages with missing or mismatched request sessions should use server-side redirects, not client-only redirect flags that serialize sensitive props first.
-
-Recommended redirect target must match the existing catch-all route `pages/exitframe/[...shop].js`:
+But the normal embedded install flow lands on the dashboard through a browser redirect:
 
 ```text
-/exitframe/<encoded-shop>
+/api/auth/callback
+-> GET /?shop=store.myshopify.com&host=...
 ```
 
-Use `encodeURIComponent(shop)` when constructing this path. Do not use `/exitframe?shop=<shop>` unless a top-level `/exitframe` route is added and tested. If the code needs to preserve existing auth behavior for unavailable shops, redirect to the existing auth route without including merchant data in props.
-
-## Testing strategy
-
-Add focused Vitest coverage before implementation.
-
-- `tests/utils/auth/requestSession.test.js`: request session success, missing session, expired session, query-shop mismatch, normalized match.
-- `tests/utils/middleware/isSessionValid.test.js`: wrapper calls request-bound flow and rejects mismatches without using offline sessions.
-- `tests/utils/ssr/getMerchantPageContext.test.js`: no merchant data loaded when session validation fails; authenticated shop is used instead of query shop.
-- `tests/utils/admin/getAdminPageContext.test.js`: full-admin access derives from `session.shop`; query-shop allowlist does not grant access; merchant-panel impersonator access derives from `session.shop` and allows `STAFF_STORES` through `isImpersonator()`.
-- `tests/pages/merchantSsrAuth.test.js`: each normal merchant SSR entrypoint rejects or ignores mismatched query shop and never loads data for the attacker-selected shop.
-- `tests/api/settingsValidateUser.test.js`: endpoint does not call `saveAppMetafields()` or `loadSessionWithShop()` and returns the expected MD5 validation status, including 200 `{ status: "false" }` for missing settings/user data.
-
-Run targeted tests first, then run the full suite:
-
-```bash
-yarn test tests/utils/auth/requestSession.test.js
-yarn test tests/utils/middleware/isSessionValid.test.js
-yarn test tests/utils/ssr/getMerchantPageContext.test.js
-yarn test tests/utils/admin/getAdminPageContext.test.js
-yarn test tests/pages/merchantSsrAuth.test.js
-yarn test tests/api/settingsValidateUser.test.js
-yarn test
-```
-
-## Out of scope
-
-- Redesigning merchant UI or navigation.
-- Changing impersonated merchant route contracts under `pages/admin/merchants/[merchant]/*`, except removing unsafe auth fallback from the merchant panel landing page.
-- Adding rate limiting to `validateUser`. It is useful defense-in-depth, but the critical fix is removing public side effects.
-- Changing `pages/api/v1/public/moneyFormat.js`. It may deserve a separate public-endpoint hardening issue, but it is outside the reported SSR auth-bypass root cause.
-- Changing `pages/api/v1/billing/checkSubscriptionStatus.js`. Billing callback trust was handled by the separate secure billing-flow spec and should not be mixed into this auth SSR patch.
-- Changing Shopify metafield payload shape.
-
-## Commit message
-
-Use this commit message after the implementation and tests pass:
+That first page request is not an App Bridge authenticated API request. It does not include:
 
 ```text
-fix(auth): bind merchant SSR pages to verified Shopify sessions
+Authorization: Bearer <Shopify session token>
 ```
 
-If the implementation is split into multiple commits, use:
+So `fetchSession({ req, res })` fails during SSR with an error like:
 
 ```text
-fix(auth): validate SSR sessions from requests
-fix(admin): derive partner dashboard access from staff sessions
-fix(settings): keep storefront validation endpoint read-only
+Missing Authorization header, was the request made with authenticatedFetch?
+```
+
+Then the SSR page treats the fresh OAuth landing as unauthenticated and redirects to auth again. That creates an OAuth loop:
+
+```text
+OAuth completes
+-> callback redirects to dashboard
+-> dashboard SSR cannot fetch session
+-> dashboard redirects to auth/exitframe
+-> OAuth starts again
+```
+
+The problem is not that the OAuth callback failed. The callback completed and stored the session. The problem is that the next browser document request does not carry the App Bridge Authorization header that `fetchSession()` expects.
+
+## Related Exitframe Bug
+
+`pages/exitframe/[...shop].js` used to build auth URLs only from the Shopify browser config:
+
+```js
+const shop = window?.shopify?.config?.shop;
+
+open(`${process.env.CONFIG_SHOPIFY_APP_URL}/api/auth?shop=${shop}`, "_top");
+```
+
+During install or reauth, `window.shopify.config.shop` can be missing. That produced:
+
+```text
+/api/auth?shop=undefined
+```
+
+and Shopify returned:
+
+```text
+InvalidShopError: Received invalid shop argument
+```
+
+The minimal fix is to read the catch-all route value first.
+
+For a plain shop route:
+
+```text
+/exitframe/store.myshopify.com
+```
+
+build:
+
+```text
+/api/auth?shop=store.myshopify.com
+```
+
+For an existing OAuth query route:
+
+```text
+/exitframe/shop=store.myshopify.com&host=abc&embedded=1
+```
+
+preserve the query:
+
+```text
+/api/auth?shop=store.myshopify.com&host=abc&embedded=1
+```
+
+This fix only corrects OAuth URL construction. It does not solve the merchant SSR security issue by itself.
+
+## Fix Option 1: SSR Shell + Authenticated Bootstrap API
+
+This is the clean long-term fix.
+
+Normal merchant SSR pages should not load sensitive merchant data. They should render a safe shell only.
+
+Flow:
+
+```text
+1. OAuth completes.
+2. /api/auth/callback redirects to /?shop=store.myshopify.com&host=...
+3. SSR receives a normal browser GET with no Authorization header.
+4. SSR renders a safe shell only.
+5. App Bridge loads in the browser.
+6. Client calls /api/v1/bootstrap using authenticated fetch.
+7. Bootstrap API calls fetchSession({ req, res }).
+8. Bootstrap API uses session.shop as the tenant key.
+9. Bootstrap API loads merchant data and returns it.
+10. Page renders the real dashboard/settings content.
+```
+
+SSR example:
+
+```js
+export async function getServerSideProps(context) {
+  return {
+    props: {
+      shop: context.query?.shop || null,
+      host: context.query?.host || null,
+      initialData: null,
+      needsBootstrap: true,
+    },
+  };
+}
+```
+
+The SSR shell must not include sensitive merchant data:
+
+```text
+userData
+settings
+customCurrencyRules
+partner_referral
+billing or subscription data
+merchant banner state
+analytics flags
+access tokens
+```
+
+Bootstrap API example:
+
+```js
+const session = await fetchSession({ req, res });
+
+if (!session?.shop) {
+  return res.status(401).json({ success: false, error: "Unauthorized" });
+}
+
+const shop = session.shop;
+const data = await loadShopData(shop, { includeSetupStatus: true });
+
+return res.status(200).json({ success: true, data });
+```
+
+Client example:
+
+```js
+const fetch = useFetch();
+
+useEffect(() => {
+  async function loadBootstrap() {
+    const response = await fetch("/api/v1/bootstrap");
+    const json = await response.json();
+
+    if (json.success) {
+      setUserDataGlobal(json.data.userData);
+      setUserSettingsGlobal(json.data.settings);
+    }
+  }
+
+  loadBootstrap();
+}, []);
+```
+
+Why this fixes install:
+
+```text
+The initial browser GET does not need an Authorization header because SSR does not call fetchSession() or load merchant data.
+```
+
+Why this fixes security:
+
+```text
+Sensitive merchant data is loaded only by an authenticated API route. The API uses session.shop, not context.query.shop.
+```
+
+If an attacker opens:
+
+```text
+/?shop=victim.myshopify.com
+```
+
+SSR returns only the safe shell. The bootstrap API still returns data for `session.shop`, not for `victim.myshopify.com`.
+
+## Fix Option 3: Short-Lived Signed OAuth Landing Cookie
+
+This is a smaller transitional fix if the app must keep SSR data loading for now.
+
+After OAuth callback succeeds, the server sets a short-lived signed cookie for the authenticated shop:
+
+```text
+recent_oauth_shop=signed(store.myshopify.com, timestamp)
+```
+
+Then the callback redirects:
+
+```text
+/?shop=store.myshopify.com&host=...
+```
+
+Merchant SSR checks:
+
+```text
+1. Try fetchSession({ req, res }).
+2. If fetchSession() succeeds, use session.shop.
+3. If fetchSession() fails, verify the recent OAuth landing cookie.
+4. If cookie is valid and matches context.query.shop, allow this shop.
+5. Otherwise, redirect and load no data.
+```
+
+Callback shape:
+
+```js
+const cookie = createSignedOAuthLandingCookie(session.shop);
+res.setHeader("Set-Cookie", cookie);
+res.redirect(`/?shop=${shop}&host=${host}`);
+```
+
+SSR shape:
+
+```js
+const session = await tryFetchSession(context);
+
+if (session?.shop) {
+  return session.shop;
+}
+
+const shopFromCookie = verifySignedOAuthLandingCookie({
+  req: context.req,
+  requestedShop: context.query.shop,
+});
+
+if (shopFromCookie) {
+  return shopFromCookie;
+}
+
+return null;
+```
+
+Required guards:
+
+```text
+Cookie is signed with SHOPIFY_API_SECRET.
+Cookie shop must match context.query.shop.
+Cookie expires quickly, for example 60-120 seconds.
+Cookie is HttpOnly, Secure, SameSite=None.
+Cookie fallback applies only to normal merchant pages.
+Cookie fallback must not apply to internal admin pages.
+```
+
+Why this fixes install:
+
+```text
+The first post-OAuth browser GET has no Authorization header, but it has a server-set signed cookie from the successful OAuth callback.
+```
+
+Why this fixes security:
+
+```text
+Changing ?shop is not enough. The requester also needs a fresh valid signed cookie for that same shop.
+```
+
+This option is faster but more delicate than Option 1 because the security depends on correct cookie signing, expiry, matching, and scoping.
+
+## Recommendation
+
+Use Option 1 for the permanent fix:
+
+```text
+SSR shell + authenticated bootstrap API
+```
+
+It is cleaner because sensitive data never leaves SSR based on `?shop`.
+
+Use Option 3 only as a transition if rewriting all merchant pages to bootstrap data is too large for the current release.
+
+## What Still Should Be Hardened Independently
+
+These fixes do not depend on the merchant SSR strategy:
+
+```text
+Admin partner pages should authorize with fetchSession().shop, not query shop.
+Merchant panel should authorize with isImpersonator(fetchSession().shop), not query shop or offline session fallback.
+Public storefront validateUser should remain read-only and must not call saveAppMetafields().
+Exitframe should preserve route shop or OAuth query params when building /api/auth URLs.
 ```
