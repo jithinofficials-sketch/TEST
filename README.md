@@ -57,16 +57,53 @@ Relevant. `pages/admin/partners/[id].jsx` has the same flaw as #264, then loads 
 
 The same full-admin SSR guard should protect both admin partner pages.
 
-## Related vulnerable patterns
+## Related-area audit
 
-These are not in the pasted issue list but use the same unsafe pattern and should be included in the fix.
+I searched SSR pages and session helpers for these patterns:
+
+```bash
+rg "getServerSideProps|loadShopData\(|getMerchantPageContext\(|getImpersonatedMerchantPageContext\(|loadSessionWithShop\(|fetchSession\(|context\.query\?\.shop|context\.query\.shop|isSessionValid\(" pages utils
+```
+
+### Must fix with this root cause
+
+These areas either serialize merchant/admin data from `context.query.shop`, authorize an admin page from query-string shop, or inherit the broken `isSessionValid()` behavior. They should be changed in the same implementation because the root cause is the same.
 
 - `pages/settings/index.jsx`: loads `loadShopData(context.query.shop)` directly.
 - `pages/pricing/index.jsx`: loads `loadShopData(context.query.shop)` directly.
 - `pages/partners/index.jsx`: loads `loadShopData(context.query.shop)` directly.
 - `pages/currency-rules/index.jsx`: loads `loadShopData(context.query.shop)` directly.
+- `pages/analytics/index.jsx`: uses `getMerchantPageContext()`, so it is affected until that helper authenticates before loading data.
+- `pages/integrations/index.jsx`: uses `getMerchantPageContext()`, so it is affected until that helper authenticates before loading data.
 - `utils/ssr/getMerchantPageContext.js`: currently depends on the flawed `isSessionValid()` implementation.
 - `pages/admin/merchants/index.jsx`: uses `fetchSession()`, but falls back to `sessionHandler.loadSessionWithShop(shop)` if request session lookup fails. That fallback recreates the bypass and must be removed.
+
+### Related but already uses a dedicated impersonation guard
+
+These pages use `getImpersonatedMerchantPageContext()`, which calls `getEffectiveShopContext()`. That helper verifies the staff request session with `fetchSession({ req, res })`, checks `isImpersonator(staffShop)`, checks the active impersonation session, then loads merchant data. They should not be changed for this issue unless testing shows the impersonation helper itself is broken.
+
+- `pages/admin/merchants/[merchant]/index.jsx`
+- `pages/admin/merchants/[merchant]/settings.jsx`
+- `pages/admin/merchants/[merchant]/advanced.jsx`
+- `pages/admin/merchants/[merchant]/pricing.jsx`
+- `pages/admin/merchants/[merchant]/partners.jsx`
+- `pages/admin/merchants/[merchant]/integrations.jsx`
+- `pages/admin/merchants/[merchant]/analytics.jsx`
+- `pages/admin/merchants/[merchant]/currency-rules.jsx`
+
+### Related but not the same root-cause fix
+
+These files call `loadSessionWithShop(shop)`, but not as SSR requester authentication. They should be documented and regression-tested where relevant, not blindly changed in this auth-hardening patch.
+
+- `pages/api/v1/user/latest.js`: under `withImpersonation()`, it loads the merchant offline session only after the staff session and impersonation session are validated. This is an authorized server-to-Shopify operation and should remain.
+- `pages/api/v1/billing/checkSubscriptionStatus.js`: Shopify billing callback uses the shop offline session to verify the charge. It has separate billing-state security concerns, but it is not the same requester-auth bypass covered by these issues.
+- `utils/helper.js` `checkMoneyFormat(shop)`: helper loads the offline session for a shop-domain server operation. It is not used in the audited SSR paths; no direct change for this issue.
+- `utils/extensionCheck.js`: helper loads the offline session for extension/theme status checks. It is not used in the audited SSR paths; no direct change for this issue.
+- `pages/api/v1/public/moneyFormat.js`: public onboarding helper loads a shop offline session and reads Shopify shop money formats. This is a public endpoint with authenticated Admin API read side effects, but it is not in the pasted issues and does not serialize another merchant's app DB data through SSR. Track separately unless the current security batch is explicitly expanded to public endpoint API-capacity hardening.
+
+### Safe redirect-only query usage
+
+- `pages/admin/merchants/list.jsx`: reads `context.query.shop` only to redirect to `/admin/merchants?shop=...`. It does not load merchant data or authorize access. No change needed for this issue.
 
 ## Trust model
 
@@ -179,6 +216,8 @@ yarn test
 - Redesigning merchant UI or navigation.
 - Changing impersonated merchant route contracts under `pages/admin/merchants/[merchant]/*`, except removing unsafe auth fallback from the merchant panel landing page.
 - Adding rate limiting to `validateUser`. It is useful defense-in-depth, but the critical fix is removing public side effects.
+- Changing `pages/api/v1/public/moneyFormat.js`. It may deserve a separate public-endpoint hardening issue, but it is outside the reported SSR auth-bypass root cause.
+- Changing `pages/api/v1/billing/checkSubscriptionStatus.js`. Billing callback trust was handled by the separate secure billing-flow spec and should not be mixed into this auth SSR patch.
 - Changing Shopify metafield payload shape.
 
 ## Commit message
