@@ -1,340 +1,257 @@
-# Auth Session Hardening Notes
+# Route-Scoped CORS Design Spec
+
+**Date:** 2026-08-19
+**Status:** Draft for implementation
+**Scope:** Replace global wildcard CORS with a centralized route-aware policy for Bucks admin APIs, public widget APIs, Shopify app proxy routes, and webhook routes.
 
 ## Problem
 
-Normal merchant SSR pages currently use the URL query shop as the tenant key.
+Bucks currently emits wildcard browser CORS headers too broadly:
 
-Example shape:
+- `next.config.js:50` applies `Access-Control-Allow-Origin: *` to every `/api/:path*` route.
+- `middleware.js:26` applies `Access-Control-Allow-Origin: *` to matched app routes.
 
-```js
-const shop = context.query.shop;
-const data = await loadShopData(shop);
-```
+This exposes API responses to any browser origin that can trigger a request and receive a readable response. The audit did not find credential reflection, but the global wildcard API exposure is confirmed.
 
-Then SSR serializes merchant data to the browser:
+The fix must remove the global wildcard and replace it with route-scoped origin decisions. Authentication, Shopify proxy signatures, and webhook HMAC verification remain the real access-control boundaries; CORS only controls which browser origins can read responses.
 
-```js
-return {
-  props: {
-    initialData: {
-      userData,
-      settings,
-    },
-  },
-};
-```
+## Audience
 
-`context.query.shop` is browser-controlled. If someone changes the URL to another installed shop, SSR can load data for that shop when the app has a stored offline session or DB records for it.
+This affects both Bucks audiences:
 
-The stored offline session proves only this:
+- **Merchant admin:** embedded Shopify Admin pages and admin API calls must keep working only from expected Shopify/app origins.
+- **Shopper storefront:** the storefront widget must keep reading public widget config/rates from legitimate storefront origins without opening protected APIs to arbitrary sites.
 
-```text
-The app has an installed token for that shop.
-```
+If merchant and shopper needs conflict, protected merchant/admin data wins. Public widget data may be readable cross-origin only where the widget requires it.
 
-It does not prove this:
+## Goals
 
-```text
-The current browser requester belongs to that shop.
-```
+- Remove wildcard CORS from global Next headers and app middleware.
+- Centralize CORS policy so future API routes do not copy/paste ad hoc header logic.
+- Allow protected admin/app APIs only from expected Shopify Admin, app-host, development tunnel, and valid Shopify shop origins.
+- Allow public storefront/widget APIs from valid Shopify storefront origins and a documented custom storefront allowlist.
+- Keep Shopify app proxy routes protected by `verifyProxy`; CORS must not replace proxy signature verification.
+- Keep webhook/GDPR routes protected by Shopify signature/HMAC verification; they must not rely on browser CORS.
+- Add tests proving `Origin: https://evil.example` is rejected for protected route families.
+- Add tests proving wildcard `Access-Control-Allow-Origin: *` no longer appears in project-owned CORS code.
 
-That is the merchant SSR security issue.
+## Non-Goals
 
-## Why The Strict SSR Fix Broke Install
+- Do not redesign API authentication.
+- Do not change Shopify OAuth behavior.
+- Do not add a database-backed custom domain lookup in this fix.
+- Do not modify widget JavaScript bundles under `widgets/`.
+- Do not add a third-party CORS package.
+- Do not make webhook endpoints inaccessible to Shopify server-to-server delivery.
 
-The first attempted hardening was to use Shopify's request-bound session during merchant SSR:
+## Route Families
 
-```js
-const session = await fetchSession({ req, res });
-const shop = session.shop;
-```
+### Protected Admin/App APIs
 
-This is the right trust source because `session.shop` comes from the authenticated Shopify request, not from the URL.
+Examples:
 
-But the normal embedded install flow lands on the dashboard through a browser redirect:
+- `/api/v1/user/*`
+- `/api/v1/settings/*`
+- `/api/v1/billing/*`
+- `/api/v1/banner/*`
+- `/api/v1/analytics/*`
+- `/api/v1/admin/*`
+- `/api/partner/*`
+- `/api/v1/public/themeAppEmbeds`
 
-```text
-/api/auth/callback
--> GET /?shop=store.myshopify.com&host=...
-```
+Policy:
 
-That first page request is not an App Bridge authenticated API request. It does not include:
+- Allow browser CORS only from expected admin/app origins.
+- Reject preflight requests from unknown origins with `403`.
+- Do not set an allow-origin header for unknown normal requests.
+- Keep existing session and impersonation checks unchanged.
 
-```text
-Authorization: Bearer <Shopify session token>
-```
+`/api/v1/public/themeAppEmbeds` is classified as admin despite the `/public/` path segment because it calls `fetchSession()` and is consumed by admin onboarding UI, not by the storefront widget runtime.
 
-So `fetchSession({ req, res })` fails during SSR with an error like:
+Allowed origins:
 
-```text
-Missing Authorization header, was the request made with authenticatedFetch?
-```
+- `https://admin.shopify.com`
+- `process.env.SHOPIFY_APP_URL`, if valid
+- `process.env.TUNNEL_URL`, in development only, if valid
+- `https://{shop}` when `{shop}` is a valid `*.myshopify.com` domain available from `req.query.shop`, `req.body.shop`, `req.shop`, or the current session context
 
-Then the SSR page treats the fresh OAuth landing as unauthenticated and redirects to auth again. That creates an OAuth loop:
+### Public Storefront/Widget APIs
 
-```text
-OAuth completes
--> callback redirects to dashboard
--> dashboard SSR cannot fetch session
--> dashboard redirects to auth/exitframe
--> OAuth starts again
-```
+Examples:
 
-The problem is not that the OAuth callback failed. The callback completed and stored the session. The problem is that the next browser document request does not carry the App Bridge Authorization header that `fetchSession()` expects.
+- `/api/v1/public/config`
+- `/api/v1/public/currency`
+- `/api/v1/public/appStatus`
+- `/api/v1/public/moneyFormat`
+- `/api/v1/settings/validateUser`
 
-## Related Exitframe Bug
+Policy:
 
-`pages/exitframe/[...shop].js` used to build auth URLs only from the Shopify browser config:
+- Allow browser CORS only where the storefront widget needs cross-origin reads.
+- Allow valid Shopify-hosted storefront origins: `https://*.myshopify.com`.
+- Allow custom storefront domains only through an explicit environment allowlist.
+- Reject preflight requests from unknown origins with `403`.
+- Do not use `*` as a fallback.
 
-```js
-const shop = window?.shopify?.config?.shop;
+Custom domain allowlist:
 
-open(`${process.env.CONFIG_SHOPIFY_APP_URL}/api/auth?shop=${shop}`, "_top");
-```
+- Add `CORS_STOREFRONT_ORIGINS` as a comma-separated list of exact origins.
+- Example: `https://example.com,https://www.example.com`.
+- This is intentionally explicit until Bucks has a reliable domain-to-shop lookup in the database or via Shopify Admin API.
 
-During install or reauth, `window.shopify.config.shop` can be missing. That produced:
+Reason: allowing every arbitrary custom domain recreates the wildcard exposure under a different name. A future domain lookup can replace the env allowlist when the app stores or verifies merchant domains reliably.
 
-```text
-/api/auth?shop=undefined
-```
+`/api/v1/settings/validateUser` is intentionally included in the public-widget family even though it lives under `/api/v1/settings`. The route file documents it as a non-impersonatable public storefront endpoint, and the widget calls it from `widgets/src/apps/widgets/buckscc/validateUserPlan.js`. Route classification must check this exact path before the broad `/api/v1/settings` admin prefix.
 
-and Shopify returned:
+### Shopify App Proxy APIs
 
-```text
-InvalidShopError: Received invalid shop argument
-```
+Example:
 
-The minimal fix is to read the catch-all route value first.
+- `/api/proxy_route/*`
 
-For a plain shop route:
+Policy:
 
-```text
-/exitframe/store.myshopify.com
-```
+- Keep `verifyProxy` as the access-control boundary.
+- CORS may allow valid Shopify storefront origins if browser reads are required.
+- Unknown origins do not receive CORS allow headers.
 
-build:
+### Auth/OAuth APIs
 
-```text
-/api/auth?shop=store.myshopify.com
-```
+Examples:
 
-For an existing OAuth query route:
+- `/api/auth/*`
 
-```text
-/exitframe/shop=store.myshopify.com&host=abc&embedded=1
-```
+Policy:
 
-preserve the query:
+- Do not add API CORS headers.
+- These routes are browser navigations and redirects, not JSON APIs consumed by arbitrary browser JavaScript.
 
-```text
-/api/auth?shop=store.myshopify.com&host=abc&embedded=1
-```
+### Webhooks and GDPR Hooks
 
-This fix only corrects OAuth URL construction. It does not solve the merchant SSR security issue by itself.
+Examples:
 
-## Fix Option 1: SSR Shell + Authenticated Bootstrap API
+- `/api/webhooks`
+- `/api/webhooks/*`
+- `/api/v1/hooks/*`
+- `/api/gdpr/*`
 
-This is the clean long-term fix.
+Policy:
 
-Normal merchant SSR pages should not load sensitive merchant data. They should render a safe shell only.
+- Do not add CORS allow headers.
+- Continue to rely on Shopify webhook processing and HMAC/signature middleware.
+- `OPTIONS` requests should not be granted cross-origin access.
 
-Flow:
+## Architecture
 
-```text
-1. OAuth completes.
-2. /api/auth/callback redirects to /?shop=store.myshopify.com&host=...
-3. SSR receives a normal browser GET with no Authorization header.
-4. SSR renders a safe shell only.
-5. App Bridge loads in the browser.
-6. Client calls /api/v1/bootstrap using authenticated fetch.
-7. Bootstrap API calls fetchSession({ req, res }).
-8. Bootstrap API uses session.shop as the tenant key.
-9. Bootstrap API loads merchant data and returns it.
-10. Page renders the real dashboard/settings content.
-```
+Add one server-side CORS module at `utils/security/cors.js`.
 
-SSR example:
+The module owns:
 
-```js
-export async function getServerSideProps(context) {
-  return {
-    props: {
-      shop: context.query?.shop || null,
-      host: context.query?.host || null,
-      initialData: null,
-      needsBootstrap: true,
-    },
-  };
-}
-```
+- route-family classification from `req.url`, with exact public-widget exceptions checked before broad admin prefixes
+- origin parsing and normalization
+- allowlist checks
+- CORS response headers
+- preflight responses
+- a wrapper for API route handlers
 
-The SSR shell must not include sensitive merchant data:
+Proposed exports:
 
-```text
-userData
-settings
-customCurrencyRules
-partner_referral
-billing or subscription data
-merchant banner state
-analytics flags
-access tokens
-```
+- `CORS_POLICIES`
+- `getCorsPolicyForPath(pathname)`
+- `isOriginAllowedForPolicy(origin, policyName, req)`
+- `applyCorsHeaders(req, res, policyName)`
+- `withCors(policyNameOrHandler?)`
 
-Bootstrap API example:
+`withCors()` should run before route logic. For valid preflight requests it returns `204`. For invalid preflight requests it returns `403`. For normal requests it sets CORS headers only when the origin is allowed, then calls the wrapped handler.
 
-```js
-const session = await fetchSession({ req, res });
+## Header Contract
 
-if (!session?.shop) {
-  return res.status(401).json({ success: false, error: "Unauthorized" });
-}
+For an allowed origin:
 
-const shop = session.shop;
-const data = await loadShopData(shop, { includeSetupStatus: true });
+- `Access-Control-Allow-Origin: <request origin>`
+- `Vary: Origin`
+- `Access-Control-Allow-Methods: GET,POST,PUT,DELETE,OPTIONS`
+- `Access-Control-Allow-Headers: Content-Type, Authorization, X-Impersonating-Shop, X-Impersonation-Session`
 
-return res.status(200).json({ success: true, data });
-```
+For a rejected origin:
 
-Client example:
+- no `Access-Control-Allow-Origin`
+- preflight returns `403`
+- normal requests continue to handler authentication unless route-specific auth rejects them first
 
-```js
-const fetch = useFetch();
+Do not set `Access-Control-Allow-Origin: *` anywhere.
 
-useEffect(() => {
-  async function loadBootstrap() {
-    const response = await fetch("/api/v1/bootstrap");
-    const json = await response.json();
+Do not set `Access-Control-Allow-Credentials` unless a later route proves it needs credentialed cross-origin browser requests. Current acceptance criteria do not require it.
 
-    if (json.success) {
-      setUserDataGlobal(json.data.userData);
-      setUserSettingsGlobal(json.data.settings);
-    }
-  }
+## Implementation Application
 
-  loadBootstrap();
-}, []);
-```
+Apply the wrapper to route families that need explicit CORS behavior first:
 
-Why this fixes install:
+- `pages/api/v1/settings/index.js` as the protected admin smoke route.
+- `pages/api/v1/user/latest.js` as another protected admin route with Shopify Admin API reads.
+- `pages/api/v1/billing/initSubscription.js` as a protected billing route.
+- `pages/api/v1/public/config.js` as the public widget config smoke route.
+- `pages/api/v1/public/currency.js` as public rates data.
+- `pages/api/v1/public/appStatus.js` as public app status data.
+- `pages/api/v1/public/moneyFormat.js` as public onboarding/widget support data.
+- `pages/api/v1/settings/validateUser/index.js` as public storefront plan validation; wrap with `public-widget`, not `admin`.
+- `pages/api/v1/public/themeAppEmbeds.js` as an admin/session-bound route; wrap with `admin` if it is wrapped at all.
+- `pages/api/proxy_route/json.js` as app-proxy CORS behavior while keeping `verifyProxy`.
 
-```text
-The initial browser GET does not need an Authorization header because SSR does not call fetchSession() or load merchant data.
-```
+Then add `withCors` to additional protected API routes in the same families. If the first implementation needs to stay small, cover all `/api/v1/public/*` and at least one representative protected route with tests, then follow up with full route-family wrapping before merging.
 
-Why this fixes security:
+## Error Handling
 
-```text
-Sensitive merchant data is loaded only by an authenticated API route. The API uses session.shop, not context.query.shop.
-```
+- Invalid `Origin` value: treat as rejected.
+- Missing `Origin`: do not set CORS headers and do not reject; non-browser and same-origin requests should continue to existing auth/handler logic.
+- Invalid preflight from unknown origin: return `403` JSON `{ success: false, error: "Origin not allowed" }` or plain end body; tests should assert the status and missing wildcard, not the exact copy.
+- Allowed preflight: return `204` with CORS headers.
 
-If an attacker opens:
+## Testing
 
-```text
-/?shop=victim.myshopify.com
-```
+Add unit tests for `utils/security/cors.js`:
 
-SSR returns only the safe shell. The bootstrap API still returns data for `session.shop`, not for `victim.myshopify.com`.
+- protected admin route rejects `https://evil.example`
+- protected admin route allows `https://admin.shopify.com`
+- protected admin route allows configured `SHOPIFY_APP_URL`
+- public widget route allows `https://test-shop.myshopify.com`
+- public widget route allows an exact `CORS_STOREFRONT_ORIGINS` match
+- public widget validation route `/api/v1/settings/validateUser` allows `https://test-shop.myshopify.com`
+- public widget validation route rejects `https://evil.example`
+- public widget route rejects `https://evil.example`
+- webhook route policy does not allow browser CORS
+- rejected origins never emit `Access-Control-Allow-Origin: *`
 
-## Fix Option 3: Short-Lived Signed OAuth Landing Cookie
+Add route-level smoke tests:
 
-This is a smaller transitional fix if the app must keep SSR data loading for now.
+- `OPTIONS /api/v1/settings` with `Origin: https://evil.example` returns `403` and no allow-origin header.
+- `OPTIONS /api/v1/public/config` with `Origin: https://test-shop.myshopify.com` returns `204` and reflects that origin.
+- `OPTIONS /api/v1/settings/validateUser?shop=test-shop.myshopify.com&param=hash` with `Origin: https://test-shop.myshopify.com` returns `204` and reflects that origin.
+- `OPTIONS /api/v1/settings/validateUser?shop=test-shop.myshopify.com&param=hash` with `Origin: https://evil.example` returns `403` and no allow-origin header.
+- `OPTIONS /api/webhooks/app_uninstalled` with `Origin: https://evil.example` does not return wildcard CORS.
 
-After OAuth callback succeeds, the server sets a short-lived signed cookie for the authenticated shop:
+Add static regression tests:
 
-```text
-recent_oauth_shop=signed(store.myshopify.com, timestamp)
-```
+- `next.config.js` does not contain `Access-Control-Allow-Origin`.
+- `middleware.js` does not contain `Access-Control-Allow-Origin`.
+- project source does not contain `Access-Control-Allow-Origin', '*'`, `Access-Control-Allow-Origin", "*"`, or equivalent project-owned wildcard CORS patterns.
 
-Then the callback redirects:
+## Acceptance Criteria Mapping
 
-```text
-/?shop=store.myshopify.com&host=...
-```
+- **Wildcard CORS removed from global Next headers and middleware:** remove from `next.config.js` and `middleware.js`; static tests cover this.
+- **Admin/API routes only allow expected Shopify/admin application origins:** `admin` policy covers Shopify Admin, app host, dev tunnel, and valid shop origins.
+- **Public storefront/widget routes have documented narrow policy:** `public-widget` allows `*.myshopify.com` plus explicit `CORS_STOREFRONT_ORIGINS` exact matches.
+- **Storefront validation remains public:** `/api/v1/settings/validateUser` is classified as `public-widget` before `/api/v1/settings/*` is classified as `admin`.
+- **Webhook routes do not rely on browser CORS:** webhook routes get no CORS allow headers; Shopify HMAC/signature verification remains unchanged.
+- **Smoke checks reject evil origin:** route-level tests cover protected and public route families.
 
-Merchant SSR checks:
+## Risks
 
-```text
-1. Try fetchSession({ req, res }).
-2. If fetchSession() succeeds, use session.shop.
-3. If fetchSession() fails, verify the recent OAuth landing cookie.
-4. If cookie is valid and matches context.query.shop, allow this shop.
-5. Otherwise, redirect and load no data.
-```
+- Some merchants use custom storefront domains. Exact env allowlisting is safe but operationally limited. A follow-up can add a verified domain lookup through Shopify Admin API or persisted shop domains.
+- Removing wildcard CORS before production `CORS_STOREFRONT_ORIGINS` is populated can break widget config reads on custom storefront domains. Production rollout must inventory and configure known custom storefront origins, or defer enforcement until verified shop-domain lookup exists.
+- Admin APIs may be called from `https://admin.shopify.com` with session tokens or from the app host depending on browser/embed context. Tests must cover both configured app host and Shopify Admin origin.
+- Normal requests with disallowed origins still execute handler logic if they are not preflight. This is acceptable because CORS is not authentication; session/proxy/HMAC checks remain required. The browser will not expose the response without an allow-origin header.
 
-Callback shape:
+## Open Decisions
 
-```js
-const cookie = createSignedOAuthLandingCookie(session.shop);
-res.setHeader("Set-Cookie", cookie);
-res.redirect(`/?shop=${shop}&host=${host}`);
-```
-
-SSR shape:
-
-```js
-const session = await tryFetchSession(context);
-
-if (session?.shop) {
-  return session.shop;
-}
-
-const shopFromCookie = verifySignedOAuthLandingCookie({
-  req: context.req,
-  requestedShop: context.query.shop,
-});
-
-if (shopFromCookie) {
-  return shopFromCookie;
-}
-
-return null;
-```
-
-Required guards:
-
-```text
-Cookie is signed with SHOPIFY_API_SECRET.
-Cookie shop must match context.query.shop.
-Cookie expires quickly, for example 60-120 seconds.
-Cookie is HttpOnly, Secure, SameSite=None.
-Cookie fallback applies only to normal merchant pages.
-Cookie fallback must not apply to internal admin pages.
-```
-
-Why this fixes install:
-
-```text
-The first post-OAuth browser GET has no Authorization header, but it has a server-set signed cookie from the successful OAuth callback.
-```
-
-Why this fixes security:
-
-```text
-Changing ?shop is not enough. The requester also needs a fresh valid signed cookie for that same shop.
-```
-
-This option is faster but more delicate than Option 1 because the security depends on correct cookie signing, expiry, matching, and scoping.
-
-## Recommendation
-
-Use Option 1 for the permanent fix:
-
-```text
-SSR shell + authenticated bootstrap API
-```
-
-It is cleaner because sensitive data never leaves SSR based on `?shop`.
-
-Use Option 3 only as a transition if rewriting all merchant pages to bootstrap data is too large for the current release.
-
-## What Still Should Be Hardened Independently
-
-These fixes do not depend on the merchant SSR strategy:
-
-```text
-Admin partner pages should authorize with fetchSession().shop, not query shop.
-Merchant panel should authorize with isImpersonator(fetchSession().shop), not query shop or offline session fallback.
-Public storefront validateUser should remain read-only and must not call saveAppMetafields().
-Exitframe should preserve route shop or OAuth query params when building /api/auth URLs.
-```
+None for the initial implementation. The chosen public storefront policy is Shopify storefronts plus an explicit custom-domain env allowlist.
