@@ -548,9 +548,19 @@ Stop if the Volume will exceed 70% immediately after migration.
 
 ---
 
-## Phase 3: Online Pre-Copy
+## Phase 3: Online Pre-Copy Passes
 
-### 10. Run The Initial Copy While ClickHouse Is Online
+This migration intentionally uses three `rsync` passes:
+
+| Pass | ClickHouse state | Purpose |
+| --- | --- | --- |
+| 1 | Running | Copy most files before downtime. |
+| 2 | Running | Measure the remaining delta shortly before the maintenance window. |
+| 3 | Stopped | Make the destination authoritative and consistent. |
+
+Only the third pass is authoritative. Do not start ClickHouse from the DigitalOcean Volume after pass 1 or pass 2.
+
+### 10. Run Sync Pass 1: Initial Online Copy
 
 The initial copy reduces downtime but is not a consistent backup. ClickHouse continues changing files while this copy runs.
 
@@ -570,7 +580,7 @@ If the pre-copy affects production query or insert latency, stop it with `Ctrl+C
 rsync -aHAXS --numeric-ids --exclude='/lost+found' --bwlimit='<KIB_PER_SECOND>' --info=progress2 --stats "$CH_SOURCE_DIR/" "$CH_NEW_DATA_DIR/"
 ```
 
-### 11. Measure The Expected Final Delta
+### 11. Run Sync Pass 2: Online Delta Measurement
 
 Run another online pass shortly before the maintenance window:
 
@@ -588,6 +598,12 @@ Record:
 | Files transferred | `<COUNT>` |
 | Estimated final delta | `<GIB>` |
 | Revised expected downtime | `<MINUTES>` |
+
+Expected result:
+
+- The second pass transfers much less data than the first pass.
+- The recorded transfer size is used to estimate the final stopped sync time.
+- The destination still must not be used to start ClickHouse.
 
 ---
 
@@ -662,7 +678,7 @@ Checklist:
 
 ---
 
-## Phase 5: Stop ClickHouse And Final Sync
+## Phase 5: Stop ClickHouse And Final Sync Pass
 
 ### 14. Stop The ClickHouse Container Cleanly
 
@@ -713,7 +729,7 @@ Confirm before continuing:
 - [ ] `lost+found` is excluded.
 - [ ] No unexpected directory is being deleted.
 
-### 16. Run The Final Authoritative Copy
+### 16. Run Sync Pass 3: Final Authoritative Copy
 
 Run the final sync while ClickHouse is stopped:
 
