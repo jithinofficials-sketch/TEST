@@ -27,7 +27,44 @@ Do this before anything else in this plan. User passwords live inside the data d
 
 ## Step 1 — Create the new Droplet
 
-In the DigitalOcean dashboard: 1 vCPU / 2GB RAM / 50GB NVMe SSD. Note its IP once created — every step from here on needs it. We'll refer to it as `<NEW_DROPLET_IP>`.
+### Sizing decision: RAM headroom on the $14/mo (1 vCPU / 2GB) plan
+
+Checked directly on the live server before deciding:
+```
+free -h:              3.8Gi total, 849Mi used, 2.7Gi available, 188Mi swap already in use
+docker stats (ClickHouse): 1.073 GiB actual memory usage, under real live load
+```
+**Findings:**
+- ClickHouse itself is genuinely using ~1.07GB right now — that's already over half of a 2GB Droplet's total RAM, before accounting for the OS, Docker overhead, and the two exporter containers planned for Step 8.
+- Some swap (188Mi) is already in use even on the current, more generous 4GB setup — the original setup documentation flagged this exact risk at 2GB ("may use swap → slower performance"). On a 2GB Droplet this is likely to increase, meaning slower (not necessarily broken) performance under load spikes, not a hard failure.
+- CPU usage (5-10% typical, one 33% spike over 14 days) is comfortably fine on 1 vCPU — RAM is the real constraint here, not CPU.
+
+**Decision: proceed with the $14/mo 1 vCPU / 2GB plan, but treat it as provisional, not final**, with the explicit rollback plan below if it proves too tight. Real data size and light query load make this worth trying; the downside is fully covered by keeping the old Droplet available as a fallback (see next section).
+
+In the DigitalOcean dashboard: create the new Droplet, 1 vCPU / 2GB RAM / 50GB NVMe SSD. Note its IP — every step from here on needs it, referred to as `<NEW_DROPLET_IP>`.
+
+### If the 2GB Droplet turns out to be insufficient — revert plan
+
+Watch these specifically during the first several days after cutover (Step 7):
+```bash
+free -h                                          # available memory, swap usage trend
+docker stats clickhouse-prod-v2 --no-stream      # ClickHouse's actual usage vs the 2GB limit
+dmesg | grep -i "out of memory"                  # OOM-killer events = hard failure signal
+docker logs clickhouse-prod-v2 --tail 100 | grep -iE "memory|oom"
+```
+**Warning signs that mean "revert, this Droplet is too small":**
+- Swap usage climbing steadily rather than staying flat/occasional
+- `dmesg`/logs showing OOM-killer activity or ClickHouse memory-limit-exceeded errors
+- Noticeably slower query/insert latency compared to the old Droplet, without a corresponding traffic increase to explain it
+
+**Revert procedure — this is why the old Droplet must stay untouched through Step 9's stability window:**
+1. Update the analytics backend's `CLICKHOUSE_HOST` back to the **old** Droplet's IP (`159.203.187.239`), restart the backend.
+2. On the **old** Droplet: `docker start clickhouse-prod-new` — it's been sitting stopped, untouched, with its full data intact.
+3. Confirm `SELECT 1` and row counts on the old Droplet.
+4. If the new (2GB) Droplet ever received writes the old one doesn't have, reverse-rsync `/var/lib/clickhouse-data` (new Droplet) → `/mnt/clickhouse_storage/clickhouse-data` (old Droplet) with ClickHouse stopped on both sides, dry-run first — same pattern as the original migration's rollback procedure.
+5. Once reverted and confirmed stable, either try a larger new-Droplet size (e.g., 2 vCPU / 4GB at a higher price point) and repeat Steps 1-7, or stay on the old Droplet longer-term.
+
+**This means: do not destroy the old Droplet or its DO Volume until you've personally watched the 2GB setup under real load for at least a few days and are confident it holds up** — this is a firmer requirement for this particular migration than a generic "wait a few days," specifically because RAM headroom is a known, real risk here, not a hypothetical one.
 
 ---
 
@@ -272,7 +309,7 @@ ufw status verbose
 
 ## Step 9 — Decommission the old Droplet
 
-Only after: new Droplet stable for several days with zero errors, app confirmed writing/reading correctly, monitoring confirmed working, and a fresh independent backup taken from the new Droplet's data.
+Only after: new Droplet stable for several days with zero errors, **RAM/swap behavior specifically confirmed acceptable** (see Step 1's warning signs — this is a firmer bar than usual given the 2GB sizing risk), app confirmed writing/reading correctly, monitoring confirmed working, and a fresh independent backup taken from the new Droplet's data.
 
 1. `docker rm clickhouse-prod-new` and `docker rm clickhouse-prod` on the old Droplet
 2. Detach and destroy the old DO Volume (`clickhouse-storage`, 150GB)
@@ -295,7 +332,7 @@ Only after: new Droplet stable for several days with zero errors, app confirmed 
 ## Summary checklist
 
 - [ ] Password rotation (prod, staging, admin) completed and verified — Step 0
-- [ ] New Droplet created — Step 1
+- [ ] New Droplet created (1 vCPU/2GB — provisional, see RAM risk/rollback notes in Step 1) — Step 1
 - [ ] Docker, tmux, directories set up on new Droplet — Step 2
 - [ ] Old Droplet's SSH key trusted by new Droplet, tested — Step 3
 - [ ] `log_ttl.xml` created and verified on new Droplet — Step 4
@@ -306,4 +343,5 @@ Only after: new Droplet stable for several days with zero errors, app confirmed 
 - [ ] Exporters redeployed, Prometheus targets updated, Grafana confirmed, firewall checked — Step 8
 - [ ] Grafana password rotated — Step 8
 - [ ] `admin`/`analytics_user`/`metrics` reviewed — tracked separately
+- [ ] RAM/swap watched closely during stability window (free -h, docker stats, dmesg for OOM) — Step 1 warning signs, checked before Step 9
 - [ ] Stable for several days, then old Droplet + Volume decommissioned — Step 9
