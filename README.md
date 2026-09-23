@@ -1,205 +1,401 @@
-# Dashboard Review Feedback Design Spec
+# Dashboard Review Feedback Implementation Plan
 
-**Date:** 2026-09-23
-**Status:** Approved design; awaiting written-spec review
-**Surface:** Bucks merchant admin dashboard
-**Audience:** Bucks frontend engineers who know React, Next.js, Polaris, and Shopify embedded apps but are new to this dashboard feedback flow.
+> **For implementers:** REQUIRED SUB-SKILL: Use executing-plans to implement this plan task-by-task.
 
-## Problem
+**Goal:** Replace the Bucks dashboard Good/Bad feedback card with the Figma star-review card, route five-star feedback through Shopify Reviews with an App Store fallback, and send lower ratings as silent structured Crisp feedback.
 
-The dashboard's current feedback card asks merchants to choose Good or Bad. A positive response opens the Shopify App Store review page directly, while a negative response opens Crisp with a generic message. It does not provide Shopify's native review experience, structured feedback, or event-level product analytics.
+**Architecture:** Keep `FeedbackCard` as the single feature boundary at the existing dashboard placement. It will use `useAppBridge()` to access `shopify.reviews.request()`, manage review-request and feedback-modal state locally, and retain `ClosePopover` as the only persisted dismissal path. Add narrowly scoped Vitest component tests that mock App Bridge, Crisp, and PostHog.
 
-## Goals
+**Tech Stack:** Next.js, React 18, Shopify Polaris 12, Shopify App Bridge React 4, Crisp SDK, PostHog browser client, Vitest, React Testing Library.
 
-- Replace the current Good/Bad dashboard card with the approved star-rating card.
-- Request Shopify's native review modal when a merchant selects five stars.
-- Open the Shopify App Store review link in a new tab when Shopify cannot display its review modal.
-- Collect structured feedback for one-to-four-star selections and send it silently to Crisp.
-- Keep the card visible unless the merchant explicitly dismisses it from its overflow menu.
-- Track the review and feedback flow in PostHog.
-- Match the supplied Figma designs with existing Polaris components and no new UI library.
+**Approved Figma references:**
 
-## Non-Goals
+- Dashboard review card: [node 15426:40884](https://www.figma.com/design/zWmT6pWcnApOQrtvHv3KC5/UFE-Widget---UFE-3.0--ALPHA-2.0?node-id=15426-40884&t=9oNOFO8taGndXOgN-4)
+- Custom feedback modal: [node 15426:42089](https://www.figma.com/design/zWmT6pWcnApOQrtvHv3KC5/UFE-Widget---UFE-3.0--ALPHA-2.0?node-id=15426-42089&t=9oNOFO8taGndXOgN-4)
 
-- Do not change storefront widget code under `widgets/`.
-- Do not store feedback in a new database model or add an API endpoint for it.
-- Do not add a rating field to the custom feedback modal or Crisp payload.
-- Do not automatically dismiss the dashboard card after a rating selection, feedback action, Shopify review response, or fallback link.
-- Do not replace the current persisted `showFeedbackSection` dismissal mechanism.
+---
 
-## Design References
+### Task 1: Add a focused feedback-card test harness
 
-Use these Figma nodes as the implementation reference:
+**Files:**
+- Create: `tests/home/FeedbackCard.test.jsx`
+- Reference: `tests/home/UserGuideCard.test.jsx`
+- Reference: `tests/common/closePopover.test.jsx`
+- Reference: `components/home/feedbackCard.jsx`
 
-- Dashboard review card: [Figma node 15426:40884](https://www.figma.com/design/zWmT6pWcnApOQrtvHv3KC5/UFE-Widget---UFE-3.0--ALPHA-2.0?node-id=15426-40884&t=9oNOFO8taGndXOgN-4)
-- Custom feedback modal: [Figma node 15426:42089](https://www.figma.com/design/zWmT6pWcnApOQrtvHv3KC5/UFE-Widget---UFE-3.0--ALPHA-2.0?node-id=15426-42089&t=9oNOFO8taGndXOgN-4)
+**Step 1: Write the shared mocks and Polaris render helper**
 
-The selected section identifies the approved card as a full-width 112px dashboard card with an overflow menu, title, helper text, and five 20px outlined stars. The feedback modal reference is a 657px desktop dialog with two checkbox columns, a textarea, and Cancel/Send footer actions. Use Polaris responsive behavior for narrow screens rather than fixed pixel widths.
+Create `tests/home/FeedbackCard.test.jsx`. Mock these boundaries before importing the component:
 
-## Existing Integration Points
+```jsx
+const mocks = {
+  reviewRequest: vi.fn(),
+  triggerMessage: vi.fn(),
+  closePopover: vi.fn(),
+};
 
-- The dashboard renders the card at `pages/index.jsx` through `FeedbackCard`.
-- The current card is `components/home/feedbackCard.jsx`.
-- `components/common/closePopover.jsx` persists an explicit card dismissal through `POST /api/v1/user/dashboardSection` with `section: "showFeedbackSection"` and `value: false`.
-- The endpoint allows `showFeedbackSection`, and `pages/index.jsx` hides the card only when `user.showFeedbackSection === false`.
-- Crisp is initialized in `pages/index.jsx` and supports a silent `REVIEW_QUERY` trigger through `utils/extras/crispChat.js`.
-- The dashboard uses client-side `window.posthog.capture` when PostHog is available.
+vi.mock("@shopify/app-bridge-react", () => ({
+  useAppBridge: () => ({ reviews: { request: mocks.reviewRequest } }),
+}));
 
-## Components
+vi.mock("@/utils/extras/crispChat", () => ({
+  triggerMessage: mocks.triggerMessage,
+}));
 
-### FeedbackCard
-
-Keep `components/home/feedbackCard.jsx` as the feature owner. It renders:
-
-- A full-width `Grid.Cell` with a Polaris `Card`.
-- Title: `How is your experience with BUCKS?`
-- Helper text: `Rate us by clicking on the stars.`
-- Five keyboard-accessible star buttons using Polaris star iconography. The visual state is outlined by default and fills through the selected star on hover/focus/selection.
-- The existing `ClosePopover` overflow-menu control configured with `showFeedbackSection`.
-- The custom feedback `Modal` only while the merchant has selected one to four stars.
-
-The component owns transient rating-request and feedback-modal state. It must not add new user/settings persistence for a selected rating, feedback draft, or Shopify API response.
-
-### Custom Feedback Modal
-
-Use a Polaris `Modal` matching the Figma structure:
-
-- Title: `Share your feedback`
-- Close icon and Cancel action: close the modal without sending feedback.
-- Five independent, optional checkboxes arranged in two columns on desktop and one column on narrow layouts:
-  - `Hard to setup`
-  - `Something's not working`
-  - `Missing features`
-  - `Not compatible with my setup`
-  - `Other`
-- Optional text area label: `What can we improve?`
-- Placeholder: `We read every piece of feedback`
-- Secondary Cancel action and primary Send action.
-
-The modal has no star display and does not collect or send the selected star value.
-
-## Behavior
-
-### One to Four Stars
-
-1. Merchant selects any star from one through four.
-2. Capture the star-selection PostHog event.
-3. Open the custom feedback modal.
-4. Merchant may choose zero or more reasons and optionally enter free text.
-5. Send creates a formatted Crisp message containing selected reasons and optional text only. It uses `triggerMessage(REVIEW_QUERY, user, message)`, which sends the message without opening Crisp chat.
-6. After the send call, close and reset the modal form. Leave the dashboard card visible.
-7. Cancel or the modal close icon closes and resets the modal without sending. Leave the dashboard card visible.
-
-The Send button remains enabled when both the reason selection and free-text field are empty because all feedback inputs are optional.
-
-### Five Stars
-
-1. Merchant selects the fifth star.
-2. Capture star selection and Shopify review request events.
-3. Call `await shopify.reviews.request()` in the embedded-app client.
-4. If the response is successful, record the successful result. Shopify owns the review modal from this point.
-5. If the response is unsuccessful, record its `code` and `message`, then open this URL in a new browser tab:
-
-```txt
-https://apps.shopify.com/bucks-currency-converter?#modal-show=WriteReviewModal
+vi.mock("@/components/common/closePopover", () => ({
+  default: ({ closeAction }) => (
+    <button type="button" onClick={() => closeAction(false)}>Dismiss card</button>
+  ),
+}));
 ```
 
-6. If the request throws, record an error outcome and open the same URL in a new browser tab.
-7. Leave the dashboard card visible for every outcome.
-
-Supported declined response codes are:
-
-```txt
-already-open
-already-reviewed
-annual-limit-reached
-cancelled
-cooldown-period
-merchant-ineligible
-mobile-app
-open-in-progress
-recently-installed
-```
-
-Fallback applies to every declined code and any thrown request error. It must not be restricted to a hand-maintained subset of codes, so newly introduced declined codes continue to receive the fallback.
-
-### Explicit Card Dismissal
-
-Only the existing overflow menu's `Dismiss` action hides the card. It persists `showFeedbackSection: false` through the existing dashboard-section endpoint. On a future dashboard render, `pages/index.jsx` continues to suppress the card from `user.showFeedbackSection`.
-
-Do not add dismissal behavior to:
-
-- Star buttons
-- Feedback-modal Send
-- Feedback-modal Cancel or close icon
-- Shopify review success
-- Shopify review decline
-- App Store fallback-link opening
-
-## Crisp Payload
-
-The message must make feedback readable in Crisp without exposing a rating. Use a stable text format:
-
-```txt
-Dashboard feedback
-Reasons: Hard to setup, Missing features
-What can we improve: The initial configuration is unclear.
-```
-
-Omit the `Reasons:` line when no reason is selected. Omit the `What can we improve:` line when no text is entered. If both are empty, send `Dashboard feedback` alone.
-
-The message uses `REVIEW_QUERY`, not `SENT_QUERY`, so the merchant stays on the dashboard and the Crisp messenger does not open automatically.
-
-## PostHog Analytics
-
-Capture client-side events only when `window.posthog.capture` is available. Every event includes:
+Render the component inside Polaris `AppProvider` with `enTranslations`, matching `tests/home/UserGuideCard.test.jsx`. Use a fixed merchant object:
 
 ```js
-{ myshopify_domain: user?.myshopify_domain }
+const user = { myshopify_domain: "test.myshopify.com" };
 ```
 
-Required events and properties:
+Stub `window.open` in `beforeEach`, clear all mocks, and remove `window.posthog` after every test.
 
-| Event | Additional properties | Trigger |
-| --- | --- | --- |
-| `Feedback Card - Star Selected` | `rating` | Any star click |
-| `Feedback Card - Feedback Modal Opened` | `rating` | One-to-four-star path opens the custom modal |
-| `Feedback Card - Feedback Submitted` | `selected_reasons`, `has_written_feedback` | Send feedback to Crisp |
-| `Feedback Card - Feedback Cancelled` | `close_method` (`cancel` or `close_icon`) | Cancel or modal X |
-| `Feedback Card - Shopify Review Requested` | none | Before calling Shopify Reviews API |
-| `Feedback Card - Shopify Review Result` | `success`, `code`, `message` | Shopify API resolves |
-| `Feedback Card - App Store Fallback Opened` | `reason` | Declined result or thrown request error |
-| `Feedback Card - Dismissed` | none | Persisted card dismissal succeeds |
+**Step 2: Run the new test file to confirm the harness loads**
 
-Use `request-error` for the fallback `reason` when the Reviews API rejects or throws before returning a structured result. PostHog payloads must not include the merchant's free-text feedback.
+Run:
 
-## Error Handling and Accessibility
+```powershell
+yarn vitest run tests/home/FeedbackCard.test.jsx
+```
 
-- Prevent duplicate five-star review requests while a request is in progress.
-- If opening the fallback tab is blocked by the browser, do not dismiss the card; log the fallback event before attempting to open it.
-- Keep the feedback modal usable by keyboard: focus enters the dialog, checkbox and textarea controls have labels, Escape/close behavior follows Polaris modal defaults, and focus returns to the initiating star after close.
-- Give every star button an accessible label such as `Rate BUCKS 3 out of 5 stars`.
-- Use Polaris layout components for responsive checkbox columns. Avoid horizontal overflow on mobile.
-- Keep analytics and Crisp failures non-blocking: the UI must remain usable and the card must remain visible if either integration fails.
+Expected: the command fails because the new component behavior and its test cases have not yet been added, or passes only the initial render smoke test if added first.
 
-## Acceptance Criteria
+**Step 3: Commit the test harness**
 
-- `FeedbackCard` replaces Good/Bad controls with the Figma-based five-star review card.
-- The card remains at the existing dashboard placement in `pages/index.jsx`.
-- Selecting stars one through four opens a custom modal with only the five specified checkboxes and optional text area; it contains no rating UI.
-- Sending feedback calls the silent Crisp `REVIEW_QUERY` path with no rating in the payload and closes the modal.
-- Cancelling or closing the modal sends nothing and leaves the card visible.
-- Selecting five stars calls Shopify's `shopify.reviews.request()` API.
-- Any Shopify declined result or thrown request error opens the approved App Store review URL in a new tab.
-- The card hides only after its explicit overflow-menu Dismiss action persists successfully.
-- All required PostHog events use the specified names and do not include free-text feedback.
-- No new dependency, API route, database field, or widget change is introduced.
+```powershell
+git add tests/home/FeedbackCard.test.jsx
+```
 
-## Verification
+### Task 2: Specify the failing lower-rating feedback tests
 
-- Unit-test star routing: ratings one through four open feedback; five requests Shopify review.
-- Unit-test Crisp message formatting for reasons-only, text-only, both, and empty feedback.
-- Mock Reviews API success, each declined response code, and rejection; verify fallback behavior only for declines/errors.
-- Test close, Cancel, Send, successful review request, declined review request, and fallback opening all leave the card visible.
-- Test persisted overflow-menu dismissal and dashboard re-render suppression.
-- Run the relevant lint and test commands defined in `package.json` before merging.
+**Files:**
+- Modify: `tests/home/FeedbackCard.test.jsx`
+- Modify: `components/home/feedbackCard.jsx`
+- Reference: `utils/extras/crispChat.js:282-291`
+- Reference: `utils/common/constants/constants.js`
+
+**Step 1: Write the failing modal-opening test**
+
+Add a test that clicks the button labelled `Rate BUCKS 3 out of 5 stars` and verifies:
+
+```jsx
+expect(screen.getByRole("dialog", { name: "Share your feedback" })).toBeInTheDocument();
+expect(screen.queryByText(/3 out of 5/i)).not.toBeInTheDocument();
+expect(screen.getByLabelText("Hard to setup")).toBeInTheDocument();
+expect(screen.getByLabelText("What can we improve?")).toBeInTheDocument();
+```
+
+Also assert the card title remains rendered behind the modal.
+
+**Step 2: Write the failing silent-Crisp payload tests**
+
+Add four tests for Send:
+
+- reasons only: select `Hard to setup` and `Missing features`;
+- text only: enter `The setup instructions are unclear.`;
+- reasons and text;
+- empty feedback.
+
+Each test must assert `triggerMessage` is called with `REVIEW_QUERY`, `user`, and one exact formatted message. For example:
+
+```js
+expect(mocks.triggerMessage).toHaveBeenCalledWith(
+  REVIEW_QUERY,
+  user,
+  "Dashboard feedback\nReasons: Hard to setup, Missing features\nWhat can we improve: The setup instructions are unclear."
+);
+```
+
+Assert Send closes the dialog, leaves the card visible, and does not call `window.open`.
+
+**Step 3: Write the failing cancel tests**
+
+Add one test for Cancel and one for the modal close button. Both must assert that `triggerMessage` was not called and that the feedback dialog closes while the card remains visible.
+
+**Step 4: Run the lower-rating tests to verify failure**
+
+Run:
+
+```powershell
+yarn vitest run tests/home/FeedbackCard.test.jsx
+```
+
+Expected: FAIL because the current Good/Bad card has no stars or custom feedback modal.
+
+**Step 5: Implement the minimal lower-rating flow in `FeedbackCard`**
+
+Replace the Good/Bad button group in `components/home/feedbackCard.jsx` with:
+
+- Five `<Button variant="tertiary">` star buttons, using Polaris star icons and `accessibilityLabel={`Rate BUCKS ${rating} out of 5 stars`}`.
+- Local state for `isFeedbackModalOpen`, selected feedback reasons, and feedback text.
+- A shared `FEEDBACK_REASONS` array in this component in Figma order:
+
+```js
+const FEEDBACK_REASONS = [
+  "Hard to setup",
+  "Something's not working",
+  "Missing features",
+  "Not compatible with my setup",
+  "Other",
+];
+```
+
+- A Polaris `Modal` titled `Share your feedback`, with a responsive `Grid` for the checkboxes and a Polaris `TextField multiline={4}` for the optional input.
+- `handleFeedbackSend` that builds the exact three-line-maximum message defined in the approved spec, calls `triggerMessage(REVIEW_QUERY, user, message)`, then resets and closes the modal. Do not include the star rating.
+- `handleFeedbackClose(closeMethod)` that resets and closes without calling Crisp.
+
+Keep all inputs optional. Keep the card mounted after every lower-rating outcome.
+
+**Step 6: Run the lower-rating tests to verify they pass**
+
+Run:
+
+```powershell
+yarn vitest run tests/home/FeedbackCard.test.jsx
+```
+
+Expected: PASS for modal opening, Crisp formatting, Send, Cancel, and close-button cases.
+
+**Step 7: Commit the lower-rating feedback flow**
+
+```powershell
+git add components/home/feedbackCard.jsx tests/home/FeedbackCard.test.jsx
+```
+
+### Task 3: Specify the failing five-star Shopify review tests
+
+**Files:**
+- Modify: `tests/home/FeedbackCard.test.jsx`
+- Modify: `components/home/feedbackCard.jsx`
+- Reference: `pages/settings/index.jsx:114`
+- Reference: `pages/_document.js:8-9`
+- Reference: `docs/superpowers/specs/2026-09-23-dashboard-review-feedback-design.md:95-124`
+
+**Step 1: Write the successful review-request test**
+
+Set `mocks.reviewRequest.mockResolvedValue({ success: true, code: "success", message: "Review modal shown successfully" })`. Click `Rate BUCKS 5 out of 5 stars` and assert:
+
+```js
+expect(mocks.reviewRequest).toHaveBeenCalledTimes(1);
+expect(window.open).not.toHaveBeenCalled();
+expect(screen.getByText("How is your experience with BUCKS?")).toBeInTheDocument();
+```
+
+**Step 2: Write declined-response fallback tests**
+
+Use `it.each` for every documented decline code:
+
+```js
+[
+  "already-open",
+  "already-reviewed",
+  "annual-limit-reached",
+  "cancelled",
+  "cooldown-period",
+  "merchant-ineligible",
+  "mobile-app",
+  "open-in-progress",
+  "recently-installed",
+]
+```
+
+For each code, resolve the request with `{ success: false, code, message: "Unavailable" }`, click five stars, then assert the App Store URL is opened in a new tab:
+
+```js
+expect(window.open).toHaveBeenCalledWith(
+  "https://apps.shopify.com/bucks-currency-converter?#modal-show=WriteReviewModal",
+  "_blank"
+);
+```
+
+Also verify the card remains rendered.
+
+**Step 3: Write a request-error fallback and duplicate-request test**
+
+- Mock `reviewRequest` to reject, click five stars, and assert the fallback opens and the card remains visible.
+- Return a pending promise, click five stars twice, and assert `reviewRequest` runs once. Resolve it after the assertion to avoid an open test handle.
+
+**Step 4: Run the five-star tests to verify failure**
+
+Run:
+
+```powershell
+yarn vitest run tests/home/FeedbackCard.test.jsx
+```
+
+Expected: FAIL because `FeedbackCard` has not yet requested Shopify Reviews or handled fallback responses.
+
+**Step 5: Implement the five-star review flow**
+
+In `components/home/feedbackCard.jsx`:
+
+- Import `useAppBridge` from `@shopify/app-bridge-react` and call it inside `FeedbackCard`, matching existing usage in `pages/settings/index.jsx`.
+- Add `isReviewRequestInProgress` state and return early from the five-star handler while it is true.
+- Call `await shopify.reviews.request()` only for rating five.
+- If `result.success` is false, call the fallback opener for every response code, without a code allowlist.
+- If the request throws, call the fallback opener with `request-error` analytics context.
+- Use `window.open(APP_STORE_REVIEW_URL, "_blank")`; do not navigate the embedded app's current tab.
+- Clear the in-progress state in `finally`.
+
+Keep one-to-four-star handling separate and do not open the custom feedback modal for rating five.
+
+**Step 6: Run the five-star tests to verify they pass**
+
+Run:
+
+```powershell
+yarn vitest run tests/home/FeedbackCard.test.jsx
+```
+
+Expected: PASS for successful requests, every declined code, request errors, duplicate prevention, and card visibility.
+
+**Step 7: Commit the Shopify review flow**
+
+```powershell
+git add components/home/feedbackCard.jsx tests/home/FeedbackCard.test.jsx
+```
+
+### Task 4: Add PostHog event coverage and implementation
+
+**Files:**
+- Modify: `tests/home/FeedbackCard.test.jsx`
+- Modify: `components/home/feedbackCard.jsx`
+- Reference: `components/common/AnalyticsBanner/index.jsx:25-47`
+- Reference: `components/common/ThemeSyncCard.jsx:70`
+- Reference: `docs/superpowers/specs/2026-09-23-dashboard-review-feedback-design.md:153-174`
+
+**Step 1: Write failing analytics tests**
+
+Set `window.posthog = { capture }` and verify these events and properties:
+
+- A three-star click captures `Feedback Card - Star Selected` with `{ myshopify_domain: user.myshopify_domain, rating: 3 }`.
+- Opening lower-rating feedback captures `Feedback Card - Feedback Modal Opened` with the same rating.
+- Send captures `Feedback Card - Feedback Submitted` with `selected_reasons` and Boolean `has_written_feedback`; assert no free-text value appears in any capture call.
+- Cancel and close-icon tests capture `Feedback Card - Feedback Cancelled` with the appropriate `close_method`.
+- Five-star successful request captures `Feedback Card - Shopify Review Requested` and `Feedback Card - Shopify Review Result` with `success`, `code`, and `message`.
+- A declined request captures `Feedback Card - App Store Fallback Opened` with its decline `reason`.
+- A thrown request captures fallback with `reason: "request-error"`.
+- The mocked `ClosePopover` dismiss control remains a separate concern; do not claim `Feedback Card - Dismissed` is implemented until `ClosePopover` offers a success callback or the card wires one without changing current persistence semantics.
+
+Add one test where `window.posthog` is absent and verify rating, modal, and Shopify actions do not throw.
+
+**Step 2: Run analytics tests to verify failure**
+
+Run:
+
+```powershell
+yarn vitest run tests/home/FeedbackCard.test.jsx
+```
+
+Expected: FAIL because feedback-card analytics have not been implemented.
+
+**Step 3: Implement a local safe tracking helper**
+
+Add a small `trackEvent(eventName, properties = {})` function in `components/home/feedbackCard.jsx` that:
+
+```js
+const { posthog } = window || {};
+posthog?.capture?.(eventName, {
+  myshopify_domain: user?.myshopify_domain,
+  ...properties,
+});
+```
+
+Guard `window` for SSR. Call this helper exactly at the tested behavior boundaries. Do not send modal free text to PostHog.
+
+**Step 4: Add successful-dismiss analytics without weakening persistence**
+
+Modify `components/common/closePopover.jsx` to accept an optional `onDismissed` callback. Invoke it only after `dismiss()` returns `true`; do not invoke it when persistence fails. Keep existing consumers unchanged by making the prop optional.
+
+Pass `onDismissed={() => trackEvent("Feedback Card - Dismissed")}` from `FeedbackCard` to `ClosePopover`. Add/extend a test in `tests/common/closePopover.test.jsx` showing that the callback runs after a successful persistence response and not after a failed response.
+
+**Step 5: Run component tests to verify analytics pass**
+
+Run:
+
+```powershell
+yarn vitest run tests/home/FeedbackCard.test.jsx tests/common/closePopover.test.jsx
+```
+
+Expected: PASS for all review-card and close-popover analytics assertions.
+
+**Step 6: Commit analytics support**
+
+```powershell
+git add components/home/feedbackCard.jsx components/common/closePopover.jsx tests/home/FeedbackCard.test.jsx tests/common/closePopover.test.jsx
+```
+
+### Task 5: Perform integration verification and visual comparison
+
+**Files:**
+- Verify: `components/home/feedbackCard.jsx`
+- Verify: `components/common/closePopover.jsx`
+- Verify: `pages/index.jsx:515-516`
+- Verify: `docs/superpowers/specs/2026-09-23-dashboard-review-feedback-design.md`
+- Reference: [Dashboard card Figma](https://www.figma.com/design/zWmT6pWcnApOQrtvHv3KC5/UFE-Widget---UFE-3.0--ALPHA-2.0?node-id=15426-40884&t=9oNOFO8taGndXOgN-4)
+- Reference: [Feedback modal Figma](https://www.figma.com/design/zWmT6pWcnApOQrtvHv3KC5/UFE-Widget---UFE-3.0--ALPHA-2.0?node-id=15426-42089&t=9oNOFO8taGndXOgN-4)
+
+**Step 1: Run targeted tests**
+
+Run:
+
+```powershell
+yarn vitest run tests/home/FeedbackCard.test.jsx tests/common/closePopover.test.jsx tests/api/dashboardSection.test.js
+```
+
+Expected: PASS.
+
+**Step 2: Run the full test suite**
+
+Run:
+
+```powershell
+yarn test
+```
+
+Expected: PASS. Investigate and fix all failures caused by this feature before proceeding.
+
+**Step 3: Run production build verification**
+
+Run:
+
+```powershell
+yarn build
+```
+
+Expected: Next.js production build completes successfully. Resolve import, SSR `window`, Polaris, or App Bridge errors before merge.
+
+**Step 4: Manually verify in embedded Shopify Admin**
+
+Start the app through the repository's normal Shopify development flow, open the Bucks dashboard, and compare it to both Figma references. Verify:
+
+- card title, helper copy, five-star layout, and overflow menu match the card design;
+- modal title, checkbox choices/order, textarea label/placeholder, and Cancel/Send footer match the modal design;
+- narrow viewport stacks checkbox columns with no horizontal overflow;
+- one-to-four-star path opens the custom modal, sends silently to Crisp, and retains the card;
+- five-star path requests Shopify's native review modal;
+- force or observe a declined/error Reviews API result and confirm the App Store URL opens in a new tab;
+- only explicit overflow-menu Dismiss hides the card and it remains hidden after dashboard refresh.
+
+**Step 5: Inspect final changes before commit**
+
+Run:
+
+```powershell
+git status --short
+```
+
+Expected: no whitespace errors, no unrelated files, no free-text feedback in PostHog calls, and no changes under `widgets/`.
+
+**Step 6: Commit final verification fixes if needed**
+
+```powershell
+git add components/home/feedbackCard.jsx components/common/closePopover.jsx tests/home/FeedbackCard.test.jsx tests/common/closePopover.test.jsx
+```
