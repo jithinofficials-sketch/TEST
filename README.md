@@ -1,113 +1,148 @@
-# Minimal Auto Location Refresh Design
+# RFC: BUCKS Integration With Shopify Sidekick
 
-Status: DRAFT - requires approval before implementation.
+- **Status:** Draft
+- **Type:** Feature RFC
+- **Audience:** Merchants using BUCKS in Shopify Admin
+- **Proposed reviewers:** BUCKS product, engineering, and support teams
+- **Scope:** Core proposal for alignment; a detailed technical RFC follows approval.
 
-Audience: BUCKS storefront shoppers.
+## 1. Problem
 
-## Goal
+Merchants need help setting up BUCKS, understanding currency behavior, and troubleshooting their stores. Answers currently require navigating app settings, reading help articles, or contacting support.
 
-When location-based auto-switch is enabled, refreshing the same tab requests fresh location unless the shopper has an explicit currency choice. A VPN change can then affect displayed currency if the location provider returns the new country and the existing conversion flow supports the switch.
+Sidekick should make basic guidance and store-specific configuration easier to understand without leaving the merchant's current workflow.
 
-This is a narrow cache/selection fix, not a redesign of Shopify localization or widget reconversion.
+## 2. Why This Matters
 
-## Current problem
+- Make setup and common troubleshooting easier.
+- Reduce searching across settings and documentation.
+- Explain the differences between displayed currency, market currency, and checkout currency.
+- Help merchants understand analytics without confusing currency selections with purchases.
+- Direct issues requiring investigation to BUCKS support with useful context.
 
-1. `autoSwitchCurrency.js` restores `buckscc_customer_currency` before attempting location detection.
-2. `convert/convertToLocalCurrency.js` also returns early when `hxoGeoCurrency` exists.
-3. Automatic conversion and manual selection both save the current currency. The saved value alone cannot distinguish intent.
-4. Session storage survives a same-tab refresh; a VPN connection does not invalidate it.
+These are intended outcomes. Support-ticket reduction should be measured after release rather than assumed.
 
-The existing `buckscc_auto_currency` and `buckscc_last_manual` localStorage entries are analytics records and cannot reliably identify selection intent.
+## 3. Proposed Solution
 
-## Recommended solution
+Provide a **read-only Sidekick integration** that answers basic BUCKS questions using approved product guidance and authenticated store configuration, then links to the relevant app page or help resource.
 
-Add one session boolean, `buckscc_manual_currency_selected`, using `eStore` directly in the existing files. Do not introduce a storage helper or shared request-state module.
-
-| Action | Flag | Result |
+| Answer type | Purpose | Example |
 | --- | --- | --- |
-| Automatic first visit | Absent | Request location and apply a supported detected currency |
-| Refresh in automatic mode | Absent | Request location even when both currency caches exist |
-| Explicit dropdown currency | `true` | Preserve the existing saved currency on refresh |
-| Accepted URL currency | `true` | Preserve the accepted URL choice on refresh |
-| Auto Location click | Remove flag | Request location immediately rather than applying the cached dropdown ID |
+| Product guidance | Explain verified functionality and documented steps | "How do I add a currency?" |
+| Store-specific answers | Explain the merchant's saved configuration | "Which currencies have I enabled?" |
+| Guided troubleshooting | Identify configuration-based causes and suggest basic checks | "Why might my switcher be hidden on mobile?" |
+| Navigation and support | Link to settings, help, or support | "Where can I get help with this issue?" |
 
-Read the flag as strict boolean true. Keep the formats of `buckscc_customer_currency`, `hxoGeoCurrency`, and `hxoGeoCountry` unchanged.
+**Recommended first release:** approved product guidance, saved configuration, and basic troubleshooting. Analytics definitions can be included once verified; store-specific analytics reporting is a later phase pending validation of metric definitions, access controls, and response speed.
 
-### Why this approach
+Compared with a general FAQ alone, this approach provides relevant store context. Compared with a full data-and-actions integration, it keeps the initial scope smaller and leaves changes in the existing app UI. No new BUCKS settings screen is proposed.
 
-Always refreshing location without the flag would undo manual choices on navigation. A geo-cache expiry alone would still leave the saved-current-currency shortcut and would not guarantee detection on the next refresh. One flag and four existing production files are the smallest proposed scope that preserves explicit choices.
+### Core Merchant Questions
 
-No new merchant settings or shopper UI are needed. Existing currency labels and formatting remain intact.
+This is a question inventory, not a claim that every answer or data source is already available. Each launch topic requires a verified source.
 
-## Detection and fallback
+| Area | Questions |
+| --- | --- |
+| Setup | How do I enable BUCKS on my theme? Why isn't the currency switcher showing? Do I need to remove my old currency converter? Do I need to enable BUCKS again after changing or publishing a theme? |
+| Currencies | How do I add or remove currencies? Can I change the default currency? Can customers choose their own currency? Which currencies are currently enabled? |
+| Automatic conversion | Can BUCKS detect the visitor's country? Why am I seeing the wrong currency? Will it remember a customer's selection? Which takes priority: automatic detection, the default currency, or a saved selection? |
+| Prices and exchange rates | Where do exchange rates come from? How often are they updated? Can I use a manual rate or round converted prices? Why does the converted price look incorrect? Does BUCKS change product prices or only their display? |
+| Checkout | Will customers pay in the currency they select? Why does the currency change at checkout? How does BUCKS work with Shopify Markets? |
+| Appearance | Can I change the switcher's position, colors, or flags? Can I hide it on mobile? What are my current visibility settings? |
+| Compatibility and troubleshooting | Does BUCKS work with my theme? Why aren't cart prices converting? Does it work with quick-view popups or subscription apps? Will it slow down my store? |
+| Plans and support | What is included in the free plan? How do I cancel my subscription? How do I contact support? What information should I share for an investigation? |
+| Markets | Does BUCKS use currencies configured in my markets? Does changing currency change the customer's market? Does BUCKS respect market-specific prices? What happens if a visitor's country is not in an active market? Do I need to update BUCKS after changing market settings? |
+| Analytics | How are visits tracked and stored? What counts as a visit? Can I see visits by country or currency? How many shoppers clicked the switcher or changed currency? Why do numbers differ from Shopify Analytics? How long is data stored? Why is there no data yet, and when was it last updated? |
+| Testing | How can I test another currency or country without affecting customers? Why does an incognito window or another device show a different currency? |
 
-- Automatic initialization and Auto Location explicitly request a fresh lookup, bypassing the cached-geo shortcut for those requests.
-- Preserve existing merchant-preview transport and behavior; the freshness requirement is for storefront shoppers, not a preview redesign.
-- Bound a fresh storefront attempt, including response-body parsing, to **2500 ms**.
-- On a successful valid result, update the country/currency cache pair and invoke the existing conversion flow with its merchant restrictions and multi-currency behavior.
-- On rejection, unsuccessful HTTP status, malformed response, unavailable rate, disallowed currency, or timeout: use the previously applied currency if usable, otherwise the cached geo currency if usable. If neither is usable, leave current prices unchanged.
-- A fallback does not set the manual flag and does not claim fresh location detection succeeded. Do not introduce additional fallback analytics dispatches; keep existing analytics behavior inside shared conversion paths.
-- Clear the timeout after settlement. Late results cannot change storage, labels, prices, or events after timeout.
-- Retain existing visit-tracking completion behavior; do not attribute a failed lookup to a newly detected country.
+### Support Escalation - Core Requirement
 
-## Request ordering without another file
+> **Sidekick provides basic guidance and explains the merchant's BUCKS configuration. For further assistance, detailed investigation, or issues that cannot be resolved through basic checks, it must recommend contacting BUCKS support and provide an approved direct support link.**
 
-Keep a module-local request counter in `convertToLocalCurrency.js`. Export a small invalidation function from that same file for explicit dropdown selections.
+Escalate when:
 
-- A new lookup supersedes older lookups.
-- Explicit manual selection invalidates pending lookups before applying the choice.
-- Each response and fallback checks that its request is still current and no manual flag is active.
-- An auto -> manual -> auto sequence must not allow the first automatic response to overwrite the second. The flag alone is insufficient, hence the counter.
-- Keep network parsing free of storage/UI side effects; apply those only after the timeout race and request checks succeed.
+- The switcher or converted prices still do not work after basic checks.
+- Theme, cart, quick-view, or third-party app compatibility requires investigation.
+- Checkout, Shopify Markets, or analytics discrepancies cannot be explained using verified information.
+- The merchant needs store-specific customization or more detailed assistance.
 
-## URL behavior
+Briefly summarize the issue and checks already completed so the merchant can share them with support. Do not invent a diagnosis or imply that support has been contacted automatically.
 
-Preserve the existing handler's precedence: an already-saved currency prevents accepting a new URL override. Otherwise accepted `currency` or `bucks_currency` parameters save the currency and set the flag. Invalid or disallowed parameters do not set it.
+**Example:**
 
-This records accepted URL intent; it does not change which links take priority.
+> Your saved settings show that the switcher is enabled on mobile. If it still is not appearing, contact BUCKS support for a closer look at your theme. Share the affected page URL and a screenshot, along with the checks you have already tried.
 
-## Auto Location interaction
+The actual response must include the approved support link.
 
-Clear the manual flag, close the existing dropdown as appropriate, and request fresh detection. Do not immediately display or dispatch the cached item ID as if it were a fresh result. Update the selected label and existing currency-change event through the accepted conversion/fallback path. Refresh the cart banner after current-request completion when enabled, not from a stale response.
+### Answer Boundaries
 
-An Auto Location click does not change the merchant's auto-switch setting. If that setting is disabled, later page loads retain their existing behavior.
+- Distinguish documented behavior, saved configuration, and verified live behavior.
+- Do not treat a saved enabled status as proof that the widget works on the live theme.
+- Do not guarantee checkout currency based on BUCKS display settings.
+- Do not claim compatibility, performance, exchange-rate cadence, or retention policies without verified evidence.
+- Keep plan answers factual; exclude upgrade nudges, promotions, and cross-selling.
+- Identify missing, stale, or unavailable information rather than guessing.
+- Do not expose credentials, unrelated personal data, or another merchant's information.
+- No automatic setting changes, live storefront debugging, or automatic support-ticket creation in this release.
 
-## Four-file production boundary
+## 4. End-to-End Flow
 
-All paths below are relative to `widgets/src/apps/widgets/buckscc/`:
+```text
+Merchant asks a BUCKS question in Sidekick
+  -> Sidekick selects the relevant BUCKS data tool
+  -> BUCKS returns approved guidance or authenticated store data
+  -> Sidekick explains the answer and links to the relevant page
+  -> If further investigation is needed, recommend BUCKS support
+```
 
-1. `autoSwitchCurrency.js`: flag-aware initial routing and explicit fresh lookup request.
-2. `convert/convertToLocalCurrency.js`: fresh-request option, timeout, fallback, and local request counter.
-3. `template/refreshTriggerEvent.js`: record manual intent, invalidate requests, and re-detect on Auto Location.
-4. `common/convertCurrencyByUrlParams.js`: record accepted URL intent.
+For example, if a merchant asks why the switcher is missing on mobile and saved mobile visibility is disabled, explain the setting and link to it. If visibility is enabled, suggest basic checks and escalate unresolved issues rather than claiming a live diagnosis.
 
-Tests and these documents are additional files, but production modifications stay within these four files.
+Merchants make changes through the existing app. This release introduces no shopper-facing behavior changes.
 
-## Deliberate limitations
+## 5. Dependencies and Release Criteria
 
-- `common/reconvert.js` is unchanged. Existing page-load/DOM handlers may briefly reapply cached currency while detection is pending. This version does not promise flicker-free pending behavior.
-- `common/changeMultiCurrency.js` and its path-based reload guard are unchanged. A Shopify localization change can still be blocked after an earlier automatic submission on the same path. Fresh detection is fixed; successful checkout/localization switching is not guaranteed in that case.
-- No manual multi-currency restoration redesign, same-currency country switching changes, or retry-history migration.
-- No live VPN listener, polling, cache TTL, or new request-state helper.
-- Existing rerender callers may also initiate detection through `autoSwitchCurrency`; this version does not promise exactly one request per page or change resize handling. Superseded results remain ignored.
-- Provider country accuracy and HTTP cache behavior need live verification. A new request is not proof that the provider has detected the VPN country.
+### Integration Prerequisites
 
-## Existing sessions
+- Support Shopify managed installation and token exchange; the inspected app currently uses legacy OAuth.
+- Allow authenticated requests from Shopify's extension sandbox.
+- Verify Shopify CLI 3.90.0 or later and the required Sidekick app configuration, including `extensions_summary`.
+- Keep backend responses shop-scoped and enforce feature access server-side.
+- Keep the headless Sidekick extension separate from the storefront widget build.
 
-Missing flag means automatic mode when auto-switch is enabled. An old manual choice may therefore reset once after deployment because existing data cannot reliably identify its source. New explicit choices remain preserved. Approving this design includes accepting this rollout tradeoff.
+### Content Prerequisites
 
-## Acceptance checks
+- Select approved BUCKS help and product sources for the launch question set.
+- Verify rate provider/cadence, currency-selection precedence, Markets behavior, analytics definitions, and retention before answering those topics.
+- Assign ownership for approving answers and keeping them current.
+- Confirm the direct support link and relevant app/help destinations.
 
-1. Saved automatic INR + fresh US response on reload -> USD in the normal display conversion path.
-2. Manual INR, even if equal to detected INR, remains INR on refresh without a switching geo request.
-3. Accepted URL currency sets the flag; rejected URL and already-saved-currency precedence remain unchanged.
-4. Auto Location after manual EUR requests location and uses the result rather than cached item ID.
-5. Rejected, malformed, disallowed, or never-settling lookup uses the defined fallback; no usable fallback leaves prices unchanged.
-6. A response after the 2500 ms deadline is ignored; a later manual choice beats a pending response.
-7. Two requests resolving out of order, including auto -> manual -> auto, apply only the latest intent.
-8. Preview, auto-switch-disabled behavior, dropdown closure, and banner completion remain functional.
-9. Verify existing localization and pending-reconversion limitations separately; do not label them fixed.
+### Initial Acceptance Criteria
 
-## Approval
+- Agreed launch questions have verified expected answers and sources.
+- Configuration answers match the authenticated merchant's saved settings.
+- Missing or stale information is explicitly identified.
+- Unresolved issues and requests for detailed investigation lead to a clear support recommendation and working support link.
+- No tool changes merchant settings or claims to contact support automatically.
+- Links open the correct app page, help resource, or support destination.
+- Responses stay within Shopify's 4,000-token limit and approximately one-second app-data response target.
 
-Approve this design and its companion plan before implementation. The previous reset implementation is not to be restored.
+Evaluate answer correctness, support-escalation behavior, and response latency before release. After launch, track tool failures and unanswered question categories, and measure support handoffs where observable.
+
+### Phasing
+
+1. **Core release:** product guidance, saved configuration, basic troubleshooting, and support handoff.
+2. **Analytics expansion:** store-specific reporting after validating metric meaning, entitlements, freshness, and latency.
+
+The detailed technical RFC will define tool schemas, endpoints, content delivery, caching, authentication migration, and rollout checks. This core RFC does not approve implementation.
+
+## 6. Open Questions
+
+1. Which BUCKS help center or support FAQ is the approved source for product guidance?
+2. Should all listed topics receive general guidance at launch, with store-specific analytics deferred?
+3. Who owns answer approval and updates when BUCKS behavior changes?
+4. Which approved support destination should Sidekick link to?
+
+## References
+
+- [Shopify Sidekick app extensions](https://shopify.dev/docs/apps/build/sidekick)
+- [Use extensions to surface app data](https://shopify.dev/docs/apps/build/sidekick/build-app-data)
