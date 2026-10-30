@@ -1,101 +1,244 @@
-# Merchant Panel Enhancement Design
+# Ticket: Create a Hawkeye Review Skill
 
-Status: approved scope; written design for review. Implementation has not started.
+- Status: Workflow approved; implementation ticket awaiting review
+- Type: AI tooling / developer experience
+- Intended user: Developer responding to Hawkeye feedback on a GitHub PR
+- Skill name: `hawkeye-review`
 
-Audience: Bucks internal super-admin and allowlisted support staff.
+## Problem
 
-## Decisions
+Developers repeatedly read Hawkeye reviews, decide whether findings are valid,
+make fixes, write commits, and respond to the bot. Blindly accepting findings
+creates unnecessary changes; manually repeating the review loses context between
+rounds. The workflow needs evidence-based decisions and verification of developer
+fixes before publishing replies.
 
-The RFC and clarification answers approve Polaris Filters and IndexTable, complete-dataset filtering, per-row Sync, install-time Markets capture, and a Live Preview button in each merchant row. External feedback investigation/restoration is a separate follow-up, with no rating column in this release.
+## Why This Matters
 
-Use the existing shop-level enabled presentment currencies, refreshed manually through Sync. Use UTC date boundaries and single-select Bucks Plan. Sync does not reconcile billing. The later clarification approves displaying the stored Bucks plan with recorded subscription status as secondary context: missing status must not turn a paid plan into Free.
+This skill should reduce repeated review work while keeping the developer in
+control of code changes and published responses. Success means findings have
+traceable evidence, fixes are verified, and no reply is posted without approval.
 
-## Approach
+## Proposed Solution
 
-Implement focused changes to the existing list component and route, plus small helpers for query validation, row serialization, and Shopify context refresh. Reuse the refresh helper from installation and Sync. No new UI library, global store slice, widget changes, or general-purpose data framework.
+Build a PR-connected skill using authenticated GitHub CLI (`gh`) access and the
+local repository. Use two commands:
 
-Alternatives: a display-only patch is smaller but cannot satisfy reliable filtering or refresh; automatic Markets/currency webhook refresh adds integration and rollout work that is unnecessary for the approved manual-refresh scope. The focused approach meets the agreed scope with the least additional surface. Staff get one list and explicit refresh; merchants gain no settings or setup tasks.
-
-## Interface
-
-Keep the existing Merchants page and Access navigation. Replace the custom table and pagination controls with Polaris components. Use a non-selectable IndexTable, horizontally scrollable on narrow screens.
-
-Columns, in order: Merchant, Email, Domain, Status, Bucks Plan, Store created, App installed, Markets status, Enabled currencies, Actions.
-
-- Merchant: name, falling back to Shopify domain. Email and unavailable dates: N/A.
-- Domain: primary domain, falling back to Shopify domain.
-- Status: Active or Uninstalled; this describes installation only.
-- Bucks Plan: named stored Bucks entitlement, never Shopify plan_display_name. Show recorded subscription status below it when present. Explain that Sync does not verify billing. Known free/null/missing plan maps to Free; an unrecognized nonempty plan maps to Unknown rather than Free. Keep legacy variants distinguishable by label and identifier.
-- Store created: created_at from Shopify shop data. App installed: first_installed, never last_installed.
-- Markets status: Enabled, Disabled, or Not available. Help text: "Enabled means at least one active market beyond the primary market. Saved data is refreshed on installation or Sync."
-- Enabled currencies: saved ISO codes, allowed to wrap. Nonempty historical values display immediately. Empty values without evidence of successful retrieval display Not available; a successfully refreshed empty list displays None. A separate successful currency-refresh timestamp establishes that evidence.
-- Actions: Access, Sync, Live Preview. Only the affected row shows Sync loading; Access keeps its existing behavior.
-
-Live Preview is an external-link button with target="_blank" and rel="noopener noreferrer". Build an HTTPS storefront URL from a validated primary hostname, otherwise a validated myshopify.com hostname. Reject credentials, unsafe schemes, malformed hosts, and unexpected ports. Disable the action if neither source is valid. It does not require impersonation and remains usable for an uninstalled merchant. This is the live storefront, subject to password protection.
-
-## Filters and list contract
-
-GET /api/v1/admin/merchants/list accepts page, limit, search, status, plan, createdFrom, createdTo, installedFrom, installedTo. Defaults: page 1, limit 20, no filters. Cap limit at 100. Reject malformed, repeated/array-valued, fractional, nonpositive, or unsafe pagination values with 400; validate skip arithmetic. Search is trimmed and limited to 200 characters.
-
-Status: any, active, uninstalled. Plan: any, free, unknown, or a recognized Bucks plan identifier. Text search matches name, email, primary domain, or Shopify domain with OR. Combine text search, other filters, and staff-own-store exclusion with AND. Use exactly the same predicate for findMany and count before skip/take. Use last_used descending plus myshopify_domain ascending for deterministic ties.
-
-Date inputs accept real YYYY-MM-DD calendar dates. Either bound may be supplied. Start is inclusive at 00:00 UTC; end is exclusive at the next day's 00:00 UTC. Reject reversed or invalid ranges. Missing dates do not match a date filter. Account explicitly for MongoDB missing versus null fields in Free/Unknown plan predicates.
-
-Each date filter opens its own popover containing range controls and Apply. Do not leave calendars permanently visible. Committed changes reset page to 1. Show removable chips and Clear all. Debounce text input by 300 ms; never issue an immediate request for the previous page when a filter changes.
-
-Return a whitelist of display fields, normalized plan metadata, safe storefront URL, and existing pagination shape. Never return tokens or full merchant records. Loading, no results, and request failure have distinct states; errors have Retry. Guard list requests by monotonically increasing request IDs and invalidate on cleanup so old results/errors/finalizers cannot replace current state. After Sync, refetch the current filtered page because changed data may affect membership; if the page is beyond the new total, load the last available page.
-
-## Persistence and refresh
-
-Add nullable users fields:
-
-```prisma
-marketsEnabled        Boolean?
-marketsFetchedAt      DateTime?
-currenciesFetchedAt   DateTime?
+```text
+/hawkeye-review check [PR URL]
+/hawkeye-review verify [PR URL]
 ```
 
-No default false and no bulk backfill. Missing Markets fields mean Not available. Existing enabled_presentment_currencies remains the currency source. A successful Markets refresh writes its boolean and timestamp together. A successful currency refresh writes its array and timestamp together.
+The PR URL is optional. By default, discover the open PR for the current branch
+whose base is `development`. The developer implements recommended fixes.
+Both modes draft replies and request explicit approval before publishing.
+Every posted reply starts with the literal `/hawkye`. There is no separate
+review-trigger step.
 
-POST /api/v1/admin/merchants/sync accepts only merchantShop as the target selector. Authenticate the actual staff session with fetchSession, authorize with isImpersonator, validate the Shopify hostname, and load the selected merchant and its credentials server-side. Do not use the staff token or create an impersonation session to perform Sync. Return 401 for missing authentication, 403 for unauthorized staff, 405 for wrong method, and 400 for invalid/unknown target or unavailable credentials/uninstalled app.
+This approach is preferred over pasted feedback because it preserves review
+thread and commit context. Fully automated fixing is outside the initial scope.
+PR creation remains in the existing PR workflow.
 
-Refresh has independent shop/currency and Markets outcomes. The shop query selects only name, email, primary domain, creation time, and enabledPresentmentCurrencies. Write only successfully validated fields; never spread Shopify responses or an old complete user record into an update. Preserve first_installed, last_installed, last_used, billing, installation status, settings, and unrelated shop fields.
+## End-to-End Flow
 
-Use the configured Shopify client and selected merchant credentials. Check transport errors, GraphQL errors, null/missing fields, pagination cursors, and query completeness. A failed Markets request preserves both saved value and successful timestamp. Disabled requires a complete successful traversal with no active non-primary market. Enabled requires a verified active non-primary market; prefer completing traversal before saving for a simple consistent contract. Bound execution time; exhausted pagination/time/retry budgets produce failure, never Disabled.
+```text
+Existing PR -> check -> assess findings
+                       |-> valid: recommend fix -> developer changes code
+                       |                           -> verify -> commit message
+                       |                                     + reply drafts
+                       |-> invalid: evidence + reply drafts
+                       |-> uncertain: identify missing evidence
 
-Return component outcomes, for example data.outcomes.store/currencies/markets with updated or failed and a safe message, plus data.partial. Overall success is true only if something was saved; partial success is visible as a warning rather than a full-success toast. Persistence failure is not reported as successful refresh. Disable repeated row clicks while pending; use bounded retries only for transient reads, respecting Shopify throttle guidance. Do not introduce a distributed job system.
+Reply drafts -> developer approval -> post approved replies to GitHub
+Next invocation -> fetch current state -> reconcile earlier findings
+```
 
-After new-install/reinstall merchant persistence in afterAuth, attempt the same Markets refresh using the authenticated session. Await a bounded attempt within its own error boundary: failures must not fail authentication, roll back merchant creation, or skip existing notifications. Do not launch an unawaited promise whose execution depends on serverless process survival. Do not refresh Markets on every ordinary auth callback for an already active merchant.
+### PR Discovery
 
-## Verified code facts and compatibility gates
+1. Detect the repository, current branch, and GitHub remote using Git/`gh`.
+2. Match open PRs by head branch, head repository, and base `development`.
+3. Display the selected PR URL, head, base, and head SHA before analysis.
+4. If no PR matches, ask for a URL or another base branch; do not create a PR.
+5. If matches or remotes are ambiguous, ask the developer to select one.
+6. An explicit URL overrides discovery. Validate that the local checkout
+   corresponds to that PR before relying on it for verification.
+7. Detached HEAD, missing authentication, unavailable repository access, or an
+   unrelated checkout must produce an actionable explanation rather than a guess.
 
-- pages/api/auth/afterAuth.js maps REST shop data into users and sets first_installed only on create. Preserve this behavior.
-- utils/constants.js excludes enabled_presentment_currencies from ordinary update writes. Sync must use an explicit narrow write, not weaken the global allowlist.
-- utils/admin/isSuperAdmin.js authorizes merchant-panel staff through isImpersonator, combining SUPER_ADMIN_DOMAINS and STAFF_STORES.
-- Billing confirmation writes bucks_plan and subscription_id, not subscription_status. The local payment_update.js handler is a stub. New webhook registrations target a separate server. Stored status is context, not a verified live billing signal.
-- utils/shopify.js reads SHOPIFY_API_VERSION and SCOPES from environment. Deployed values and granted target-store scopes have not been verified.
-- Shopify current Market documentation requires read_markets and deprecates primary/enabled fields. Before implementing the query, verify the deployed-version schema and primary-market semantics on a test shop. Do not silently upgrade the app-wide API version or assume modern retail/company markets represent international regions.
-- Verify shop.enabledPresentmentCurrencies, primaryDomain, and createdAt against that same version. If existing scopes do not cover Markets, missing permission stays Not available and Sync explains it; any scope rollout requires an explicit deployment decision.
+### Check Mode
 
-These API checks are blocking implementation prerequisites for the refresh adapter, not claims of completed live validation. The table/filter work is independent.
+Fetch all pages of relevant review threads, review summaries, and PR comments.
+Identify Hawkeye by its confirmed GitHub author identity, not by keyword matching
+alone. Read the PR diff, surrounding code, callers, tests, and applicable repository
+instructions. Compare the reviewed revision with the current PR head.
 
-## Verification and release
+For each finding, report:
 
-Test complete-dataset filter/count parity, Mongo null/missing plan cases, UTC/leap-day boundaries, reinstall preservation, staff authorization, target credential isolation, complete pagination, partial GraphQL errors, missing scopes, revoked credentials, and last-known-good preservation. UI tests cover stale requests, chip removal/reset, row loading, Sync-driven refetch, and safe external links.
+| Field | Required content |
+| --- | --- |
+| Reference | Stable finding ID and source comment/thread URL |
+| Verdict | Valid, partially valid, invalid, already addressed, or needs evidence |
+| Evidence | Code references, reachable conditions, requirements, or checks |
+| Impact | Actual failure conditions and consequence |
+| Scope | Whether this PR needs the change or a follow-up is appropriate |
+| Recommendation | Smallest suitable fix and verification, or no-change rationale |
+| Reply | Proposed text when a response is appropriate |
 
-On a development shop, verify first installation and reinstall, a primary-only configuration, an active non-primary market, disabled non-primary markets, and partial failures. Check desktop and narrow-screen scrolling, keyboard use, and visible error states. Never declare deployed Markets compatibility based only on mocks.
+Validity and urgency are independent. A real but unrelated issue is not invalid.
+Do not classify uncertain findings as invalid merely because they cannot be
+reproduced. Group duplicate root causes while retaining each source reference.
 
-Use nullable additive schema fields and regenerate Prisma. No destructive data migration or all-store backfill. The storefront widget build remains isolated. Sidekick explanations need changes only if inspection finds an existing explanation of this internal staff surface; do not expose staff-only actions as merchant capabilities.
+For valid and partially valid findings, recommend fixes without editing code.
+For invalid findings, draft an evidence-based reply. For already-addressed
+findings, verify the relevant revision before drafting an accurate response.
+For uncertain findings, explain the missing evidence and next diagnostic step.
+
+### Verify Mode
+
+1. Re-fetch the PR and findings; reconcile prior review state.
+2. Inspect committed changes, staged changes, and unstaged changes without
+   modifying the working tree. Identify which changes relate to each finding.
+3. Verify the root cause is addressed and check for regressions in affected paths.
+4. Run relevant checks permitted by repository instructions. Report exact results,
+   including checks not run and why. Passing a test alone is not proof of a fix.
+5. Classify each finding as fixed, partially fixed, unresolved, or unverified.
+6. Generate a commit message for the relevant changes using repository conventions.
+   Do not incorporate unrelated work or create an empty/fictional commit message
+   when no relevant uncommitted changes exist.
+7. Draft thread-specific replies explaining changes and verification. Distinguish
+   uncommitted, committed locally, and pushed changes. Use a commit SHA only when
+   the commit actually exists; do not claim a local fix is visible in the PR.
+8. Show the drafts and request posting approval. Partial/unverified fixes must not
+   be presented as resolved. A local-only progress reply must explicitly say the
+   fix is not yet available in the PR.
+
+### Approval and Publishing
+
+Show each exact reply with its target thread/comment URL and finding ID.
+Allow approval of all drafts, selected drafts, edits, or cancellation.
+
+Example prompts:
+
+- Check: "These findings appear invalid for the reasons shown. Approve posting
+  these replies?"
+- Verify: "These findings appear fixed based on the checks shown. Approve posting
+  these replies?"
+
+Approval covers only the displayed text and destinations. Edits require fresh
+approval. Before publishing, check whether the PR head or relevant review thread
+changed; if so, refresh the assessment and approval rather than posting stale text.
+
+Post inline replies to the original review threads. Where GitHub has no threaded
+reply support, publish a PR comment linking the original comment and finding.
+Report successful reply URLs and failures separately. Do not blindly retry an
+uncertain write; first reconcile whether it was already published.
+
+Example fixed reply:
+
+```text
+/hawkye
+
+Addressed in <actual pushed commit SHA>.
+Change: <what changed and why it resolves the finding>
+Verification: <checks actually performed and results>
+```
+
+Example invalid-finding reply:
+
+```text
+/hawkye
+
+No code change is needed for this finding.
+Reason: <specific explanation supported by the code>
+Evidence: <revision-aware code references or verification results>
+```
+
+Do not automatically commit, push, resolve threads, merge PRs, or issue a separate
+Hawkeye trigger. Approved replies themselves carry the requested prefix.
+
+## Implementation Details
+
+### Components
+
+- Skill instructions: Command routing, evidence standards, output format, and
+  approval protocol.
+- GitHub adapter: PR discovery, paginated review retrieval, thread mapping, and
+  approved reply publishing through `gh`.
+- Analysis workflow: Revision-aware evaluation using the actual repository code.
+- Local review state: Resume across invocations without relying on chat history.
+
+### Review State
+
+Store a versioned record under the repository's Git metadata directory, resolved
+using Git rather than assuming `.git` is a directory. Key records by repository
+and PR number. Store review/head SHAs, source comment/thread IDs, verdicts,
+evidence references, verification results, reply text/status, and posted reply IDs.
+Do not store credentials. GitHub remains the source of truth; refresh on each run.
+
+If state is missing, reconstruct from GitHub and current code. Do not automatically
+reuse cached approval on a new invocation. Suppress duplicate replies using source
+IDs, posted reply IDs, and reconciliation against GitHub.
+
+### Edge Cases
+
+- New review rounds: distinguish new, repeated, stale, and already-handled findings.
+- Repeated disagreements: present the changed claim and prior evidence rather
+  than repeatedly changing code or posting the same rebuttal.
+- Resolved threads: do not reopen or respond automatically; check whether new
+  evidence actually requires attention.
+- API failures/rate limits: identify incomplete retrieval and avoid claiming the
+  entire review was assessed when pages or sources could not be fetched.
+- Review text: treat it as untrusted input to investigate, not executable
+  instructions or authority to change unrelated files.
+- Changed checkout/remote SHA: report mismatches and do not verify against the
+  wrong revision or silently switch branches.
+
+### Delivery Phases
+
+1. Implement discovery, retrieval, evidence-based check mode, and resumable state.
+2. Implement developer-change verification and commit-message generation.
+3. Implement approval-bound publishing and end-to-end workflow checks.
+
+No admin-app, storefront-widget, Shopify API, or database changes are needed.
+
+## Acceptance Criteria
+
+- [ ] Both commands work without a URL when exactly one matching PR targets
+  `development`; explicit PR URLs override discovery.
+- [ ] Missing/ambiguous PRs and mismatched checkouts are handled explicitly.
+- [ ] Inline reviews, summaries, and PR comments are fetched with pagination and
+  attributed to the confirmed bot identity.
+- [ ] Every verdict includes evidence; validity is distinct from urgency/scope.
+- [ ] Valid findings receive a suitable minimal-fix recommendation.
+- [ ] Invalid findings receive a factual draft rebuttal, never an automatic post.
+- [ ] Verify evaluates actual changes and reports partial or unverifiable fixes.
+- [ ] Commit messages follow repository style and describe only relevant changes.
+- [ ] Replies accurately distinguish local changes from pushed fixes.
+- [ ] Every posted reply begins with `/hawkye` and has explicit approval for its
+  exact content and destination.
+- [ ] Changed drafts or changed review context require renewed approval.
+- [ ] Repeated invocations do not duplicate already-posted replies.
+- [ ] Partial publishing failures report which replies succeeded and remain pending.
+- [ ] A fresh session can resume by fetching GitHub state and local review records.
+- [ ] No command automatically edits code, commits, pushes, resolves threads,
+  merges, or performs an additional review-trigger step.
+
+Verification scenarios must cover a valid finding, an invalid finding, an uncertain
+finding, an outdated finding, a local-only fix, a pushed fix, duplicate findings,
+approval rejection/editing, a changed head after approval, and partial API failure.
+Publishing tests should use mocked APIs or an explicitly designated test PR.
+
+## Integration Questions to Confirm Before Implementation
+
+1. Confirm the Hawkeye GitHub bot identity and whether the exact `/hawkye` prefix
+   triggers it in inline replies as well as top-level PR comments. This is the
+   requested spelling, not a verified integration fact. If unsupported, report
+   the limitation and agree on placement rather than silently changing the flow.
+2. Confirm the target skill host and installation scope (project-local or personal)
+   so the approved command names map to the host's actual invocation syntax.
 
 ## References
 
-- components/admin/MerchantList.jsx
-- pages/api/v1/admin/merchants/list.js
-- components/admin/StaffAccessBar.jsx
-- pages/api/auth/afterAuth.js
-- utils/userWriteFilter.js and utils/constants.js
-- utils/admin/isSuperAdmin.js and utils/admin/impersonationContext.js
-- pages/api/v1/billing/checkSubscriptionStatus.js
-- utils/common/common-methods/trialHelpers.js
-- utils/webhooks/payment_update.js and utils/shopify.js
-- https://shopify.dev/docs/api/admin-graphql/latest/objects/Market (reviewed 2026-10-28; not proof of deployed-version compatibility)
+- Existing repository instructions: `AGENTS.md`
+- Existing PR creation workflow: `raise-pr` skill (separate responsibility)
+- Requirements: Developer-approved workflow in this conversation
