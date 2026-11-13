@@ -1,75 +1,98 @@
-# BUCKS BFCM Campaign Design
+# RFC: Session-Based Support Chat Prompts
 
-Audience: BUCKS product owners and engineers familiar with Shopify app billing who need the agreed campaign rules and integration boundaries.
+- Status: Draft - awaiting confirmation
+- Author: Engineering draft
+- Reviewers: BUCKS product and support owners
+- Type: #feature-rfc
+- Audience: BUCKS merchants in admin; support agents receiving context
 
-Status: Commercial rules confirmed; final technical design awaiting review. No campaign code is implemented by this document.
+## 1. Problem
 
-## Agreed Offers
+Position edits, enabling Cart notification, and repeatedly rechecking an inactive app embed can indicate a need for setup help. Opening chat for every trigger interrupts the merchant. The current once-per-store flags also prevent assistance on a later visit and do not capture subsequent setup actions for support.
 
-All annual offers target current Pro annual, with $239.88/year as the reference price. Percentages are rounded display values; the annual charges below are authoritative.
+## 2. Why This Matters
 
-| Segment | Annual charge | Displayed discount |
-| --- | --- | --- |
-| Current Free, first installed before campaign start, never subscribed | $71.96 | 70% |
-| New Free merchant, first installed on/after campaign start, never subscribed | $83.93 | 65% |
-| Current or former paid merchant, including legacy Plus | $95.90 | 60% |
+Offer help after a short pause, limit interruptions to one automatic opening per visit, and give support context about subsequent actions. Success means one automatic opening at most per session, no opening before three seconds, and later events reaching support without reopening chat.
 
-Paid history takes precedence over installation date. Current annual subscribers, legacy or Pro, receive no campaign offers or banners. Former annual subscribers follow the paid-history rule. Unknown or invalid eligibility data must not unlock the 70% branch.
+## 3. Proposed Solution
 
-Eligible merchants selecting Pro monthly receive $9.99/month automatically, presented as "Black Friday deal" and "Offer applied" rather than requiring coupon entry. Do not automatically modify an existing subscription. An already-current Pro monthly card must not invite a duplicate subscription solely to reprice it.
+| Action | Proposed behavior |
+| --- | --- |
+| Change any Desktop or Mobile position option | Wait three seconds after the latest change, then process the placement trigger. |
+| Successfully save Cart notification from off to on | Wait three seconds after the successful save, then process the notification trigger. |
+| Click the app embed banner's Recheck status button three times within a rolling 60-second window while its status is disabled | Wait for the third check to complete. Only if it confirms the embed is still disabled, wait three seconds and process the app-embed trigger. |
+| First eligible trigger in the session | Show the agreed support greeting and open Crisp. |
+| Further triggers in any of the three scenarios | Record context for support without showing another greeting or opening chat. |
 
-Partner merchants follow the same campaign pricing without stacking; partner trial rules remain. Accepted prices recur on subsequent renewals. Disabling BFCM stops new claims, not existing discounted subscriptions.
+Keep the existing greetings. Add no merchant-facing settings. Typing or repeated option changes restart the placement timer, so one burst produces one event. Cancel pending triggers when leaving their section, unmounting, or hiding the app. Do not deliver stale prompts on return. Staff impersonation remains excluded.
 
-## Configuration
+### App embed recheck scenario
 
-- `BFCM_ENABLED=false` by default.
-- `BFCM_START_AT` and `BFCM_END_AT` require valid timestamps with explicit timezone offsets.
-- An active campaign requires the exact enabled value `true`, valid ordered timestamps, and `start <= now < end`.
-- Dates will be configured before launch; no dates are invented in code.
-- Read these variables on the server at request time. Do not compile the campaign flag into a public frontend environment constant.
+The merchant confirmed that the trigger must wait for the check result; a disabled status displayed before the check is not enough.
 
-Use a single shared pure offer resolver with explicit configuration and clock inputs. Server-side pages pass the resolved offer to components. The backend independently resolves the offer from trusted merchant data. The client may expire a displayed offer using its supplied end timestamp, but cannot authorize a charge.
+- Count only manual Recheck status actions accepted while the banner shows disabled. Automatic mount checks and clicks ignored while a check is pending do not count.
+- Use click timestamps: three accepted clicks must fall within 60 seconds of one another. The third response may arrive after that window; the click timestamps determine eligibility.
+- If that check returns disabled, schedule the prompt three seconds after the response. If the embed becomes enabled before delivery, cancel it and clear the click history.
+- Failed, timed-out, or unknown checks cannot qualify the trigger. Proposed conservative handling: clear the click history on a failed check, so stale disabled status cannot accumulate toward a prompt.
+- After processing the threshold, clear the click history. A fourth click alone must not create another event; a new group of three is required. Clear history when leaving/unmounting the banner or hiding the app.
+- This scenario shares the same one-opening-per-session allowance as placement and cart notification. If another scenario already opened chat, send app-embed context only.
 
-## Approaches Considered
+Suggested greeting (pending copy approval):
 
-1. **Recommended: server configuration plus shared resolver.** Smallest coherent change that keeps SSR presentation and billing consistent and permits future campaign reuse.
-2. Set legacy `discountEligible` on Pro. Rejected: legacy plan identities, old thresholds and independent frontend prices would produce incorrect subscriptions and displays.
-3. Database-managed campaign administration. Deferred: unnecessary storage, endpoints and management UI for this scope.
+> Hi! Is your app embed still showing as inactive after rechecking? I'm happy to help you activate it in your theme and get your currency converter working!
 
-Merchant burden: the recommended approach adds no merchant settings. Eligible merchants see the exact annual charge and a direct upgrade action. Existing annual merchants see their existing plan information, without campaign promotion.
+### What counts as a session? (Proposed, not approved)
 
-## Integration
+Use a 30-minute inactivity window, scoped to the store and browser. Activity means meaningful interaction with the visible BUCKS app, such as a pointer action, keypress, or navigation; background polling does not count.
 
-### Billing
+- Refreshing, changing sections, closing Crisp, or briefly switching tabs does not reset the session.
+- Returning before 30 minutes continues the session; returning after 30 minutes starts a new one.
+- Keep the same session across BUCKS tabs in the same browser. Different browsers/devices are separate sessions; this is not a Shopify authentication session.
+- Persist session ID and last activity locally, with throttled activity writes. Check expiry before refreshing the activity timestamp on return.
 
-Keep the current trusted catalog and pending-billing flow. Resolve active campaign eligibility before partner plan routing so a direct `pro-annual-partner` request cannot bypass campaign segment pricing. Validate that explicit partner-only requests still require a referral.
+This is preferable to detecting a browser close, which is unreliable, or treating every focus event as a new visit, which causes repeated openings.
 
-Preserve Pro plan identity and entitlement checks. The existing standard Pro annual identity can store a campaign-specific accepted price; do not route 70% through the legacy `bucks_premium_70` identity. `utils/billing/pendingBillingState.js` already stores the trusted amount separately from the plan ID.
+### Support context: simplest option versus internal notes
 
-Use the existing recurring subscription mechanism. No client amount or coupon can override a resolved campaign price. Include `plan_type` in the trusted merchant projection so legacy `bucks_premium` annual subscriptions are excluded correctly.
+**Recommended minimal version:** use Crisp session events for subsequent actions, plus session data for the latest trigger context. The Web SDK documents `Crisp.session.pushEvent()` and `Crisp.session.setData()`. Before release, confirm where these appear for agents in our Crisp workspace and whether they cause any existing automation to open chat. These are context records, not guaranteed conversation notes.
 
-Expired campaign submissions should fail with a clear refresh-required response rather than silently charging a higher amount. Carry a non-authoritative campaign ID/quoted amount with campaign submissions, compare against the server-resolved offer, and reject stale or mismatched quotes. Ordinary requests still receive server-side eligibility enforcement.
+**Alternative:** send a private conversation note through a backend integration. This requires verifying Crisp's note API, account access and credentials, plus server-side session ownership validation. Do not expose API credentials in the browser. Choose this only if support needs notes in the conversation timeline and the minimal event approach is insufficient.
 
-### Pricing and Dashboard
+Suggested context: trigger type, section, changed field names, timestamp and app-session ID. For app-embed help, include `app_embed_recheck`, manual recheck count (3), window duration (60 seconds), and confirmed result (disabled). Do not transmit custom selector contents or merchant-entered notification text. Debounce rapid edits and coalesce identical events within a short interval to avoid flooding the agent.
 
-Use the resolved annual charge for monthly equivalent, reference price, discount badge and savings. Preserve existing annual `acceptedPrice` display. All campaign promotion, including monthly Pro messaging, is suppressed for current annual subscribers.
+## 4. End-to-End Flow
 
-Recover the dashboard banner presentation from Git history, using `05866e7d` for the BFCM behavior and the last pre-deletion version before `025d1e6a` for later dismissal/layout improvements. Adapt rather than revert whole commits.
+```text
+Merchant changes position OR successfully saves notification off -> on
+  OR third manual embed recheck within 60 seconds confirms disabled
+  -> wait 3 seconds (restart placement timer on another edit)
+  -> check active section and current app session
+  -> initialize Crisp and record trigger context
+  -> session already used its automatic opening?
+       yes: context only
+       no: atomically reserve opening, show greeting, open chat
+```
 
-Restore artwork/layout, countdown, annual pricing CTA, persistent dismissal and tracking with current repo conventions. Use the campaign-wide expiry, not a new per-merchant database deadline. A campaign-specific dismissal key prevents last year's dismissal from hiding a future campaign. Hide the banner when disabled or expired; preserve the historical expired-support state only while an already-open banner transitions to expiry. An expired CTA must not initiate discounted billing.
+If Crisp is already open, record context and mark the session as assisted without showing another greeting. This prevents reopening it after the merchant closes it. Concurrent triggers share one opening allowance; the other event becomes context only. No shopper-facing behavior changes.
 
-No storefront widget code changes or shared widget/admin imports are required.
+## 5. Implementation Details
 
-## Legacy Cleanup Boundary
+- **Frontend:** reuse the existing Display edit handler, Advanced successful-save handler, app embed banner's manual recheck/result handling, and Crisp helper. Add a small shared session/timer coordinator and a short rolling click history in the banner; keep widget code isolated. Keep the support-delay timer separate from the banner's existing check-timeout timer.
+- **Persistence:** replace permanent per-trigger suppression with a session-scoped atomic opening claim. Scope claims to the authenticated store plus an opaque app-session ID, and expire old claims. Browser-local state alone is insufficient for simultaneous-tab claims. Final storage design is subject to session-definition approval.
+- **Migration:** stop consulting old `supportChatTriggers` booleans for session eligibility. Leave old data untouched initially. Removing obsolete fields can be a separate cleanup.
+- **Failures:** chat or context delivery must not block saving settings. Do not mark a session assisted when initialization fails. Release known failed opening attempts; a browser crash after reservation can still consume an opening without visible delivery. Do not promise exactly-once visual delivery.
+- **Verification:** fake-timer tests for three-second delay/debounce/cancellation; off-to-on successful saves only; three manual embed rechecks within 60 seconds versus outside that window; automatic checks excluded; enabled/failed/unknown results do not trigger; fourth click does not repeat the event; session continuation/expiry; refresh and concurrent tabs; context-only subsequent triggers across all three scenarios; impersonation; failed initialization. Verify agent-visible context and no automatic reopening in the actual Crisp workspace.
+- **Delivery:** first confirm this RFC and the agent-context mechanism, then implement and test the session behavior, then verify with a merchant login and support-agent account before rollout.
 
-Retain legacy subscription identities, normalization, entitlement recognition and accepted-price rendering. Audit direct legacy purchase requests and prevent the old 70% endpoint path from bypassing the current campaign rules.
+## 6. Decisions Needed
 
-Do not remove all legacy calculation code merely because the card is hidden. First prove which supported legacy purchase flows still depend on it. Remove unused campaign UI flags and obsolete branches only with tests demonstrating no change to supported off-campaign behavior. Existing legacy subscribers must retain recognition and display.
+1. Approve the proposed **30-minute inactivity session**, including separate sessions per browser/device?
+2. Confirm Cart notification still triggers **after a successful off-to-on save**, rather than immediately on toggle?
+3. Accept **Crisp events/session data** if visible and useful to support, or require an actual private conversation note?
+4. Approve replacing **once per store** with **once per session**, so returning merchants can receive help again?
+5. Approve the suggested app-embed greeting and conservative reset of recheck history after failures? Waiting for a confirmed disabled result is already approved.
 
-## Verification
+## References
 
-Test disabled/missing/malformed configuration; exact start/end boundaries; older/new Free merchants; paid-history precedence; missing install dates; current legacy/Pro annual exclusion; partner routing and direct partner IDs; monthly automatic discount; no coupon stacking; Pro identity; stale quotes; accepted-price persistence; campaign expiry; and off-campaign compatibility.
-
-Component tests cover price agreement, automatic applied state, annual exclusion, countdown expiry and dismissal. Browser verification must cover embedded billing navigation and desktop/mobile banner presentation before release.
-
-Update Sidekick explanations and source citations with the implementation. Follow repository Shopify validation requirements for generated UI code. Do not change GraphQL operations unless required by an identified gap.
+- Crisp Web SDK events, session data and local operator messages: https://docs.crisp.chat/guides/chatbox-sdks/web-sdk/npm/
+- Current integration: `components/display-tab/index.jsx`, `pages/advanced/index.jsx`, `components/home/AppEmbedBanner.jsx`, `utils/extras/crispChat.js`, `pages/api/v1/user/supportPrompt.js`.
