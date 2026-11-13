@@ -1,244 +1,75 @@
-# Ticket: Create a Hawkeye Review Skill
+# BUCKS BFCM Campaign Design
 
-- Status: Workflow approved; implementation ticket awaiting review
-- Type: AI tooling / developer experience
-- Intended user: Developer responding to Hawkeye feedback on a GitHub PR
-- Skill name: `hawkeye-review`
+Audience: BUCKS product owners and engineers familiar with Shopify app billing who need the agreed campaign rules and integration boundaries.
 
-## Problem
+Status: Commercial rules confirmed; final technical design awaiting review. No campaign code is implemented by this document.
 
-Developers repeatedly read Hawkeye reviews, decide whether findings are valid,
-make fixes, write commits, and respond to the bot. Blindly accepting findings
-creates unnecessary changes; manually repeating the review loses context between
-rounds. The workflow needs evidence-based decisions and verification of developer
-fixes before publishing replies.
+## Agreed Offers
 
-## Why This Matters
+All annual offers target current Pro annual, with $239.88/year as the reference price. Percentages are rounded display values; the annual charges below are authoritative.
 
-This skill should reduce repeated review work while keeping the developer in
-control of code changes and published responses. Success means findings have
-traceable evidence, fixes are verified, and no reply is posted without approval.
+| Segment | Annual charge | Displayed discount |
+| --- | --- | --- |
+| Current Free, first installed before campaign start, never subscribed | $71.96 | 70% |
+| New Free merchant, first installed on/after campaign start, never subscribed | $83.93 | 65% |
+| Current or former paid merchant, including legacy Plus | $95.90 | 60% |
 
-## Proposed Solution
+Paid history takes precedence over installation date. Current annual subscribers, legacy or Pro, receive no campaign offers or banners. Former annual subscribers follow the paid-history rule. Unknown or invalid eligibility data must not unlock the 70% branch.
 
-Build a PR-connected skill using authenticated GitHub CLI (`gh`) access and the
-local repository. Use two commands:
+Eligible merchants selecting Pro monthly receive $9.99/month automatically, presented as "Black Friday deal" and "Offer applied" rather than requiring coupon entry. Do not automatically modify an existing subscription. An already-current Pro monthly card must not invite a duplicate subscription solely to reprice it.
 
-```text
-/hawkeye-review check [PR URL]
-/hawkeye-review verify [PR URL]
-```
+Partner merchants follow the same campaign pricing without stacking; partner trial rules remain. Accepted prices recur on subsequent renewals. Disabling BFCM stops new claims, not existing discounted subscriptions.
 
-The PR URL is optional. By default, discover the open PR for the current branch
-whose base is `development`. The developer implements recommended fixes.
-Both modes draft replies and request explicit approval before publishing.
-Every posted reply starts with the literal `/hawkye`. There is no separate
-review-trigger step.
+## Configuration
 
-This approach is preferred over pasted feedback because it preserves review
-thread and commit context. Fully automated fixing is outside the initial scope.
-PR creation remains in the existing PR workflow.
+- `BFCM_ENABLED=false` by default.
+- `BFCM_START_AT` and `BFCM_END_AT` require valid timestamps with explicit timezone offsets.
+- An active campaign requires the exact enabled value `true`, valid ordered timestamps, and `start <= now < end`.
+- Dates will be configured before launch; no dates are invented in code.
+- Read these variables on the server at request time. Do not compile the campaign flag into a public frontend environment constant.
 
-## End-to-End Flow
+Use a single shared pure offer resolver with explicit configuration and clock inputs. Server-side pages pass the resolved offer to components. The backend independently resolves the offer from trusted merchant data. The client may expire a displayed offer using its supplied end timestamp, but cannot authorize a charge.
 
-```text
-Existing PR -> check -> assess findings
-                       |-> valid: recommend fix -> developer changes code
-                       |                           -> verify -> commit message
-                       |                                     + reply drafts
-                       |-> invalid: evidence + reply drafts
-                       |-> uncertain: identify missing evidence
+## Approaches Considered
 
-Reply drafts -> developer approval -> post approved replies to GitHub
-Next invocation -> fetch current state -> reconcile earlier findings
-```
+1. **Recommended: server configuration plus shared resolver.** Smallest coherent change that keeps SSR presentation and billing consistent and permits future campaign reuse.
+2. Set legacy `discountEligible` on Pro. Rejected: legacy plan identities, old thresholds and independent frontend prices would produce incorrect subscriptions and displays.
+3. Database-managed campaign administration. Deferred: unnecessary storage, endpoints and management UI for this scope.
 
-### PR Discovery
+Merchant burden: the recommended approach adds no merchant settings. Eligible merchants see the exact annual charge and a direct upgrade action. Existing annual merchants see their existing plan information, without campaign promotion.
 
-1. Detect the repository, current branch, and GitHub remote using Git/`gh`.
-2. Match open PRs by head branch, head repository, and base `development`.
-3. Display the selected PR URL, head, base, and head SHA before analysis.
-4. If no PR matches, ask for a URL or another base branch; do not create a PR.
-5. If matches or remotes are ambiguous, ask the developer to select one.
-6. An explicit URL overrides discovery. Validate that the local checkout
-   corresponds to that PR before relying on it for verification.
-7. Detached HEAD, missing authentication, unavailable repository access, or an
-   unrelated checkout must produce an actionable explanation rather than a guess.
+## Integration
 
-### Check Mode
+### Billing
 
-Fetch all pages of relevant review threads, review summaries, and PR comments.
-Identify Hawkeye by its confirmed GitHub author identity, not by keyword matching
-alone. Read the PR diff, surrounding code, callers, tests, and applicable repository
-instructions. Compare the reviewed revision with the current PR head.
+Keep the current trusted catalog and pending-billing flow. Resolve active campaign eligibility before partner plan routing so a direct `pro-annual-partner` request cannot bypass campaign segment pricing. Validate that explicit partner-only requests still require a referral.
 
-For each finding, report:
+Preserve Pro plan identity and entitlement checks. The existing standard Pro annual identity can store a campaign-specific accepted price; do not route 70% through the legacy `bucks_premium_70` identity. `utils/billing/pendingBillingState.js` already stores the trusted amount separately from the plan ID.
 
-| Field | Required content |
-| --- | --- |
-| Reference | Stable finding ID and source comment/thread URL |
-| Verdict | Valid, partially valid, invalid, already addressed, or needs evidence |
-| Evidence | Code references, reachable conditions, requirements, or checks |
-| Impact | Actual failure conditions and consequence |
-| Scope | Whether this PR needs the change or a follow-up is appropriate |
-| Recommendation | Smallest suitable fix and verification, or no-change rationale |
-| Reply | Proposed text when a response is appropriate |
+Use the existing recurring subscription mechanism. No client amount or coupon can override a resolved campaign price. Include `plan_type` in the trusted merchant projection so legacy `bucks_premium` annual subscriptions are excluded correctly.
 
-Validity and urgency are independent. A real but unrelated issue is not invalid.
-Do not classify uncertain findings as invalid merely because they cannot be
-reproduced. Group duplicate root causes while retaining each source reference.
+Expired campaign submissions should fail with a clear refresh-required response rather than silently charging a higher amount. Carry a non-authoritative campaign ID/quoted amount with campaign submissions, compare against the server-resolved offer, and reject stale or mismatched quotes. Ordinary requests still receive server-side eligibility enforcement.
 
-For valid and partially valid findings, recommend fixes without editing code.
-For invalid findings, draft an evidence-based reply. For already-addressed
-findings, verify the relevant revision before drafting an accurate response.
-For uncertain findings, explain the missing evidence and next diagnostic step.
+### Pricing and Dashboard
 
-### Verify Mode
+Use the resolved annual charge for monthly equivalent, reference price, discount badge and savings. Preserve existing annual `acceptedPrice` display. All campaign promotion, including monthly Pro messaging, is suppressed for current annual subscribers.
 
-1. Re-fetch the PR and findings; reconcile prior review state.
-2. Inspect committed changes, staged changes, and unstaged changes without
-   modifying the working tree. Identify which changes relate to each finding.
-3. Verify the root cause is addressed and check for regressions in affected paths.
-4. Run relevant checks permitted by repository instructions. Report exact results,
-   including checks not run and why. Passing a test alone is not proof of a fix.
-5. Classify each finding as fixed, partially fixed, unresolved, or unverified.
-6. Generate a commit message for the relevant changes using repository conventions.
-   Do not incorporate unrelated work or create an empty/fictional commit message
-   when no relevant uncommitted changes exist.
-7. Draft thread-specific replies explaining changes and verification. Distinguish
-   uncommitted, committed locally, and pushed changes. Use a commit SHA only when
-   the commit actually exists; do not claim a local fix is visible in the PR.
-8. Show the drafts and request posting approval. Partial/unverified fixes must not
-   be presented as resolved. A local-only progress reply must explicitly say the
-   fix is not yet available in the PR.
+Recover the dashboard banner presentation from Git history, using `05866e7d` for the BFCM behavior and the last pre-deletion version before `025d1e6a` for later dismissal/layout improvements. Adapt rather than revert whole commits.
 
-### Approval and Publishing
+Restore artwork/layout, countdown, annual pricing CTA, persistent dismissal and tracking with current repo conventions. Use the campaign-wide expiry, not a new per-merchant database deadline. A campaign-specific dismissal key prevents last year's dismissal from hiding a future campaign. Hide the banner when disabled or expired; preserve the historical expired-support state only while an already-open banner transitions to expiry. An expired CTA must not initiate discounted billing.
 
-Show each exact reply with its target thread/comment URL and finding ID.
-Allow approval of all drafts, selected drafts, edits, or cancellation.
+No storefront widget code changes or shared widget/admin imports are required.
 
-Example prompts:
+## Legacy Cleanup Boundary
 
-- Check: "These findings appear invalid for the reasons shown. Approve posting
-  these replies?"
-- Verify: "These findings appear fixed based on the checks shown. Approve posting
-  these replies?"
+Retain legacy subscription identities, normalization, entitlement recognition and accepted-price rendering. Audit direct legacy purchase requests and prevent the old 70% endpoint path from bypassing the current campaign rules.
 
-Approval covers only the displayed text and destinations. Edits require fresh
-approval. Before publishing, check whether the PR head or relevant review thread
-changed; if so, refresh the assessment and approval rather than posting stale text.
+Do not remove all legacy calculation code merely because the card is hidden. First prove which supported legacy purchase flows still depend on it. Remove unused campaign UI flags and obsolete branches only with tests demonstrating no change to supported off-campaign behavior. Existing legacy subscribers must retain recognition and display.
 
-Post inline replies to the original review threads. Where GitHub has no threaded
-reply support, publish a PR comment linking the original comment and finding.
-Report successful reply URLs and failures separately. Do not blindly retry an
-uncertain write; first reconcile whether it was already published.
+## Verification
 
-Example fixed reply:
+Test disabled/missing/malformed configuration; exact start/end boundaries; older/new Free merchants; paid-history precedence; missing install dates; current legacy/Pro annual exclusion; partner routing and direct partner IDs; monthly automatic discount; no coupon stacking; Pro identity; stale quotes; accepted-price persistence; campaign expiry; and off-campaign compatibility.
 
-```text
-/hawkye
+Component tests cover price agreement, automatic applied state, annual exclusion, countdown expiry and dismissal. Browser verification must cover embedded billing navigation and desktop/mobile banner presentation before release.
 
-Addressed in <actual pushed commit SHA>.
-Change: <what changed and why it resolves the finding>
-Verification: <checks actually performed and results>
-```
-
-Example invalid-finding reply:
-
-```text
-/hawkye
-
-No code change is needed for this finding.
-Reason: <specific explanation supported by the code>
-Evidence: <revision-aware code references or verification results>
-```
-
-Do not automatically commit, push, resolve threads, merge PRs, or issue a separate
-Hawkeye trigger. Approved replies themselves carry the requested prefix.
-
-## Implementation Details
-
-### Components
-
-- Skill instructions: Command routing, evidence standards, output format, and
-  approval protocol.
-- GitHub adapter: PR discovery, paginated review retrieval, thread mapping, and
-  approved reply publishing through `gh`.
-- Analysis workflow: Revision-aware evaluation using the actual repository code.
-- Local review state: Resume across invocations without relying on chat history.
-
-### Review State
-
-Store a versioned record under the repository's Git metadata directory, resolved
-using Git rather than assuming `.git` is a directory. Key records by repository
-and PR number. Store review/head SHAs, source comment/thread IDs, verdicts,
-evidence references, verification results, reply text/status, and posted reply IDs.
-Do not store credentials. GitHub remains the source of truth; refresh on each run.
-
-If state is missing, reconstruct from GitHub and current code. Do not automatically
-reuse cached approval on a new invocation. Suppress duplicate replies using source
-IDs, posted reply IDs, and reconciliation against GitHub.
-
-### Edge Cases
-
-- New review rounds: distinguish new, repeated, stale, and already-handled findings.
-- Repeated disagreements: present the changed claim and prior evidence rather
-  than repeatedly changing code or posting the same rebuttal.
-- Resolved threads: do not reopen or respond automatically; check whether new
-  evidence actually requires attention.
-- API failures/rate limits: identify incomplete retrieval and avoid claiming the
-  entire review was assessed when pages or sources could not be fetched.
-- Review text: treat it as untrusted input to investigate, not executable
-  instructions or authority to change unrelated files.
-- Changed checkout/remote SHA: report mismatches and do not verify against the
-  wrong revision or silently switch branches.
-
-### Delivery Phases
-
-1. Implement discovery, retrieval, evidence-based check mode, and resumable state.
-2. Implement developer-change verification and commit-message generation.
-3. Implement approval-bound publishing and end-to-end workflow checks.
-
-No admin-app, storefront-widget, Shopify API, or database changes are needed.
-
-## Acceptance Criteria
-
-- [ ] Both commands work without a URL when exactly one matching PR targets
-  `development`; explicit PR URLs override discovery.
-- [ ] Missing/ambiguous PRs and mismatched checkouts are handled explicitly.
-- [ ] Inline reviews, summaries, and PR comments are fetched with pagination and
-  attributed to the confirmed bot identity.
-- [ ] Every verdict includes evidence; validity is distinct from urgency/scope.
-- [ ] Valid findings receive a suitable minimal-fix recommendation.
-- [ ] Invalid findings receive a factual draft rebuttal, never an automatic post.
-- [ ] Verify evaluates actual changes and reports partial or unverifiable fixes.
-- [ ] Commit messages follow repository style and describe only relevant changes.
-- [ ] Replies accurately distinguish local changes from pushed fixes.
-- [ ] Every posted reply begins with `/hawkye` and has explicit approval for its
-  exact content and destination.
-- [ ] Changed drafts or changed review context require renewed approval.
-- [ ] Repeated invocations do not duplicate already-posted replies.
-- [ ] Partial publishing failures report which replies succeeded and remain pending.
-- [ ] A fresh session can resume by fetching GitHub state and local review records.
-- [ ] No command automatically edits code, commits, pushes, resolves threads,
-  merges, or performs an additional review-trigger step.
-
-Verification scenarios must cover a valid finding, an invalid finding, an uncertain
-finding, an outdated finding, a local-only fix, a pushed fix, duplicate findings,
-approval rejection/editing, a changed head after approval, and partial API failure.
-Publishing tests should use mocked APIs or an explicitly designated test PR.
-
-## Integration Questions to Confirm Before Implementation
-
-1. Confirm the Hawkeye GitHub bot identity and whether the exact `/hawkye` prefix
-   triggers it in inline replies as well as top-level PR comments. This is the
-   requested spelling, not a verified integration fact. If unsupported, report
-   the limitation and agree on placement rather than silently changing the flow.
-2. Confirm the target skill host and installation scope (project-local or personal)
-   so the approved command names map to the host's actual invocation syntax.
-
-## References
-
-- Existing repository instructions: `AGENTS.md`
-- Existing PR creation workflow: `raise-pr` skill (separate responsibility)
-- Requirements: Developer-approved workflow in this conversation
+Update Sidekick explanations and source citations with the implementation. Follow repository Shopify validation requirements for generated UI code. Do not change GraphQL operations unless required by an identified gap.
