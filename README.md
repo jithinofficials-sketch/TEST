@@ -1,107 +1,191 @@
-# Legacy ScriptTag Cleanup
+# Legacy ScriptTag cleanup
 
-## Approved approach
+For developers familiar with Postman and Shopify Admin APIs, implementing or running a legacy ScriptTag cleanup.
 
-Run a one-time Node script on the production server to remove only the legacy
-BUCKS ScriptTag registrations identified in the merchant-provided sheet.
-Use fixed JSON input with shop domain, ScriptTag ID as a string, and expected
-script URL. The pasted list contains 46 entries. Do not include merchant names,
-email addresses, or other unnecessary personal data.
+Removes the legacy ScriptTags in a configured target list after their replacement app embeds are active on the published themes. Each target contains the shop domain, ScriptTag ID, and expected script URL. The API does not verify app embed activation.
 
-The merchant confirms app embeds are enabled for these shops. This cleanup
-uses that confirmation; it does not independently verify app embed state.
-No stores, sessions, settings, theme assets, or app embed blocks are deleted.
+The workflow applies to other apps; the paths, token storage, and configuration below describe this implementation and must be adapted when porting it. Set `N` to the number of entries in your target list when checking results.
 
-## Files and responsibilities
+## Implementation
 
-- `scripts/data/legacy-script-tags-2026-11-20.json`: the 46 exact shop/ID/URL triples.
-- `scripts/cleanup-legacy-script-tags.js`: executable CLI, input validation,
-  per-shop processing, Shopify requests, and report output; export injectable
-  processing functions for isolated tests without loading Prisma on import.
-- `tests/scripts/cleanupLegacyScriptTags.test.js`: mocked database and HTTP tests.
-- `docs/operations/legacy-script-tag-cleanup.md`: production execution and report
-  interpretation, including container file-copy requirements.
+- Reads `users.accessToken` from MongoDB by `myshopify_domain`. **No database writes.**
+- Uses Shopify Admin GraphQL: `scriptTag` reads the exact ID and URL; `scriptTagDelete` removes it. Numeric IDs become `gid://shopify/ScriptTag/<id>`.
+- Uses `SHOPIFY_API_VERSION`, defaulting to `2026-01`.
+- One POST processes the full target list in batches of 5, with a 1-second gap between batches. Progress appears in server logs.
+- Every POST starts fresh and generates a report ID. Results are saved locally as JSON; CSV is generated on download.
 
-## Execution contract
+## Batching and delay
 
-Default execution is a dry run. Only `--apply` permits mutations. Reject unknown
-arguments. `--report <path>` selects a new JSONL output file; create it exclusively
-before database or Shopify operations so existing reports cannot be overwritten.
-Provide `--help` without connecting to the database.
+One POST processes the entire target list; callers do not send a request per shop.
+The same scheduling applies to dry run, deletion, and cross-verification:
 
-Use Node 22.23.5 and the existing generated Prisma client. Load production
-configuration through Node's `--env-file` option or inherited environment.
-Require `MONGO_URI` and use the existing `utils/prisma.js` singleton via a dynamic
-import when executing the CLI. Disconnect in a finally block. Do not write to
-the database or print tokens, connection strings, or raw upstream error bodies.
+1. Take up to **5 shops** and process them concurrently using `Promise.allSettled`.
+2. Wait for every shop in that batch to finish, then save its results in target-list order.
+3. Wait **1 second (`1000` ms)** before starting the next batch. There is no delay after the final batch.
 
-Validate the complete fixed input before processing: nonempty array, canonical
-myshopify.com domains, decimal string IDs, HTTPS script URLs with the exact
-`/apps/buckscc/sdk.min.js` path, and unique shop/ID pairs. Reject invalid input
-before any remote operation.
+Each shop's lookup, optional deletion, and verification run sequentially within
+its worker. The final batch may contain fewer than 5 shops. Logs show each shop's
+start and result; the POST returns after the full list finishes.
 
-## Per-shop flow
+Batching bounds concurrency and spaces requests, but does not guarantee Shopify
+will never throttle them. Total duration includes API calls, report writes, and
+`ceil(N / 5) - 1` inter-batch pauses. This is synchronous processing, not a background job.
 
-1. Read the session by its unique shop domain, selecting only the token and
-   session metadata needed for processing. Missing tokens are reported separately.
-2. Fetch the exact ScriptTag using its Shopify global ID. A successful lookup
-   returning null means already absent; API errors never mean absent.
-3. Compare both returned ID and script URL with the fixed input. A mismatch
-   prevents deletion and is included in the report.
-4. In dry-run mode, report `would_delete` without issuing a mutation.
-5. In apply mode, call Admin GraphQL `scriptTagDelete`. Inspect HTTP failures,
-   top-level GraphQL errors, mutation user errors, and the returned deletion ID.
-6. Read the same ID again to confirm absence before reporting `deleted`.
-   Failed verification is reported as unverified, not as a confirmed deletion.
+To tune this implementation, change `targets.slice(start, start + 5)` and
+`sleep(1000)` in `utils/admin/legacyScriptTags/api.js`, and update the batch tests.
 
-Use Admin API version `2026-10`, which supports the validated deletion mutation.
-Read access and `write_script_tags` are required. Actual API responses determine
-access; stored scope metadata alone is not authoritative.
+## Shopify GraphQL operations
 
-Process sequentially. Use request timeouts and bounded retries for throttled
-requests, honoring Retry-After where present. Avoid blindly retrying ambiguous
-mutation failures: read the tag to reconcile whether it still exists. Never
-interpret transport failures as successful deletion. Individual shop failures
-do not prevent the remaining shops from being processed.
+The backend sends both operations to:
 
-## Reporting and reruns
+```text
+POST https://<shop>.myshopify.com/admin/api/<SHOPIFY_API_VERSION>/graphql.json
+X-Shopify-Access-Token: <that shop's stored access token>
+Content-Type: application/json
+```
 
-Write each result to JSONL immediately, including timestamp, mode, shop, ID,
-expected URL, status, and sanitized error category. Print a final count by status
-and report location. Exit nonzero for unresolved failures or mismatches.
-If report persistence fails, stop processing further shops.
+The cleanup Bearer Token authenticates Postman to your app; the merchant access
+token authenticates your backend to Shopify. Do not expose merchant tokens in reports.
+Lookup requires ScriptTag read access; deletion requires `write_script_tags`.
 
-Reruns are supported: successfully removed tags are reported as already absent.
-Reports contain no credentials or owner contact details.
+**Lookup: used by dry run, before deletion, and after deletion.**
 
-## Production packaging
+```graphql
+query CleanupScriptTag($id: ID!) {
+  scriptTag(id: $id) {
+    id
+    src
+  }
+}
+```
 
-The current production Docker image omits `scripts/` and `utils/`. Document
-copying the cleanup script, fixed input, and `utils/prisma.js` into their matching
-paths under `/app` in the existing container, where package.json, dependencies,
-generated Prisma client, and `.env` already exist. Alternatively, run from a
-server checkout with those prerequisites. No Dockerfile change is required for
-this one-time operation. Record the exact report path so container-local results
-can be copied out before the container is replaced.
+Convert the numeric ID from the target list to a Shopify global ID. Both operations
+use the same variables format (example ID):
 
-## Verification
+```json
+{
+  "id": "gid://shopify/ScriptTag/115729858596"
+}
+```
 
-Mock all remote operations in automated tests. Cover dry run issuing zero
-mutations, matching deletion plus verification, URL/ID mismatch, already absent,
-missing session, HTTP and GraphQL failures, user errors, throttling, ambiguous
-mutation reconciliation, failed verification, continuation after shop failure,
-input validation, and refusal to overwrite a report. Assert the fixed input has
-46 unique entries and compare its triples with the original pasted list.
+If a tag is returned, compare both `id` and `src` against the configured target.
+A mismatch prevents deletion.
 
-Validate generated GraphQL operations against Shopify's schema. Run focused
-tests and CLI help locally without production credentials. Production execution
-and storefront checks are separate operational steps, not implied by unit tests.
+**Deletion: sent only in `apply` mode after a matching lookup.**
 
-## Source references
+```graphql
+mutation CleanupDeleteScriptTag($id: ID!) {
+  scriptTagDelete(id: $id) {
+    deletedScriptTagId
+    userErrors {
+      field
+      message
+    }
+  }
+}
+```
 
-- `utils/sessionHandler.js`: stored Shopify sessions and access tokens.
-- `utils/prisma.js`: application Prisma singleton.
-- `prisma/schema.prisma`: unique session shop and MONGO_URI configuration.
-- `package.json`: ESM modules, Node version, and existing test dependencies.
-- `Dockerfile`: production container contents.
-- https://shopify.dev/docs/api/admin-graphql/2026-10/mutations/scriptTagDelete
+Require empty `userErrors` and the expected `deletedScriptTagId`, then repeat the
+lookup. A successful response confirming absence is:
+
+```json
+{
+  "data": {
+    "scriptTag": null
+  }
+}
+```
+
+This produces `deleted` during apply verification or `already_absent` during a
+fresh dry run. HTTP failures and top-level GraphQL `errors` are errors, not proof
+of absence, even if the response also contains null data.
+
+Reference: [scriptTagDelete](https://shopify.dev/docs/api/admin-graphql/2026-01/mutations/scriptTagDelete).
+
+## Setup in Postman
+
+Set `baseUrl` to the deployed app's HTTPS origin. The server must have `MONGO_URI` for the merchant database and `LEGACY_SCRIPT_TAG_CLEANUP_SECRET` (at least 32 characters).
+
+Use these headers for POST requests; downloads need only Authorization:
+
+```http
+Authorization: Bearer <value of LEGACY_SCRIPT_TAG_CLEANUP_SECRET>
+Content-Type: application/json
+```
+
+## 1. Dry run: check before deletion
+
+**POST** `{{baseUrl}}/api/internal/legacy-script-tags/run`
+
+Body (raw JSON):
+
+```json
+{ "mode": "dry_run" }
+```
+
+Queries Shopify for each listed tag. Exact ID/URL matches produce `would_delete`; no mutation is sent.
+
+Expected when all listed tags are present and match: `processed` equals `N`, `done` is `true`, and `counts.would_delete` equals `N`. Review any other statuses before applying.
+
+## 2. Apply: delete matching tags
+
+Use the **same POST endpoint and headers** with:
+
+```json
+{ "mode": "apply" }
+```
+
+Rechecks each ID and URL, calls `scriptTagDelete`, then queries the ID again. A successful lookup returning `null` confirms absence and produces `deleted`.
+
+Expected when all listed tags were present: `counts.deleted` equals `N`. Already-removed tags are skipped. This affects the targeted merchant stores even when called through staging. The API has no undo operation.
+
+## 3. Cross-verify: dry run again
+
+Use the **same POST endpoint** with:
+
+```json
+{ "mode": "dry_run" }
+```
+
+This makes fresh Shopify queries, not reads of the previous report. Expected:
+
+- `processed` and `total` equal `N`.
+- `done` is `true`.
+- `counts.already_absent` equals `N`.
+
+These fields appear under `data` in the response. API failures never count as absence. Also check currency selection and price conversion on affected storefronts: tag absence alone does not prove the app embed works.
+
+## Download each report
+
+Each POST response includes `data.downloads.json` and `data.downloads.csv`. Prefix the returned path with `baseUrl`, then send **GET** using the same Bearer Token. No body is needed.
+
+```text
+GET {{baseUrl}}/api/internal/legacy-script-tags/report?runId=<ID returned by POST>&format=json
+```
+
+Use `format=csv` for CSV. Downloads read local files only, without calling Shopify or MongoDB. Save the dry-run, apply, and cross-verification reports before redeploying.
+
+## Important limits and errors
+
+- Reports live in `<OS temporary directory>/bucks-legacy-script-tag-reports` and can disappear on container replacement. Use one app instance: files and the execution lock are not shared across replicas.
+- Requests are synchronous. On timeout, check logs and the partial report link before retrying; there is no automatic resume. A retry starts a fresh check of all targets.
+- `done: true` means processing finished, not that every shop succeeded. Investigate `mismatch`, `missing_session`, `error`, or `unverified`. `absent_after_error` means a mutation response failed but a subsequent lookup confirmed absence.
+- HTTP 401: incorrect token; 503: cleanup secret not configured; 409: another cleanup is running on this process; 404 on download: report not found on this instance.
+
+## Code and tests
+
+For another app, replace the target list with that app's shop/ID/URL entries and
+use its own stored merchant access tokens. Adapt the token lookup, route paths,
+authentication configuration, and tests to that app. Confirm its app embed works
+independently before deleting the legacy tags.
+
+- Target list: `utils/admin/legacyScriptTags/targets.json`.
+- Routes: `pages/api/internal/legacy-script-tags/run.js` and `report.js`.
+- Authentication, batches, local reports: `utils/admin/legacyScriptTags/api.js`.
+- Shopify lookup, deletion, verification: `utils/admin/legacyScriptTags/processor.js`.
+
+```sh
+yarn test tests/admin/legacyScriptTagsApi.test.js tests/admin/legacyScriptTagsProcessor.test.js
+```
+
+Tests mock Shopify/database access; they do not perform live deletion.
