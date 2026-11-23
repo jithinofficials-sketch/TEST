@@ -13,7 +13,7 @@ BUCKS currently offers proactive help for app embed activation, converter positi
 
 The proposed experiment compares the current agent greeting with an app-generated visitor message. We need stable assignment and explicit outcome attribution, without treating an automated visitor message as genuine merchant engagement.
 
-Existing native Crisp Trigger Analytics cannot provide this experiment's desired reply metric: it measures saved-trigger execution and has visitor-level repeat limits. Reporting for this experiment will use PostHog and Crisp profile events instead.
+The anchor is **start meaningful support conversations**. Native Crisp Trigger Analytics measures saved-trigger executions, not meaningful conversations. The requested design uses six new milestone triggers, PostHog activation records, and weekly support review in Crisp to determine actual conversion. Silent milestone-trigger counting and visitor repeat limits must be validated before implementation.
 
 ## 2. Why This Matters
 
@@ -27,9 +27,9 @@ This experiment should establish whether either approach produces more genuine m
 
 - One stable variant per shop across all three features and visits.
 - Approximately 50/50 deterministic assignment using a new experiment key, proposed as `support_chat_v1`; independent of onboarding.
-- Variant A retains the current Crisp agent-message approach. Its reply outcome is the first actual merchant message after activation in the same tab session.
+- Variant A retains the agent-style greeting experience, but the greeting must not execute a counted saved trigger. Its milestone is the first actual merchant reply after activation in the same tab session.
 - Variant B automatically sends a predefined message as the visitor and opens chat. Its automatic-send outcome is recorded separately from human replies.
-- Report in PostHog and Crisp profile events, not native Trigger Analytics.
+- Create three separate A reply triggers and three separate B automatic-send triggers in Crisp. Track shop/variant/feature activations in PostHog; support reviews meaningful conversations in Crisp weekly, at 7-day and 14-day cohort windows.
 - Keep current eligibility and suppression rules. Do not reset consumed position/cart records for the experiment.
 
 ### Alternatives considered
@@ -38,7 +38,7 @@ This experiment should establish whether either approach produces more genuine m
 | --- | --- | --- |
 | Current greeting vs automatic visitor message | Tests the requested support-initiation difference | Selected for this draft; creates a visitor message without a merchant Send action |
 | Current greeting vs prefilled composer | Merchant explicitly chooses to send; cleaner engagement comparison | Simpler alternative for support intent, but not the selected variant B |
-| Native Crisp Trigger Analytics | Existing reporting UI | Does not measure actual replies or consistently count repeat tab activations; rejected as experiment reporting |
+| Six milestone triggers plus manual review | Separates A replies and B automatic sends by feature | Selected requirement; native counts are milestones, not conversions, and silent counting remains unverified |
 
 Merchant burden: no settings or new screen. Variant B removes the Send action but may surprise merchants by speaking on their behalf and may create support work without a request. Product/support review must assess this tradeoff before launch; fewer clicks alone is not evidence that B is better.
 
@@ -50,7 +50,7 @@ Merchant burden: no settings or new screen. Variant B removes the Send action bu
 | Cart notification | Yay! Cart Notification is now enabled! 🎉 |
 | App embed | BUCKS app embed isn’t activating. Can you help? |
 
-Position and embed wording follow the developer's supplied copy. Cart copy corrects the supplied "is are" typo and renders `:tada:` as an emoji; this correction remains a review item because the request for an RFC replaced final design approval. Variant A copy remains configured in the existing Crisp triggers.
+Position and embed wording follow the developer's supplied copy. Cart copy corrects the supplied "is are" typo and renders `:tada:` as an emoji; this correction remains a review item because the request for an RFC replaced final design approval. Preserve variant A's existing greeting copy when moving its display to the app-controlled path.
 
 ### Metrics
 
@@ -59,16 +59,33 @@ Assignment is not exposure. Record a separate activation when the app submits th
 | Proposed event | When recorded | Meaning |
 | --- | --- | --- |
 | `bucks_support_activation` | Once per eligible proactive-action attempt | Denominator and variant exposure attempt; not proof of display |
-| `bucks_support_merchant_reply` | First attributable actual merchant send in the tab session | Genuine engagement in A or B; excludes B's automatic message |
-| `bucks_support_auto_message_sent` | B's automatic message is confirmed by a verified Crisp send boundary | Automated-send outcome; not a human conversion |
+| A feature-specific reply event (table below) | First attributable actual merchant send in the tab session | Requests one A milestone trigger; not a conversion verdict |
+| B feature-specific automatic-send event (table below) | B's automatic message is confirmed by a verified Crisp send boundary | Requests one B milestone trigger; not a human conversion |
 
-Send these events to PostHog and Crisp profiles, without configuring them as message-trigger inputs. Preserve existing feature context/PostHog events for continuity. Do not call `bucks_support_auto_message_sent` merely because an SDK command was queued; if only submission is observable, use `bucks_support_auto_message_submitted` and label the report accordingly.
+Track activation in PostHog and preserve existing feature context/profile events. Send the feature-specific milestone event to Crisp for its corresponding On user event rule. No automated conversion verdict is inferred from either milestone. If the SDK only confirms submission, do not label B's milestone a confirmed send; resolve the measurement contract before rollout.
+
+### Six new Crisp milestone triggers
+
+| Variant / feature | Trigger identifier | On user event |
+| --- | --- | --- |
+| A / embed | `bucks-support-a-embed-reply` | `bucks_support_a_embed_reply` |
+| A / position | `bucks-support-a-position-reply` | `bucks_support_a_position_reply` |
+| A / cart | `bucks-support-a-cart-reply` | `bucks_support_a_cart_reply` |
+| B / embed | `bucks-support-b-embed-sent` | `bucks_support_b_embed_sent` |
+| B / position | `bucks-support-b-position-sent` | `bucks_support_b_position_sent` |
+| B / cart | `bucks-support-b-cart-sent` | `bucks_support_b_cart_sent` |
+
+A greeting alone emits no milestone. A's first qualifying same-tab reply requests one feature-specific trigger. B's confirmed automatic send requests one feature-specific trigger; later human replies do not request another B trigger. Deduplicate each milestone per activation.
+
+These triggers must not add messages or reopen chat: delivery is owned by the app. **Feasibility gate:** verify with Crisp whether a saved trigger with no visible actions can execute and count in native analytics. Do not assume actionless triggers count, add unwanted visible actions to manufacture counts, or emit Crisp's internal `trigger:fired` manually. Visitor-level remembered execution may still suppress subsequent activations; this design cannot promise one native count for every tab's milestone.
 
 Common properties: `experiment`, `variant`, `feature` (`embed`, `position`, `cart`), `activation_id`, `source`, and `message_origin` where applicable. Use the existing shop identity convention in PostHog; do not include message text or visitor email in experiment properties. Variant and experiment must be attached explicitly to every event, not assumed to be inherited.
 
-**Proposed comparison:** unique eligible shops with at least one attributable human reply divided by unique shops with an activation attempt, split by variant. Report feature-level results separately and keep assignment clustered by shop. B's automatic-send rate is an operational metric, never compared directly to A's human-reply rate as a winner criterion.
+**Conversion assessment:** support reviews linked Crisp conversations weekly against the shared anchor, meaningful support conversations. Proposed rubric: genuine merchant participation plus a substantive support exchange relevant to the help context; automated visitor messages and automated greetings alone do not qualify. Product/support must approve the rubric before launch.
 
-Guardrails: automatic conversations created, repeat messages, delivery failures, and support workload. Existing Crisp visitor suppression can prevent A from displaying despite an activation attempt; report that limitation rather than labelling all attempts impressions.
+Compare unique activated shops with a reviewer-confirmed meaningful conversation against unique activated shops per variant. Evaluate each cohort after a full 7 days and again after 14 days; the 14-day cumulative window includes the first week. Keep a review ledger with experiment, variant, shop, feature, activation ID/time, Crisp conversation reference, reviewer, window, and verdict. Review conversations even when a browser reply milestone is missing; native trigger counts are not the conversion denominator. B automatic-send counts and A reply counts must not be compared as equivalent conversions.
+
+Guardrails: automatic conversations created, repeat messages, delivery failures, and support workload. Activation attempts remain distinct from confirmed display. Crisp suppression affects milestone counts even when app-controlled delivery succeeds.
 
 ## 4. End-to-End Flow
 
@@ -78,11 +95,11 @@ Authenticated shop -> stable experiment assignment
   -> existing context event
   -> proactive allowance unavailable: stop (context only)
   -> allowance available: create activation and install attribution listener
-       A: submit existing feature _message event -> Crisp agent greeting
-          -> first actual same-tab merchant send -> merchant_reply
+       A: app displays agent-style greeting and opens chat (no milestone)
+          -> first actual same-tab merchant reply -> A feature milestone event
        B: submit automatic visitor message -> open chat
-          -> confirmed automated send -> auto_message_sent
-          -> first later actual same-tab merchant send -> merchant_reply
+           -> confirmed automated send -> B feature milestone event
+       Both: weekly Crisp review -> meaningful-conversation verdict at day 7/14
 ```
 
 - **Merchant:** no experiment selector. A sees the existing help experience; B sees an app-submitted visitor message in chat. A manual support opening before activation is not attributed to the experiment.
@@ -119,11 +136,43 @@ If shop identity or assignment is unavailable, retain the current A behavior and
 | `utils/registerPostHogEvent.js` | Preserve non-blocking analytics delivery |
 | `pages/api/v1/user/chatTriggers.js` | Retain authenticated position/cart claim and completion semantics |
 
-A still emits its existing `_message` activation event. B must not emit that event: otherwise the configured agent greeting can run alongside the automatic visitor message. B uses Crisp's documented visitor-message send operation and chat opening after readiness. Verify actual send callbacks against the installed/live SDK before implementing outcome semantics.
+A uses direct local agent-style message display and chat opening to avoid counting the initial greeting as a saved-trigger execution. Neither variant emits the existing `_message` activation events during the experiment. Disable or isolate the old greeting triggers for experiment traffic; retain unrelated/manual support behavior. B uses Crisp's documented visitor-message send operation and chat opening after readiness. The six new triggers are only for milestones, subject to the silent-counting feasibility gate. Verify actual send callbacks against the installed/live SDK before implementing milestone semantics.
 
 No Prisma schema change is proposed for assignment or same-tab attribution. Existing installation consumption stays in the database. Preserve three failed manual dashboard embed checks in two minutes, three-second position/cart timing, one proactive attempt per tab, and impersonation exclusion. Existing consumed shops are not newly eligible for position/cart, so the experiment population is eligible shops, not every installation.
 
-### Reply listener and attribution
+### Automatic Crisp segments and custom data
+
+On an eligible experiment activation, after Crisp readiness, attach the assigned variant segment using `session:segments` without overwriting unrelated segments:
+
+- A: `bucks-support-v1-a`
+- B: `bucks-support-v1-b`
+
+Segments group conversations for support review; they are neither conversions nor trigger counts. Verify available segment filters in the actual Crisp workspace before documenting a saved inbox view. Apply the segment on activation, not merely assignment, so it identifies participating conversations.
+
+Set the following namespaced fields through `session:data`:
+
+| Custom data key | Value |
+| --- | --- |
+| `bucks_support_experiment` | `support_chat_v1` |
+| `bucks_support_variant` | `A` or `B` |
+| `bucks_support_feature` | `embed`, `position`, or `cart` |
+| `bucks_support_activation_id` | Current activation ID |
+| `bucks_support_activated_at` | ISO timestamp |
+| `bucks_support_message_origin` | `agent_greeting` for A; `automated_visitor` for B |
+
+The app writes these values automatically; agents do not configure them per shop. These are latest-activation context, not a historical ledger. Preserve each activation in PostHog and Crisp profile events, including its ID and timestamp. Where available, retain the Crisp conversation/session reference in the activation record to join weekly reviews. Do not include full chat text in analytics.
+
+Tagging and custom-data updates are best-effort and must not interrupt the merchant action. Do not configure message automations against these labels or fields: the six dedicated milestone events are the trigger inputs. If a conversation unexpectedly has both variant segments, flag it for attribution review rather than silently merging groups or deleting unrelated tags.
+
+### Agent review using this context
+
+1. From PostHog, select unique activated shops whose full 7-day or 14-day observation window has elapsed, split by variant and enrollment cohort.
+2. Locate their Crisp conversations using stored references and the experiment segment/context. Include shops with no reply or no conversation in the denominator; inbox-only sampling would omit non-conversions.
+3. Review the relevant time window against the agreed meaningful-conversation rubric. B's automatic opening message is not genuine merchant participation.
+4. Record reviewer, verdict (`meaningful`, `not_meaningful`, or `unclear`), evidence note, feature/activation ID, and observation window in the review ledger. Do not silently classify `unclear` as converted; resolve or report it separately before final comparison.
+5. Compare unique shops with a confirmed meaningful conversation against all activated shops per variant. Report native milestone-trigger counts separately.
+
+### Same-tab reply detection
 
 Use a single app-level listener for Crisp `message:sent`, registered before delivery and coordinated with any existing listeners. Do not install one handler per feature component or remove another feature's listener indiscriminately.
 
@@ -138,7 +187,7 @@ The first actual merchant message after activation is a proxy for engagement, no
 - Analytics failure must not block feature actions or chat delivery. Keep original event/claim behavior unless separately approved.
 - No automatic replay of an ambiguously sent visitor message: duplicate support requests are worse than an undercount. Browser persistence and Crisp are not a single transaction.
 - Existing completion retries must not replay activation or message delivery.
-- A remains subject to saved-trigger visitor suppression. B's direct visitor send does not have that same saved-trigger constraint; the experiment tests the whole experience, not copy alone.
+- App-controlled A greetings and B visitor sends retain app eligibility limits. Native milestone triggers remain subject to Crisp visitor suppression; their counts may be lower than actual milestones.
 - Do not clear Crisp visitor identity, trigger history, or installation claims to balance exposure.
 - A browser listener may observe messages from another tab sharing the same Crisp session; verify locality. If origin cannot be established, do not claim exact same-tab attribution.
 
@@ -158,7 +207,7 @@ Manual evidence must establish observable send confirmation, exact profile/PostH
 1. **Engineering:** Can the live Crisp send callback reliably distinguish B's SDK-generated message from a human send, including concurrent activity and other tabs? Validate with captured callback payloads before selecting an attribution implementation.
 2. **Product/analytics:** What baseline human-reply rate, minimum meaningful uplift, sample size, experiment duration, and support-workload ceiling should govern the decision? Select these before launch; do not copy the onboarding document's example numbers or stop on an early apparent winner.
 3. **Product/support:** Confirm automatic visitor-message wording, including the cart grammar correction, and acceptance of conversations created without a merchant Send action. Does the celebratory cart message give operators enough context to respond appropriately?
-4. **Product:** Accept that A's remembered-trigger suppression and B's direct sending give different repeat exposure for embed help? Current requirements preserve A and existing app limits; equalizing exposure would be a separate scope decision.
+4. **Engineering/Crisp support:** Can six silent milestone triggers count in native Trigger Analytics without message/opening actions? Confirm before implementation. If unsupported, return the reporting limitation for a decision rather than silently replacing native analytics with profile-event counts.
 
 ## References
 
