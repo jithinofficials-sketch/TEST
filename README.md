@@ -29,11 +29,17 @@ Support generates an offer for the selected store and shares its link. The merch
 - Keep offer rules fixed for this campaign; do not build a general coupon-management screen.
 - Do not display the private code publicly on pricing cards.
 
+### Approved discount calculation
+
+The offer gives **an additional 10% off the current payment**, not an additional 10 percentage points of discount. For an upgrade, apply it to the eligible destination plan's price from the existing pricing flow; for an existing Pro annual renewal, use the merchant's verified accepted annual payment. Apply the support discount once.
+
+For example, an existing annual payment of **$71.96 becomes $64.76**. Against the $239.88 full annual comparison price, this is approximately **73% total savings**, not 80%. Calculate the amount from the actual price, not from a rounded discount badge.
+
 ### Why links from the internal panel?
 
 | Option | Benefit | Tradeoff |
 | --- | --- | --- |
-| Shared support code entered on pricing cards | Fastest initial build; existing input can be reused | Code can spread; difficult to control individual offers |
+| Shared support code entered on pricing cards | Fastest initial build; existing input can be reused | Coupon input is visible to every merchant, so the experience does not highlight the additional effort support made for a specific merchant; codes can also spread |
 | Shop-specific code entered manually | Store restriction and staff attribution | Merchant must copy and enter the code |
 | **Shop-specific link generated in the panel** | Support selects the correct store; merchant sees the offer without typing; offer status is trackable | Requires offer storage and a small internal-panel action |
 
@@ -71,10 +77,9 @@ Opening the link must not create or change a subscription. Preserve the offer th
 
 ### Pricing UI
 
-- **Eligible Pro monthly card:** update the price and show a **Coupon applied** badge after successful validation. Explain the billing amount and discount duration. This badge means the offer is applied to the preview, not that billing is approved.
-- **Eligible Pro annual upgrade card:** show the discounted annual charge prominently, with the monthly equivalent secondary. Show when billing starts and how long the discount lasts.
+- **Eligible Pro monthly and Pro annual upgrade cards:** use the same existing pricing-card pattern for the applicable plan: update the price, strikethrough comparison price, and discount badge, and add a **Coupon applied** badge after successful validation. Preserve the existing monthly/annual billing presentation and explain the discount duration. The coupon badge means the offer is applied to the preview, not that billing is approved.
 - **Existing Pro annual, after verified approval:** show a **Discount scheduled** badge and a message such as: "From your next billing cycle on [date], your annual payment will be $[amount]."
-- If Product approves the 80%-total-discount interpretation, that message can include: "You'll receive 80% off from your next billing cycle." **80% is an unapproved example, not final copy.**
+- For example: "From your next billing cycle, your annual payment will be $64.76 instead of $71.96 - an additional 10% off." Use the verified renewal date and amounts when available.
 - Before Shopify approval, show **Approval required**, not **Discount scheduled**. If verification is pending, show that status without claiming success.
 - Show expired, revoked, wrong-store, or ineligible offers clearly, without silently substituting a different price.
 
@@ -84,9 +89,16 @@ There are no storefront changes.
 
 ### Offer record and support panel
 
-Store the shop, unique offer identifier/code, campaign, staff identity/name, issue time, optional expiry, eligible destinations, approved discount rule/duration, and status. Link the offer to the Shopify subscription request and its quoted base/final amounts.
+Store one support-offer object on the merchant's existing `users` record with only:
 
-Track issued, approval-pending, scheduled, redeemed/active, expired, and revoked states as appropriate. Keep approval distinct from activation. Allow authorized staff to revoke unapproved offers; handling an already approved replacement is a separate billing operation.
+- **Offer token:** unpredictable identifier used in the private link.
+- **Issued by:** support staff identity/name for attribution.
+- **Status:** available, pending approval, scheduled, applied, or revoked. Keep approval distinct from activation.
+- **Expires at:** only if offer expiry is approved; derive expiration from this timestamp.
+
+Reuse the shop already on the user record and existing billing tracking for the Shopify subscription reference and approved price. Keep the fixed 10% rule, eligibility, and agreed duration in campaign configuration rather than duplicating them per merchant.
+
+Validate the token against the authenticated Shopify session's shop, both when displaying the offer and when creating the billing request. A link issued to Store A cannot be redeemed by Store B, even if forwarded. Reopening a pending, scheduled, or applied offer must show its status rather than create another redemption. Authorized staff can revoke an unapproved offer; an already approved replacement requires separate billing handling.
 
 ### Backend and billing
 
@@ -96,7 +108,7 @@ Track issued, approval-pending, scheduled, redeemed/active, expired, and revoked
 - Reuse the existing subscription creation, pending billing state, callback, and webhook paths, extending them for scheduled replacements.
 - For an existing Pro annual renewal offer, create the replacement with `APPLY_ON_NEXT_BILLING_CYCLE` and the same billing currency. Shopify ignores this deferral if the currency changes.
 - Do not overwrite the current active plan or accepted price merely because the merchant approved a future replacement. Reconcile activation with Shopify.
-- Finalize timing for other plan transitions before implementation; do not apply one replacement behavior to every transition.
+- Preserve existing billing timing for other plan transitions. Scope the new next-cycle replacement behavior to the existing Pro annual renewal offer.
 - Confirm the Shopify implementation for the approved discount duration. A permanently reduced price must not be used for an offer intended to last only one cycle.
 - Revise the existing BFCM annual-exclusion and coupon-disable rules explicitly. Use one shared eligibility/quote calculation for preview and billing.
 
@@ -125,38 +137,15 @@ Manual code entry and broader coupon administration are deferred.
 
 ## 6. Open Questions Requiring Approval
 
-### A. What does an additional 10% mean?
-
-Using configured BUCKS defaults, Pro is $19.99/month and the full annual comparison price is $239.88. An existing 70%-off annual offer charges $71.96.
-
-| Interpretation | Next annual charge |
-| --- | --- |
-| 10% off the current $71.96 payment | **$64.76**, approximately 73% total savings |
-| Add 10 percentage points: 70% becomes 80% | **$47.98** |
-
-Recommendation: 10% off the actual eligible price. Product must approve the interpretation before prices or percentage copy are implemented. Existing subscriptions use the verified accepted price, not a percentage reconstructed from a rounded badge.
-
-### B. Does the offer expire?
+### A. Does the offer expire?
 
 Recommendation: yes. Decide the redemption window, campaign cutoff, and exact timezone. Separately decide whether Shopify approval must finish before expiry and how outstanding approval requests are handled.
 
 An offer approved within its valid window should retain its promised next-cycle benefit even when the renewal date falls after campaign expiry.
 
-### C. How long does the discount last?
+### B. How long does the discount last?
 
 Choose one billing cycle, a fixed number of cycles, or every renewal. "Starting next billing cycle" does not answer this. UI copy and Shopify billing configuration must match the decision.
-
-### D. Which price is discounted, and what can stack?
-
-For upgrades, decide whether the base is the regular destination price, BFCM price, or partner price. For existing Pro annual renewals, recommend the actual accepted annual charge. Apply the support discount once and define how existing coupons interact with it.
-
-### E. When do other plan transitions take effect?
-
-Confirm timing for monthly-to-annual, legacy annual-to-Pro annual, and legacy annual-to-Pro monthly transitions. Show the approved timing and Shopify billing terms before confirmation.
-
-### F. Operational limits
-
-Confirm which staff roles can issue offers, how competing offers for the same store are handled, and the definition of "existing Free" at the campaign cutoff. Recommendation: one redeemable offer per shop per campaign, with retries reopening the same offer rather than issuing another discount.
 
 ## References
 
